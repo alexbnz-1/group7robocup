@@ -12,7 +12,6 @@
 **/.vscode/ipch
 **/.vscode/settings.json
 *.code-workspace
-Robocup/.gitignore
 
 # --- macOS ---
 .DS_Store
