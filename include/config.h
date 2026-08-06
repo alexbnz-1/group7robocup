@@ -50,3 +50,16 @@ constexpr uint8_t SHORT_XSHUT_PINS[SHORT_COUNT] = {0, 1};
 constexpr uint8_t LONG_COUNT = 2;
 constexpr uint8_t LONG_XSHUT_PINS[LONG_COUNT] = {2, 3};
 } // namespace TofConfig
+
+// IR sensors — placeholder count/pins, confirm against final sensor layout.
+// The team's own bench testing (see CDR) found analogue IR too noisy to
+// trust for ranging, especially off-angle — prefer the digital presence
+// check over the distance conversion where possible.
+namespace IrConfig {
+constexpr uint8_t COUNT = 2;
+constexpr uint8_t PINS[COUNT] = {Pins::IR_LEFT, Pins::IR_RIGHT};
+
+// Raw ADC threshold above which an object is considered "present".
+// Tune on the bench against the actual mounted sensors.
+constexpr uint16_t PRESENCE_THRESHOLD = 400;
+} // namespace IrConfig
