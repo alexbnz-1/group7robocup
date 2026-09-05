@@ -3,7 +3,7 @@ DataRecorder.py
 
 SQLite-backed session recorder for the robot debug GUI.
 
-A session database contains:
+A recording contains:
 - session metadata
 - all telemetry samples
 - structured robot logs
@@ -11,9 +11,9 @@ A session database contains:
 - parameter changes sent from the GUI
 - robot state messages
 - raw serial lines
+- manually logged fault markers
 
-The database is intentionally self-contained so DataVisualiser.py can analyse
-a recorded run later without needing the robot or the live GUI.
+The database uses the .rdbg extension but is a normal SQLite database.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ class DataRecorder:
         self._lock = threading.RLock()
         self._path: Path | None = None
         self._session_start_monotonic: float | None = None
-        self._session_start_wall: float | None = None
 
     @property
     def is_recording(self) -> bool:
@@ -73,23 +72,22 @@ class DataRecorder:
             self._conn = conn
             self._path = path
             self._session_start_monotonic = time.monotonic()
-            self._session_start_wall = time.time()
-
-            now_iso = datetime.now().astimezone().isoformat(timespec="milliseconds")
 
             metadata = {
                 "session_name": session_name,
-                "created_at": now_iso,
+                "created_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "port": port,
                 "baudrate": str(baudrate),
-                "format_version": "1",
+                "format_version": "2",
                 "application": "Robot Debug Console",
             }
+
             conn.executemany(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                 metadata.items(),
             )
             conn.commit()
+
             return path
 
     def stop(self):
@@ -110,7 +108,6 @@ class DataRecorder:
                 self._conn.close()
                 self._conn = None
                 self._session_start_monotonic = None
-                self._session_start_wall = None
 
     def _create_schema(self, conn: sqlite3.Connection):
         conn.executescript(
@@ -171,14 +168,25 @@ class DataRecorder:
                 wall_time TEXT NOT NULL,
                 line TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS faults (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                elapsed_s REAL NOT NULL,
+                wall_time TEXT NOT NULL,
+                label TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_faults_time
+                ON faults(elapsed_s);
             """
         )
         conn.commit()
 
     def _times(self) -> tuple[float, str]:
-        elapsed = self.elapsed
-        wall = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        return elapsed, wall
+        return (
+            self.elapsed,
+            datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        )
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -236,9 +244,14 @@ class DataRecorder:
         with self._lock:
             if self._conn is None:
                 return
+
             elapsed, wall = self._times()
+
             self._conn.execute(
-                "INSERT INTO logs(elapsed_s, wall_time, level, message) VALUES (?, ?, ?, ?)",
+                """
+                INSERT INTO logs(elapsed_s, wall_time, level, message)
+                VALUES (?, ?, ?, ?)
+                """,
                 (elapsed, wall, level, message),
             )
             self._conn.commit()
@@ -247,11 +260,14 @@ class DataRecorder:
         with self._lock:
             if self._conn is None:
                 return
+
             elapsed, wall = self._times()
+
             self._conn.execute(
                 """
-                INSERT INTO commands(elapsed_s, wall_time, command, arguments_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO commands(
+                    elapsed_s, wall_time, command, arguments_json
+                ) VALUES (?, ?, ?, ?)
                 """,
                 (elapsed, wall, command, self._json(arguments)),
             )
@@ -261,11 +277,14 @@ class DataRecorder:
         with self._lock:
             if self._conn is None:
                 return
+
             elapsed, wall = self._times()
+
             self._conn.execute(
                 """
-                INSERT INTO parameters(elapsed_s, wall_time, name, value_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO parameters(
+                    elapsed_s, wall_time, name, value_json
+                ) VALUES (?, ?, ?, ?)
                 """,
                 (elapsed, wall, name, self._json(value)),
             )
@@ -275,7 +294,9 @@ class DataRecorder:
         with self._lock:
             if self._conn is None:
                 return
+
             elapsed, wall = self._times()
+
             self._conn.execute(
                 """
                 INSERT INTO states(elapsed_s, wall_time, state_json)
@@ -289,9 +310,38 @@ class DataRecorder:
         with self._lock:
             if self._conn is None:
                 return
+
             elapsed, wall = self._times()
+
             self._conn.execute(
-                "INSERT INTO raw_serial(elapsed_s, wall_time, line) VALUES (?, ?, ?)",
+                """
+                INSERT INTO raw_serial(elapsed_s, wall_time, line)
+                VALUES (?, ?, ?)
+                """,
                 (elapsed, wall, line),
             )
             self._conn.commit()
+
+    def record_fault(self, label: str = "MANUAL FAULT MARKER") -> float | None:
+        """
+        Record an instantaneous manual fault marker.
+
+        Returns the elapsed recording time of the marker, or None if no
+        recording is active.
+        """
+        with self._lock:
+            if self._conn is None:
+                return None
+
+            elapsed, wall = self._times()
+
+            self._conn.execute(
+                """
+                INSERT INTO faults(elapsed_s, wall_time, label)
+                VALUES (?, ?, ?)
+                """,
+                (elapsed, wall, label),
+            )
+            self._conn.commit()
+
+            return elapsed
