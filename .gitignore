@@ -1,19 +1,121 @@
-# --- PlatformIO ---
-.pio/
-.pioenvs/
-.piolibdeps/
-.clang_complete
-.gcc-flags.json
+# ============================================================
+# PlatformIO
+# ============================================================
 
-# --- VS Code (PlatformIO auto-generates these; keep settings.json out too) ---
+# PlatformIO generated directories anywhere in the repository
+**/.pio/
+**/.pioenvs/
+**/.piolibdeps/
+
+# PlatformIO / compiler generated files
+**/.clang_complete
+**/.gcc-flags.json
+
+
+# ============================================================
+# Python
+# ============================================================
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled Python extensions
+*.so
+*.pyd
+
+# Python packaging / build output
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Testing
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+
+# Type checking / linting
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# ============================================================
+# VS Code
+# ============================================================
+
+# PlatformIO / VS Code generated or machine-specific files
 **/.vscode/.browse.c_cpp.db*
 **/.vscode/c_cpp_properties.json
 **/.vscode/launch.json
 **/.vscode/ipch
 **/.vscode/settings.json
-*.code-workspace
 
-# --- macOS ---
+# NOTE:
+# *.code-workspace is deliberately NOT ignored.
+# group7robocup.code-workspace should be committed to Git.
+
+
+# ============================================================
+# JetBrains / PyCharm / IntelliJ
+# ============================================================
+
+.idea/
+*.iml
+
+
+# ============================================================
+# Environment variables / secrets
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+
+# ============================================================
+# macOS
+# ============================================================
+
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -22,35 +124,60 @@ Icon
 .Spotlight-V100
 .Trashes
 
-# --- Windows ---
+
+# ============================================================
+# Windows
+# ============================================================
+
 Thumbs.db
+Thumbs.db:encryptable
 ehthumbs.db
+ehthumbs_vista.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# --- Linux ---
+
+# ============================================================
+# Linux
+# ============================================================
+
 *~
 .directory
 
-# --- Editors ---
+
+# ============================================================
+# Editors / temporary files
+# ============================================================
+
 *.swp
 *.swo
-.idea/
-*.iml
+*.tmp
+*.temp
+*.bak
 
-# --- Claude Code ---
+
+# ============================================================
+# Claude Code
+# ============================================================
+
 .claude/
 CLAUDE.local.md
 
-# --- Build / logs ---
+
+# ============================================================
+# Compiled files / build artifacts
+# ============================================================
+
 *.o
 *.obj
 *.elf
 *.hex
 *.bin
 *.map
-*.log
 
-# --- Env ---
-.env
-.env.local
+
+# ============================================================
+# Logs
+# ============================================================
+
+*.log
