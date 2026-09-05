@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sqlite3
 import sys
 from pathlib import Path
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -73,11 +74,28 @@ class DataVisualiser(QMainWindow):
         self.plot_curves = {}
         self.signal_data = {}
 
+        # Currently-plotted selection highlighting. When a signal is selected
+        # in the "Currently plotted" list, its curve is temporarily forced
+        # visible and highlighted bright blue. Clicking anywhere outside that
+        # list restores the curve to its previous pen and visibility state.
+        self.highlighted_signal = None
+        self.highlighted_original_pen = None
+        self.highlighted_original_visible = None
+        self.highlighted_original_z = None
+
         # Manual fault markers shown on the plot.
         self.fault_lines = []
         self.fault_labels = []
 
         self._build_ui()
+
+        # Watch mouse clicks across the application so a temporary curve
+        # highlight can be cleared as soon as the user clicks outside the
+        # "Currently plotted" list.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
         self.refresh_recordings()
 
     # =================================================================
@@ -340,6 +358,15 @@ class DataVisualiser(QMainWindow):
 
         self.plotted_list = QListWidget()
 
+        self.plotted_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection
+        )
+
+        self.plotted_list.setToolTip(
+            "Select a signal to temporarily highlight it blue on the graph. "
+            "If the curve was hidden it will be shown while selected."
+        )
+
         left_layout.addWidget(
             self.plotted_list
         )
@@ -406,6 +433,10 @@ class DataVisualiser(QMainWindow):
 
         self.clear_plots_button.clicked.connect(
             self.clear_plots
+        )
+
+        self.plotted_list.itemSelectionChanged.connect(
+            self.on_plotted_selection_changed
         )
 
         self.auto_scale_button.clicked.connect(
@@ -935,6 +966,12 @@ class DataVisualiser(QMainWindow):
             )
 
         self._update_x_label()
+
+        # PyQtGraph automatically ranges the view when the first curve is
+        # added. For an all-zero signal that produces an absurdly tiny
+        # Y-range around 0. Force a useful default range instead.
+        self.ensure_sensible_zero_only_view()
+
         self.refresh_fault_markers()
 
     def _choose_x(
@@ -1019,30 +1056,324 @@ class DataVisualiser(QMainWindow):
         self.refresh_fault_markers()
 
 
+    # =================================================================
+    # Temporary selected-curve highlighting
+    # =================================================================
+
+    def on_plotted_selection_changed(self):
+        """
+        Highlight the selected plotted signal in bright blue.
+
+        The curve is forced visible while selected. Its previous visibility,
+        pen and Z-order are restored when the selection is cleared or another
+        plotted signal is selected.
+        """
+        selected = self.plotted_list.selectedItems()
+
+        new_signal = (
+            selected[0].text()
+            if selected
+            else None
+        )
+
+        if new_signal == self.highlighted_signal:
+            return
+
+        self.restore_highlighted_curve()
+
+        if new_signal is None:
+            return
+
+        curve = self.plot_curves.get(
+            new_signal
+        )
+
+        if curve is None:
+            return
+
+        self.highlighted_signal = new_signal
+        self.highlighted_original_pen = curve.opts.get(
+            "pen"
+        )
+        self.highlighted_original_visible = curve.isVisible()
+        self.highlighted_original_z = curve.zValue()
+
+        # A selected signal must always be visible, even if it had previously
+        # been hidden by some other interaction.
+        curve.setVisible(
+            True
+        )
+
+        # Bright blue, deliberately thicker than normal plot lines so it is
+        # obvious which signal is being inspected.
+        curve.setPen(
+            pg.mkPen(
+                color=(0, 120, 255),
+                width=4,
+            )
+        )
+
+        # Draw the highlighted curve over the other traces.
+        curve.setZValue(
+            1000
+        )
+
+    def restore_highlighted_curve(self):
+        """
+        Restore the previously highlighted signal exactly as it was before
+        selection, including whether it was hidden.
+        """
+        if self.highlighted_signal is None:
+            return
+
+        curve = self.plot_curves.get(
+            self.highlighted_signal
+        )
+
+        if curve is not None:
+            if self.highlighted_original_pen is not None:
+                curve.setPen(
+                    self.highlighted_original_pen
+                )
+
+            if self.highlighted_original_visible is not None:
+                curve.setVisible(
+                    self.highlighted_original_visible
+                )
+
+            if self.highlighted_original_z is not None:
+                curve.setZValue(
+                    self.highlighted_original_z
+                )
+
+        self.highlighted_signal = None
+        self.highlighted_original_pen = None
+        self.highlighted_original_visible = None
+        self.highlighted_original_z = None
+
+    def eventFilter(
+        self,
+        watched,
+        event,
+    ):
+        """
+        Clear the temporary plotted-signal selection whenever the user clicks
+        outside the \"Currently plotted\" QListWidget.
+
+        This is what makes a curve that was hidden before selection disappear
+        again immediately after the user clicks elsewhere in the GUI.
+        """
+        if (
+            event.type()
+            == QEvent.Type.MouseButtonPress
+            and hasattr(self, "plotted_list")
+            and self.plotted_list.selectedItems()
+        ):
+            widget = watched
+            inside_plotted_list = False
+
+            # Mouse events may be delivered to the list viewport, scrollbar,
+            # or another child widget, so walk up the QWidget parent chain.
+            while isinstance(widget, QWidget):
+                if widget is self.plotted_list:
+                    inside_plotted_list = True
+                    break
+
+                widget = widget.parentWidget()
+
+            if not inside_plotted_list:
+                self.plotted_list.clearSelection()
+
+        return super().eventFilter(
+            watched,
+            event,
+        )
+
+
+    def ensure_sensible_zero_only_view(self):
+        """
+        If every finite sample on every visible curve is exactly zero, force
+        a useful default Y range instead of allowing PyQtGraph to zoom into a
+        microscopic range such as +/-1e-12.
+
+        X still fits the available recording time so the zero trace is useful.
+        """
+        if not self.plot_curves:
+            return False
+
+        finite_x = []
+        saw_finite_y = False
+
+        for signal, curve in self.plot_curves.items():
+            if not curve.isVisible():
+                continue
+
+            data = self.signal_data.get(signal)
+            if not data:
+                continue
+
+            elapsed, robot, values = data
+            x_values = self._choose_x(elapsed, robot)
+
+            for x_value, y_value in zip(x_values, values):
+                try:
+                    x = float(x_value)
+                    y = float(y_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+
+                saw_finite_y = True
+
+                # As soon as there is any real non-zero data this is not the
+                # special zero-only case.
+                if y != 0.0:
+                    return False
+
+                finite_x.append(x)
+
+        if not saw_finite_y:
+            return False
+
+        # Keep a normal, human-readable vertical range around zero.
+        self.plot_widget.setYRange(
+            -1.0,
+            1.0,
+            padding=0.0,
+        )
+
+        # Fit the time axis without allowing a zero-width range.
+        if finite_x:
+            x_min = min(finite_x)
+            x_max = max(finite_x)
+
+            if x_min == x_max:
+                x_min -= 0.5
+                x_max += 0.5
+            else:
+                x_pad = max((x_max - x_min) * 0.05, 0.05)
+                x_min -= x_pad
+                x_max += x_pad
+
+            self.plot_widget.setXRange(
+                x_min,
+                x_max,
+                padding=0.0,
+            )
+        else:
+            self.plot_widget.setXRange(
+                0.0,
+                10.0,
+                padding=0.0,
+            )
+
+        return True
+
+
     def auto_scale_plots(self):
         """
-        Auto-range the plot so every currently visible signal fits on screen.
+        Fit all currently visible plotted telemetry onto the screen.
 
-        This uses PyQtGraph's built-in auto-range behaviour and includes a
-        small padding around the data. Fault marker InfiniteLines do not
-        determine the Y range.
+        The bounds are calculated manually from finite telemetry samples rather
+        than using PyQtGraph's generic autoRange().  This deliberately ignores
+        NaN/Inf samples and non-data items such as fault-marker InfiniteLines
+        and text labels, preventing errors such as:
+
+            Exception: Cannot set range [nan, nan]
         """
         if not self.plot_curves:
             return
 
-        self.plot_widget.enableAutoRange(
-            axis=pg.ViewBox.XYAxes,
-            enable=True,
+        x_min = None
+        x_max = None
+        y_min = None
+        y_max = None
+
+        for signal, curve in self.plot_curves.items():
+            # Hidden curves should not affect the requested view.  A curve that
+            # is temporarily highlighted is forced visible, so it is included.
+            if not curve.isVisible():
+                continue
+
+            data = self.signal_data.get(signal)
+            if not data:
+                continue
+
+            elapsed, robot, values = data
+            x_values = self._choose_x(elapsed, robot)
+
+            for x_value, y_value in zip(x_values, values):
+                try:
+                    x = float(x_value)
+                    y = float(y_value)
+                except (TypeError, ValueError):
+                    continue
+
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+
+                if x_min is None or x < x_min:
+                    x_min = x
+                if x_max is None or x > x_max:
+                    x_max = x
+                if y_min is None or y < y_min:
+                    y_min = y
+                if y_max is None or y > y_max:
+                    y_max = y
+
+        # There may be plotted signals but no finite visible samples.
+        if None in (x_min, x_max, y_min, y_max):
+            self.statusBar().showMessage(
+                "Auto Scale: no finite visible telemetry data to scale."
+            )
+            return
+
+        # All-zero data is a special case. PyQtGraph's normal auto-ranging can
+        # choose a microscopic range around zero, which is not useful. Reset
+        # to a sensible default vertical view instead.
+        if y_min == 0.0 and y_max == 0.0:
+            self.ensure_sensible_zero_only_view()
+            self.statusBar().showMessage(
+                "Auto Scale: visible telemetry is all zero; using default zero range."
+            )
+            return
+
+        # ViewBox needs a non-zero range on each axis.
+        if x_min == x_max:
+            x_pad = max(abs(x_min) * 0.05, 1.0)
+            x_min -= x_pad
+            x_max += x_pad
+
+        if y_min == y_max:
+            y_pad = max(abs(y_min) * 0.05, 1.0)
+            y_min -= y_pad
+            y_max += y_pad
+
+        # Disable continuous auto-ranging after calculating the one-shot fit,
+        # otherwise later plot/item changes can unexpectedly alter the view.
+        self.plot_widget.disableAutoRange()
+
+        self.plot_widget.setRange(
+            xRange=(x_min, x_max),
+            yRange=(y_min, y_max),
+            padding=0.05,
         )
 
-        self.plot_widget.autoRange(
-            padding=0.05
+        self.statusBar().showMessage(
+            "Auto Scale: fitted all visible finite telemetry."
         )
 
     def remove_selected_plot(self):
-        for item in (
+        selected_items = list(
             self.plotted_list.selectedItems()
-        ):
+        )
+
+        # Restore temporary styling/visibility before deleting the curve.
+        self.restore_highlighted_curve()
+
+        for item in selected_items:
             signal = item.text()
 
             curve = self.plot_curves.pop(
@@ -1067,6 +1398,8 @@ class DataVisualiser(QMainWindow):
             )
 
     def clear_plots(self):
+        self.restore_highlighted_curve()
+
         for curve in (
             self.plot_curves.values()
         ):
