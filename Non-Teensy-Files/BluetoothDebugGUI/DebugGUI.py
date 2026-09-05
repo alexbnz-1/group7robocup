@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import sys
 import time
+import subprocess
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -295,6 +296,16 @@ class RobotDebugGUI(QMainWindow):
         self.dashboard_command_widgets = {}
         self.plot_curves = {}
 
+        # Recording metadata / parameter snapshot support.
+        self.parameter_definitions = {}
+        self.parameter_values = {}
+
+        # Link-health counters.
+        self.raw_line_times = deque(maxlen=5000)
+        self.telemetry_event_times = deque(maxlen=10000)
+        self.last_telemetry_monotonic = None
+        self.protocol_error_count = 0
+
         self.start_time = time.monotonic()
 
         self._build_ui()
@@ -318,6 +329,12 @@ class RobotDebugGUI(QMainWindow):
         )
         self.recording_timer.start(250)
 
+        self.health_timer = QTimer(self)
+        self.health_timer.timeout.connect(
+            self.update_link_health
+        )
+        self.health_timer.start(500)
+
         self.refresh_ports()
 
     # =================================================================
@@ -339,6 +356,42 @@ class RobotDebugGUI(QMainWindow):
         )
 
         return data_dir
+
+    def git_metadata(self) -> dict:
+        """Best-effort Git branch/commit capture for reproducible tests."""
+        try:
+            project_root = Path(__file__).resolve().parents[2]
+            branch = subprocess.check_output(
+                ["git", "branch", "--show-current"],
+                cwd=project_root,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=project_root,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            dirty = bool(
+                subprocess.check_output(
+                    ["git", "status", "--porcelain"],
+                    cwd=project_root,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+            )
+            return {
+                "git_branch": branch,
+                "git_commit": commit,
+                "git_dirty": str(dirty).lower(),
+            }
+        except Exception:
+            return {
+                "git_branch": "",
+                "git_commit": "",
+                "git_dirty": "",
+            }
 
     def toggle_recording(self):
         if self.recorder.is_recording:
@@ -381,6 +434,12 @@ class RobotDebugGUI(QMainWindow):
         if path.suffix.lower() != ".rdbg":
             path = path.with_suffix(".rdbg")
 
+        session_metadata = {
+            "test_name": self.test_name_edit.text().strip(),
+            "test_notes": self.test_notes_edit.text().strip(),
+            **self.git_metadata(),
+        }
+
         self.recorder.start(
             path,
             session_name=path.stem,
@@ -391,7 +450,17 @@ class RobotDebugGUI(QMainWindow):
             baudrate=int(
                 self.baud_combo.currentData()
             ),
+            metadata=session_metadata,
         )
+
+        # Snapshot every known parameter at recording start.
+        snapshot = dict(self.parameter_values)
+        for name, editor in self.parameter_editors.items():
+            try:
+                snapshot[name] = editor.value()
+            except Exception:
+                pass
+        self.recorder.record_parameter_snapshot(snapshot)
 
         self.record_button.setText(
             "Stop Recording"
@@ -689,6 +758,19 @@ class RobotDebugGUI(QMainWindow):
             self.recording_time_label
         )
 
+        connection_layout.addSpacing(8)
+        connection_layout.addWidget(QLabel("Test:"))
+        self.test_name_edit = QLineEdit()
+        self.test_name_edit.setPlaceholderText("Straight drive PID test")
+        self.test_name_edit.setMaximumWidth(190)
+        connection_layout.addWidget(self.test_name_edit)
+
+        connection_layout.addWidget(QLabel("Notes:"))
+        self.test_notes_edit = QLineEdit()
+        self.test_notes_edit.setPlaceholderText("Optional")
+        self.test_notes_edit.setMaximumWidth(190)
+        connection_layout.addWidget(self.test_notes_edit)
+
         connection_layout.addStretch()
 
         self.enter_debug_button = QPushButton(
@@ -718,6 +800,15 @@ class RobotDebugGUI(QMainWindow):
         main_layout.addWidget(
             connection_group
         )
+
+        health_row = QHBoxLayout()
+        health_row.addWidget(QLabel("Link health:"))
+        self.link_health_label = QLabel(
+            "Frames/s: 0 | Signals/s: 0 | Last telemetry: — | Protocol errors: 0"
+        )
+        health_row.addWidget(self.link_health_label)
+        health_row.addStretch()
+        main_layout.addLayout(health_row)
 
         self.tabs = QTabWidget()
 
@@ -1512,6 +1603,33 @@ class RobotDebugGUI(QMainWindow):
             self.on_robot_state
         )
 
+    def update_link_health(self):
+        now = time.monotonic()
+        cutoff = now - 1.0
+
+        while self.raw_line_times and self.raw_line_times[0] < cutoff:
+            self.raw_line_times.popleft()
+
+        while (
+            self.telemetry_event_times
+            and self.telemetry_event_times[0] < cutoff
+        ):
+            self.telemetry_event_times.popleft()
+
+        if self.last_telemetry_monotonic is None:
+            age_text = "—"
+        else:
+            age_text = (
+                f"{now - self.last_telemetry_monotonic:.2f} s"
+            )
+
+        self.link_health_label.setText(
+            f"Frames/s: {len(self.raw_line_times)} | "
+            f"Signals/s: {len(self.telemetry_event_times)} | "
+            f"Last telemetry: {age_text} | "
+            f"Protocol errors: {self.protocol_error_count}"
+        )
+
     # =================================================================
     # Ports / connection
     # =================================================================
@@ -1759,13 +1877,15 @@ class RobotDebugGUI(QMainWindow):
         value: Any,
         robot_timestamp: Any,
     ):
+        now = time.monotonic()
+        self.telemetry_event_times.append(now)
+        self.last_telemetry_monotonic = now
+
         self.recorder.record_telemetry(
             name,
             value,
             robot_timestamp,
         )
-
-        now = time.monotonic()
 
         self.telemetry[
             name
@@ -2033,6 +2153,15 @@ class RobotDebugGUI(QMainWindow):
         if not name:
             return
 
+        self.parameter_definitions[name] = dict(definition)
+        if "value" in definition:
+            self.parameter_values[name] = definition["value"]
+        elif (
+            "default" in definition
+            and name not in self.parameter_values
+        ):
+            self.parameter_values[name] = definition["default"]
+
         if name in self.parameter_editors:
             if "value" in definition:
                 self.parameter_editors[
@@ -2125,6 +2254,7 @@ class RobotDebugGUI(QMainWindow):
         editor: ValueEditor,
     ):
         value = editor.value()
+        self.parameter_values[name] = value
 
         self.recorder.record_parameter(
             name,
@@ -2146,6 +2276,8 @@ class RobotDebugGUI(QMainWindow):
         name: str,
         value: Any,
     ):
+        self.parameter_values[name] = value
+
         editor = (
             self.parameter_editors.get(
                 name
@@ -2281,6 +2413,10 @@ class RobotDebugGUI(QMainWindow):
         self,
         text: str,
     ):
+        self.raw_line_times.append(
+            time.monotonic()
+        )
+
         # Recording is independent of whether the Raw Serial tab is paused.
         self.recorder.record_raw(
             text
@@ -2319,6 +2455,8 @@ class RobotDebugGUI(QMainWindow):
         self,
         message: str,
     ):
+        self.protocol_error_count += 1
+
         self.add_log(
             "ERROR",
             message,

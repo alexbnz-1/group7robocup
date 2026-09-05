@@ -1,20 +1,23 @@
 """
 DataVisualiser.py
 
-Offline analysis GUI for Robot Debug Console recordings (*.rdbg).
+Offline robot recording visualiser for *.rdbg files.
 
 Features:
-- recording picker
-- searchable numeric signal list
-- multi-signal plotting
-- bright red manual fault markers as vertical lines
-- chronological events table
-- raw serial inspection
-- session metadata
-- CSV export
+- searchable telemetry plotting
+- safe autoscale, including sensible all-zero handling
+- temporary blue highlight for selected plotted signal
+- click-to-inspect cursor with values for every plotted signal
+- draggable measurement region with min/max/mean/std/delta/sample count
+- fault / command / parameter / state event markers
+- double-click an event to jump the graph to it
+- derived signals using expressions
+- compare a second recording, including align-to-first-fault
+- basic anomaly detection overlays
+- raw serial, metadata, parameter snapshots, CSV export
 
 Dependencies:
-    pip install PyQt6 pyqtgraph
+    pip install PyQt6 pyqtgraph numpy
 """
 
 from __future__ import annotations
@@ -24,10 +27,14 @@ import json
 import math
 import sqlite3
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,1920 +48,1015 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QInputDialog,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "Data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+@dataclass
+class SignalSeries:
+    elapsed: np.ndarray
+    robot: np.ndarray
+    values: np.ndarray
+
+
 class DataVisualiser(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle(
-            "Robot Data Visualiser"
-        )
-
-        self.resize(
-            1500,
-            900,
-        )
+        self.setWindowTitle("Robot Data Visualiser")
+        self.resize(1600, 950)
 
         self.db_path: Path | None = None
         self.conn: sqlite3.Connection | None = None
 
-        self.plot_curves = {}
-        self.signal_data = {}
+        self.compare_path: Path | None = None
+        self.compare_conn: sqlite3.Connection | None = None
+        self.compare_offset = 0.0
 
-        # Currently-plotted selection highlighting. When a signal is selected
-        # in the "Currently plotted" list, its curve is temporarily forced
-        # visible and highlighted bright blue. Clicking anywhere outside that
-        # list restores the curve to its previous pen and visibility state.
-        self.highlighted_signal = None
+        self.plot_curves: dict[str, pg.PlotDataItem] = {}
+        self.compare_curves: dict[str, pg.PlotDataItem] = {}
+        self.signal_cache: dict[tuple[str, str], SignalSeries] = {}
+        self.derived: dict[str, str] = {}
+
+        self.highlighted_signal: str | None = None
         self.highlighted_original_pen = None
         self.highlighted_original_visible = None
         self.highlighted_original_z = None
 
-        # Manual fault markers shown on the plot.
-        self.fault_lines = []
-        self.fault_labels = []
+        self.marker_items = []
+        self.anomaly_items = []
+
+        self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(width=1))
+        self.cursor_line.setZValue(1000)
+        self.cursor_line.hide()
+
+        self.measure_region = pg.LinearRegionItem(values=(0, 1), movable=True)
+        self.measure_region.setZValue(900)
+        self.measure_region.hide()
 
         self._build_ui()
-
-        # Watch mouse clicks across the application so a temporary curve
-        # highlight can be cleared as soon as the user clicks outside the
-        # "Currently plotted" list.
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
-
+        QApplication.instance().installEventFilter(self)
         self.refresh_recordings()
 
-    # =================================================================
-    # Helpers
-    # =================================================================
+    # ------------------------------------------------------------------
+    # DB helpers
+    # ------------------------------------------------------------------
 
-    def table_exists(
-        self,
-        name: str,
-    ) -> bool:
-        if self.conn is None:
+    @staticmethod
+    def table_exists(conn: sqlite3.Connection | None, name: str) -> bool:
+        if conn is None:
             return False
-
-        row = self.conn.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name = ?
-            """,
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             (name,),
-        ).fetchone()
+        ).fetchone() is not None
 
-        return row is not None
+    @staticmethod
+    def get_metadata(conn: sqlite3.Connection | None) -> dict[str, str]:
+        if conn is None or not DataVisualiser.table_exists(conn, "metadata"):
+            return {}
+        return {str(k): str(v) for k, v in conn.execute("SELECT key,value FROM metadata")}
 
-    # =================================================================
+    def _series(self, signal: str, source: str = "main") -> SignalSeries:
+        key = (source, signal)
+        if key in self.signal_cache:
+            return self.signal_cache[key]
+
+        if source == "main" and signal in self.derived:
+            series = self._evaluate_derived(self.derived[signal])
+            self.signal_cache[key] = series
+            return series
+
+        conn = self.conn if source == "main" else self.compare_conn
+        if conn is None:
+            return SignalSeries(np.array([]), np.array([]), np.array([]))
+
+        rows = conn.execute(
+            """SELECT elapsed_s, robot_time, value_num
+               FROM telemetry
+               WHERE signal=? AND value_num IS NOT NULL
+               ORDER BY elapsed_s""",
+            (signal,),
+        ).fetchall()
+
+        if not rows:
+            result = SignalSeries(np.array([]), np.array([]), np.array([]))
+        else:
+            e = np.asarray([r[0] for r in rows], dtype=float)
+            r = np.asarray([np.nan if r[1] is None else r[1] for r in rows], dtype=float)
+            v = np.asarray([r[2] for r in rows], dtype=float)
+            result = SignalSeries(e, r, v)
+
+        self.signal_cache[key] = result
+        return result
+
+    def _evaluate_derived(self, expression: str) -> SignalSeries:
+        # Expression syntax: sig("drive.left_rpm") - sig("drive.right_rpm")
+        import re
+
+        names = re.findall(r"""sig\(\s*["']([^"']+)["']\s*\)""", expression)
+        if not names:
+            raise ValueError('Expression must contain at least one sig("name") reference.')
+
+        base = self._series(names[0], "main")
+        if len(base.elapsed) == 0:
+            raise ValueError(f"No numeric data for {names[0]}")
+
+        x = base.elapsed.copy()
+
+        def sig(name: str):
+            s = self._series(name, "main")
+            if len(s.elapsed) == 0:
+                raise ValueError(f"No numeric data for {name}")
+            return np.interp(x, s.elapsed, s.values, left=np.nan, right=np.nan)
+
+        safe = {
+            "sig": sig,
+            "np": np,
+            "abs": np.abs,
+            "sqrt": np.sqrt,
+            "sin": np.sin,
+            "cos": np.cos,
+            "tan": np.tan,
+            "clip": np.clip,
+            "minimum": np.minimum,
+            "maximum": np.maximum,
+        }
+        values = eval(expression, {"__builtins__": {}}, safe)
+        values = np.asarray(values, dtype=float)
+        return SignalSeries(x, np.full_like(x, np.nan), values)
+
+    def _x_values(self, s: SignalSeries, source: str = "main") -> np.ndarray:
+        if self.x_axis_combo.currentData() == "robot":
+            robot = s.robot.copy()
+            finite = np.isfinite(robot)
+            if finite.any():
+                first = robot[finite][0]
+                robot[finite] -= first
+                if np.nanmax(np.abs(robot[finite])) > 1000:
+                    robot[finite] /= 1000.0
+                return robot
+        x = s.elapsed.copy()
+        if source == "compare":
+            x = x + self.compare_offset
+        return x
+
+    # ------------------------------------------------------------------
     # UI
-    # =================================================================
+    # ------------------------------------------------------------------
 
     def _build_ui(self):
         central = QWidget()
-
-        self.setCentralWidget(
-            central
-        )
-
-        root = QVBoxLayout(
-            central
-        )
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
         top = QHBoxLayout()
-
-        top.addWidget(
-            QLabel("Recording:")
-        )
-
+        top.addWidget(QLabel("Recording:"))
         self.file_combo = QComboBox()
-        self.file_combo.setMinimumWidth(
-            420
-        )
+        self.file_combo.setMinimumWidth(380)
+        top.addWidget(self.file_combo)
 
-        top.addWidget(
-            self.file_combo
-        )
+        self.refresh_button = QPushButton("Refresh")
+        self.open_button = QPushButton("Open")
+        self.browse_button = QPushButton("Browse...")
+        self.compare_button = QPushButton("Compare...")
+        self.align_fault_button = QPushButton("Align Compare to First Fault")
+        self.clear_compare_button = QPushButton("Clear Compare")
+        self.export_button = QPushButton("Export Selected CSV")
 
-        self.refresh_button = QPushButton(
-            "Refresh"
-        )
-
-        self.open_button = QPushButton(
-            "Open"
-        )
-
-        self.browse_button = QPushButton(
-            "Browse..."
-        )
-
-        self.export_button = QPushButton(
-            "Export Selected CSV"
-        )
-
-        top.addWidget(
-            self.refresh_button
-        )
-
-        top.addWidget(
-            self.open_button
-        )
-
-        top.addWidget(
-            self.browse_button
-        )
-
+        for w in (
+            self.refresh_button, self.open_button, self.browse_button,
+            self.compare_button, self.align_fault_button, self.clear_compare_button,
+            self.export_button,
+        ):
+            top.addWidget(w)
         top.addStretch()
+        root.addLayout(top)
 
-        top.addWidget(
-            self.export_button
-        )
-
-        root.addLayout(
-            top
-        )
-
-        self.summary_label = QLabel(
-            "No recording loaded."
-        )
-
-        root.addWidget(
-            self.summary_label
-        )
+        self.summary_label = QLabel("No recording loaded")
+        self.summary_label.setWordWrap(True)
+        root.addWidget(self.summary_label)
 
         self.tabs = QTabWidget()
-
-        root.addWidget(
-            self.tabs,
-            1,
-        )
+        root.addWidget(self.tabs, 1)
 
         self._build_plot_tab()
         self._build_events_tab()
         self._build_raw_tab()
         self._build_metadata_tab()
 
-        self.refresh_button.clicked.connect(
-            self.refresh_recordings
-        )
-
-        self.open_button.clicked.connect(
-            self.open_selected_recording
-        )
-
-        self.browse_button.clicked.connect(
-            self.browse_recording
-        )
-
-        self.export_button.clicked.connect(
-            self.export_selected_csv
-        )
-
-    # =================================================================
-    # Plot tab
-    # =================================================================
+        self.refresh_button.clicked.connect(self.refresh_recordings)
+        self.open_button.clicked.connect(self.open_selected_recording)
+        self.browse_button.clicked.connect(self.browse_recording)
+        self.compare_button.clicked.connect(self.browse_compare_recording)
+        self.align_fault_button.clicked.connect(self.align_compare_to_first_fault)
+        self.clear_compare_button.clicked.connect(self.clear_compare)
+        self.export_button.clicked.connect(self.export_selected_csv)
 
     def _build_plot_tab(self):
         page = QWidget()
-
-        layout = QVBoxLayout(
-            page
-        )
+        layout = QVBoxLayout(page)
 
         controls = QHBoxLayout()
-
-        controls.addWidget(
-            QLabel("Search signals:")
-        )
-
+        controls.addWidget(QLabel("Search:"))
         self.signal_filter = QLineEdit()
+        self.signal_filter.setPlaceholderText("drive, imu, battery...")
+        controls.addWidget(self.signal_filter)
 
-        self.signal_filter.setPlaceholderText(
-            "e.g. drive, imu, battery"
-        )
+        self.add_button = QPushButton("Add Selected")
+        self.remove_button = QPushButton("Remove Plot")
+        self.clear_button = QPushButton("Clear Plots")
+        self.autoscale_button = QPushButton("Auto Scale")
+        self.derived_button = QPushButton("Add Derived Signal")
+        self.measure_button = QPushButton("Measure Region")
+        self.anomaly_button = QPushButton("Find Anomalies")
+        self.clear_anomaly_button = QPushButton("Clear Anomalies")
 
-        controls.addWidget(
-            self.signal_filter
-        )
+        for w in (
+            self.add_button, self.remove_button, self.clear_button, self.autoscale_button,
+            self.derived_button, self.measure_button, self.anomaly_button, self.clear_anomaly_button,
+        ):
+            controls.addWidget(w)
 
-        self.add_selected_button = QPushButton(
-            "Add Selected"
-        )
+        self.show_faults = QCheckBox("Faults")
+        self.show_faults.setChecked(True)
+        self.show_commands = QCheckBox("Commands")
+        self.show_parameters = QCheckBox("Parameters")
+        self.show_states = QCheckBox("States")
+        for w in (self.show_faults, self.show_commands, self.show_parameters, self.show_states):
+            controls.addWidget(w)
 
-        self.remove_selected_button = QPushButton(
-            "Remove Plot"
-        )
-
-        self.clear_plots_button = QPushButton(
-            "Clear Plots"
-        )
-
-        self.auto_scale_button = QPushButton(
-            "Auto Scale"
-        )
-
-        controls.addWidget(
-            self.add_selected_button
-        )
-
-        controls.addWidget(
-            self.remove_selected_button
-        )
-
-        controls.addWidget(
-            self.clear_plots_button
-        )
-
-        controls.addWidget(
-            self.auto_scale_button
-        )
-
-        controls.addSpacing(
-            15
-        )
-
-        self.show_faults_checkbox = QCheckBox(
-            "Show fault markers"
-        )
-
-        self.show_faults_checkbox.setChecked(
-            True
-        )
-
-        controls.addWidget(
-            self.show_faults_checkbox
-        )
-
-        controls.addWidget(
-            QLabel("X axis:")
-        )
-
+        controls.addWidget(QLabel("X:"))
         self.x_axis_combo = QComboBox()
+        self.x_axis_combo.addItem("Elapsed time", "elapsed")
+        self.x_axis_combo.addItem("Robot time", "robot")
+        controls.addWidget(self.x_axis_combo)
+        layout.addLayout(controls)
 
-        self.x_axis_combo.addItem(
-            "Elapsed time (s)",
-            "elapsed",
-        )
-
-        self.x_axis_combo.addItem(
-            "Robot time",
-            "robot",
-        )
-
-        controls.addWidget(
-            self.x_axis_combo
-        )
-
-        layout.addLayout(
-            controls
-        )
-
-        splitter = QSplitter(
-            Qt.Orientation.Horizontal
-        )
+        split = QSplitter(Qt.Orientation.Horizontal)
 
         left = QWidget()
-
-        left_layout = QVBoxLayout(
-            left
-        )
-
-        left_layout.addWidget(
-            QLabel(
-                "Available numeric signals"
-            )
-        )
-
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Available numeric signals"))
         self.signal_list = QListWidget()
+        self.signal_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        ll.addWidget(self.signal_list)
 
-        self.signal_list.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection
-        )
-
-        left_layout.addWidget(
-            self.signal_list
-        )
-
-        left_layout.addWidget(
-            QLabel(
-                "Currently plotted"
-            )
-        )
-
+        ll.addWidget(QLabel("Currently plotted"))
         self.plotted_list = QListWidget()
+        ll.addWidget(self.plotted_list)
 
-        self.plotted_list.setSelectionMode(
-            QListWidget.SelectionMode.SingleSelection
-        )
+        ll.addWidget(QLabel("Cursor values"))
+        self.cursor_table = QTableWidget(0, 2)
+        self.cursor_table.setHorizontalHeaderLabels(["Signal", "Value"])
+        self.cursor_table.horizontalHeader().setStretchLastSection(True)
+        self.cursor_table.setMaximumHeight(220)
+        ll.addWidget(self.cursor_table)
 
-        self.plotted_list.setToolTip(
-            "Select a signal to temporarily highlight it blue on the graph. "
-            "If the curve was hidden it will be shown while selected."
-        )
-
-        left_layout.addWidget(
-            self.plotted_list
-        )
-
-        left.setMaximumWidth(
-            360
-        )
-
-        splitter.addWidget(
-            left
-        )
+        self.measure_label = QLabel("Measurement region: off")
+        self.measure_label.setWordWrap(True)
+        ll.addWidget(self.measure_label)
+        left.setMaximumWidth(410)
+        split.addWidget(left)
 
         self.plot_widget = pg.PlotWidget()
-
-        self.plot_widget.showGrid(
-            x=True,
-            y=True,
-            alpha=0.3,
-        )
-
-        self.plot_widget.setLabel(
-            "bottom",
-            "Elapsed time",
-            units="s",
-        )
-
-        self.plot_widget.setLabel(
-            "left",
-            "Value",
-        )
-
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("bottom", "Elapsed time", units="s")
+        self.plot_widget.setLabel("left", "Value")
         self.plot_widget.addLegend()
+        self.plot_widget.addItem(self.cursor_line)
+        self.plot_widget.addItem(self.measure_region)
+        split.addWidget(self.plot_widget)
+        split.setStretchFactor(1, 1)
 
-        splitter.addWidget(
-            self.plot_widget
-        )
+        layout.addWidget(split, 1)
+        self.tabs.addTab(page, "Plots")
 
-        splitter.setStretchFactor(
-            1,
-            1,
-        )
-
-        layout.addWidget(
-            splitter,
-            1,
-        )
-
-        self.tabs.addTab(
-            page,
-            "Plots",
-        )
-
-        self.signal_filter.textChanged.connect(
-            self.apply_signal_filter
-        )
-
-        self.add_selected_button.clicked.connect(
-            self.add_selected_signals
-        )
-
-        self.remove_selected_button.clicked.connect(
-            self.remove_selected_plot
-        )
-
-        self.clear_plots_button.clicked.connect(
-            self.clear_plots
-        )
-
-        self.plotted_list.itemSelectionChanged.connect(
-            self.on_plotted_selection_changed
-        )
-
-        self.auto_scale_button.clicked.connect(
-            self.auto_scale_plots
-        )
-
-        self.x_axis_combo.currentIndexChanged.connect(
-            self.reload_plots
-        )
-
-        self.show_faults_checkbox.stateChanged.connect(
-            self.refresh_fault_markers
-        )
-
-    # =================================================================
-    # Events tab
-    # =================================================================
+        self.signal_filter.textChanged.connect(self.apply_signal_filter)
+        self.add_button.clicked.connect(self.add_selected_signals)
+        self.remove_button.clicked.connect(self.remove_selected_plot)
+        self.clear_button.clicked.connect(self.clear_plots)
+        self.autoscale_button.clicked.connect(self.auto_scale_plots)
+        self.derived_button.clicked.connect(self.add_derived_signal)
+        self.measure_button.clicked.connect(self.toggle_measure_region)
+        self.anomaly_button.clicked.connect(self.find_anomalies)
+        self.clear_anomaly_button.clicked.connect(self.clear_anomalies)
+        self.x_axis_combo.currentIndexChanged.connect(self.reload_plots)
+        self.plotted_list.itemSelectionChanged.connect(self.highlight_selected_curve)
+        self.show_faults.stateChanged.connect(self.refresh_markers)
+        self.show_commands.stateChanged.connect(self.refresh_markers)
+        self.show_parameters.stateChanged.connect(self.refresh_markers)
+        self.show_states.stateChanged.connect(self.refresh_markers)
+        self.measure_region.sigRegionChanged.connect(self.update_measurement)
+        self.plot_widget.scene().sigMouseClicked.connect(self.plot_clicked)
 
     def _build_events_tab(self):
         page = QWidget()
-
-        layout = QVBoxLayout(
-            page
-        )
+        layout = QVBoxLayout(page)
 
         controls = QHBoxLayout()
-
-        controls.addWidget(
-            QLabel("Show:")
-        )
-
-        self.show_fault_events = QCheckBox(
-            "Fault markers"
-        )
-
-        self.show_fault_events.setChecked(
-            True
-        )
-
-        self.show_logs = QCheckBox(
-            "Logs"
-        )
-
-        self.show_logs.setChecked(
-            True
-        )
-
-        self.show_commands = QCheckBox(
-            "Commands"
-        )
-
-        self.show_commands.setChecked(
-            True
-        )
-
-        self.show_parameters = QCheckBox(
-            "Parameter changes"
-        )
-
-        self.show_parameters.setChecked(
-            True
-        )
-
-        self.show_states = QCheckBox(
-            "Robot states"
-        )
-
-        self.show_states.setChecked(
-            True
-        )
-
-        for widget in (
-            self.show_fault_events,
-            self.show_logs,
-            self.show_commands,
-            self.show_parameters,
-            self.show_states,
-        ):
-            controls.addWidget(
-                widget
-            )
-
-            widget.stateChanged.connect(
-                self.load_events
-            )
-
+        self.ev_fault = QCheckBox("Faults"); self.ev_fault.setChecked(True)
+        self.ev_logs = QCheckBox("Logs"); self.ev_logs.setChecked(True)
+        self.ev_commands = QCheckBox("Commands"); self.ev_commands.setChecked(True)
+        self.ev_parameters = QCheckBox("Parameters"); self.ev_parameters.setChecked(True)
+        self.ev_states = QCheckBox("States"); self.ev_states.setChecked(True)
+        self.ev_annotations = QCheckBox("Annotations"); self.ev_annotations.setChecked(True)
+        for w in (self.ev_fault, self.ev_logs, self.ev_commands, self.ev_parameters, self.ev_states, self.ev_annotations):
+            controls.addWidget(w)
+            w.stateChanged.connect(self.load_events)
         controls.addStretch()
+        layout.addLayout(controls)
 
-        layout.addLayout(
-            controls
-        )
+        self.events_table = QTableWidget(0, 4)
+        self.events_table.setHorizontalHeaderLabels(["Elapsed (s)", "Type", "Name / Level", "Details"])
+        self.events_table.horizontalHeader().setStretchLastSection(True)
+        self.events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.events_table.cellDoubleClicked.connect(self.jump_to_event)
+        layout.addWidget(self.events_table)
 
-        self.events_table = QTableWidget(
-            0,
-            4,
-        )
-
-        self.events_table.setHorizontalHeaderLabels(
-            [
-                "Elapsed (s)",
-                "Type",
-                "Name / Level",
-                "Details",
-            ]
-        )
-
-        self.events_table.horizontalHeader().setStretchLastSection(
-            True
-        )
-
-        self.events_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
-        )
-
-        layout.addWidget(
-            self.events_table
-        )
-
-        self.tabs.addTab(
-            page,
-            "Events",
-        )
-
-    # =================================================================
-    # Raw serial
-    # =================================================================
+        hint = QLabel("Tip: double-click any event to centre the plot around it.")
+        layout.addWidget(hint)
+        self.tabs.addTab(page, "Events")
 
     def _build_raw_tab(self):
         page = QWidget()
-
-        layout = QVBoxLayout(
-            page
-        )
-
-        self.raw_table = QTableWidget(
-            0,
-            3,
-        )
-
-        self.raw_table.setHorizontalHeaderLabels(
-            [
-                "Elapsed (s)",
-                "Wall Time",
-                "Serial Line",
-            ]
-        )
-
-        self.raw_table.horizontalHeader().setStretchLastSection(
-            True
-        )
-
-        self.raw_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
-        )
-
-        layout.addWidget(
-            self.raw_table
-        )
-
-        self.tabs.addTab(
-            page,
-            "Raw Serial",
-        )
-
-    # =================================================================
-    # Metadata
-    # =================================================================
+        layout = QVBoxLayout(page)
+        self.raw_table = QTableWidget(0, 3)
+        self.raw_table.setHorizontalHeaderLabels(["Elapsed (s)", "Wall Time", "Serial Line"])
+        self.raw_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.raw_table)
+        self.tabs.addTab(page, "Raw Serial")
 
     def _build_metadata_tab(self):
         page = QWidget()
+        layout = QVBoxLayout(page)
+        self.metadata_text = QTextEdit()
+        self.metadata_text.setReadOnly(True)
+        layout.addWidget(self.metadata_text)
+        self.tabs.addTab(page, "Session Info")
 
-        layout = QFormLayout(
-            page
-        )
-
-        self.metadata_layout = layout
-        self.metadata_widgets = []
-
-        self.tabs.addTab(
-            page,
-            "Session Info",
-        )
-
-    # =================================================================
-    # Files
-    # =================================================================
+    # ------------------------------------------------------------------
+    # Recording loading
+    # ------------------------------------------------------------------
 
     def refresh_recordings(self):
-        current = (
-            self.file_combo.currentData()
-        )
-
+        current = self.file_combo.currentData()
         self.file_combo.clear()
-
-        files = sorted(
-            DATA_DIR.glob("*.rdbg"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-
-        for path in files:
-            self.file_combo.addItem(
-                path.name,
-                str(path),
-            )
-
+        files = sorted(DATA_DIR.glob("*.rdbg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files:
+            self.file_combo.addItem(f.name, str(f))
         if current:
-            index = (
-                self.file_combo.findData(
-                    current
-                )
-            )
-
-            if index >= 0:
-                self.file_combo.setCurrentIndex(
-                    index
-                )
+            idx = self.file_combo.findData(current)
+            if idx >= 0:
+                self.file_combo.setCurrentIndex(idx)
 
     def open_selected_recording(self):
-        path = (
-            self.file_combo.currentData()
-        )
-
+        path = self.file_combo.currentData()
         if path:
-            self.load_recording(
-                Path(path)
-            )
+            self.load_recording(Path(path))
 
     def browse_recording(self):
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Robot Recording",
-            str(DATA_DIR),
-            (
-                "Robot Debug Recording (*.rdbg);;"
-                "SQLite Database (*.sqlite *.db);;"
-                "All Files (*)"
-            ),
-        )
+        name, _ = QFileDialog.getOpenFileName(self, "Open Robot Recording", str(DATA_DIR), "Robot Debug Recording (*.rdbg)")
+        if name:
+            self.load_recording(Path(name))
 
-        if filename:
-            self.load_recording(
-                Path(filename)
-            )
-
-    def load_recording(
-        self,
-        path: Path,
-    ):
+    def load_recording(self, path: Path):
         try:
             if self.conn is not None:
                 self.conn.close()
-
-            self.conn = sqlite3.connect(
-                path
-            )
-
+            self.conn = sqlite3.connect(path)
             self.db_path = path
-
+            self.signal_cache.clear()
+            self.derived.clear()
             self.clear_plots()
-            self.clear_fault_markers()
-            self.signal_data.clear()
-
-            self.load_metadata()
             self.load_signal_names()
             self.load_events()
-            self.load_raw_serial()
+            self.load_raw()
+            self.load_metadata()
             self.update_summary()
-            self.refresh_fault_markers()
-
-            self.statusBar().showMessage(
-                f"Loaded {path.name}"
-            )
-
+            self.refresh_markers()
+            self.statusBar().showMessage(f"Loaded {path}")
         except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Could not open recording",
-                f"{path}\n\n{exc}",
-            )
+            QMessageBox.critical(self, "Could not open recording", str(exc))
 
-    # =================================================================
-    # Metadata / summary
-    # =================================================================
+    def browse_compare_recording(self):
+        name, _ = QFileDialog.getOpenFileName(self, "Open comparison recording", str(DATA_DIR), "Robot Debug Recording (*.rdbg)")
+        if not name:
+            return
+        try:
+            if self.compare_conn is not None:
+                self.compare_conn.close()
+            self.compare_path = Path(name)
+            self.compare_conn = sqlite3.connect(self.compare_path)
+            self.compare_offset = 0.0
+            self.signal_cache = {k: v for k, v in self.signal_cache.items() if k[0] != "compare"}
+            self.reload_plots()
+            self.statusBar().showMessage(f"Comparison loaded: {self.compare_path.name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not load comparison", str(exc))
 
-    def metadata(self) -> dict:
-        if self.conn is None:
-            return {}
+    def clear_compare(self):
+        if self.compare_conn is not None:
+            self.compare_conn.close()
+        self.compare_conn = None
+        self.compare_path = None
+        self.compare_offset = 0.0
+        for curve in self.compare_curves.values():
+            self.plot_widget.removeItem(curve)
+        self.compare_curves.clear()
+        self.statusBar().showMessage("Comparison cleared")
 
-        return dict(
-            self.conn.execute(
-                "SELECT key, value FROM metadata"
-            ).fetchall()
-        )
+    def _first_fault(self, conn):
+        if conn is None or not self.table_exists(conn, "faults"):
+            return None
+        row = conn.execute("SELECT elapsed_s FROM faults ORDER BY elapsed_s LIMIT 1").fetchone()
+        return None if row is None else float(row[0])
 
-    def load_metadata(self):
-        for label, widget in self.metadata_widgets:
-            self.metadata_layout.removeWidget(
-                label
-            )
-
-            self.metadata_layout.removeWidget(
-                widget
-            )
-
-            label.deleteLater()
-            widget.deleteLater()
-
-        self.metadata_widgets.clear()
-
-        for key, value in sorted(
-            self.metadata().items()
-        ):
-            label = QLabel(
-                key
-            )
-
-            value_label = QLabel(
-                str(value)
-            )
-
-            value_label.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-
-            self.metadata_layout.addRow(
-                label,
-                value_label,
-            )
-
-            self.metadata_widgets.append(
-                (
-                    label,
-                    value_label,
-                )
-            )
+    def align_compare_to_first_fault(self):
+        if self.conn is None or self.compare_conn is None:
+            QMessageBox.information(self, "Compare", "Load both a main and comparison recording first.")
+            return
+        a = self._first_fault(self.conn)
+        b = self._first_fault(self.compare_conn)
+        if a is None or b is None:
+            QMessageBox.information(self, "Compare", "Both recordings need at least one fault marker.")
+            return
+        self.compare_offset = a - b
+        self.reload_plots()
+        self.statusBar().showMessage(f"Comparison aligned: first fault at {a:.3f} s")
 
     def update_summary(self):
         if self.conn is None:
-            self.summary_label.setText(
-                "No recording loaded."
-            )
             return
-
-        metadata = self.metadata()
-
-        samples = self.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM telemetry
-            """
-        ).fetchone()[0]
-
-        signals = self.conn.execute(
-            """
-            SELECT COUNT(DISTINCT signal)
-            FROM telemetry
-            """
-        ).fetchone()[0]
-
-        duration = self.conn.execute(
-            """
-            SELECT COALESCE(
-                MAX(elapsed_s),
-                0
-            )
-            FROM telemetry
-            """
-        ).fetchone()[0]
-
+        meta = self.get_metadata(self.conn)
+        sigs = self.conn.execute("SELECT COUNT(DISTINCT signal) FROM telemetry").fetchone()[0]
+        samples = self.conn.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0]
+        duration = self.conn.execute("SELECT COALESCE(MAX(elapsed_s),0) FROM telemetry").fetchone()[0]
         faults = 0
-
-        if self.table_exists(
-            "faults"
-        ):
-            faults = self.conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM faults
-                """
-            ).fetchone()[0]
-
-        session_name = (
-            metadata.get(
-                "session_name"
-            )
-            or self.db_path.stem
-        )
-
+        if self.table_exists(self.conn, "faults"):
+            faults = self.conn.execute("SELECT COUNT(*) FROM faults").fetchone()[0]
+        compare = f" | Compare: {self.compare_path.name}" if self.compare_path else ""
         self.summary_label.setText(
-            f"{session_name}"
-            f"    |    {duration:.2f} s"
-            f"    |    {signals} signals"
-            f"    |    {samples:,} telemetry samples"
-            f"    |    {faults} fault markers"
+            f"{self.db_path.name} | {duration:.2f} s | {sigs} signals | {samples} telemetry rows | "
+            f"{faults} faults | Test: {meta.get('test_name','—')}{compare}"
         )
-
-    # =================================================================
-    # Signals / plotting
-    # =================================================================
 
     def load_signal_names(self):
         self.signal_list.clear()
-
         if self.conn is None:
             return
-
         rows = self.conn.execute(
-            """
-            SELECT DISTINCT signal
-            FROM telemetry
-            WHERE value_num IS NOT NULL
-            ORDER BY signal
-            """
-        ).fetchall()
-
-        for signal, in rows:
-            self.signal_list.addItem(
-                signal
-            )
-
-        self.apply_signal_filter()
+            "SELECT DISTINCT signal FROM telemetry WHERE value_num IS NOT NULL ORDER BY signal"
+        )
+        for (name,) in rows:
+            self.signal_list.addItem(str(name))
 
     def apply_signal_filter(self):
-        text = (
-            self.signal_filter.text()
-            .strip()
-            .lower()
-        )
+        needle = self.signal_filter.text().strip().lower()
+        for i in range(self.signal_list.count()):
+            item = self.signal_list.item(i)
+            item.setHidden(needle not in item.text().lower())
 
-        for index in range(
-            self.signal_list.count()
-        ):
-            item = (
-                self.signal_list.item(
-                    index
-                )
-            )
-
-            item.setHidden(
-                text
-                not in item.text().lower()
-            )
-
-    def get_signal_data(
-        self,
-        signal: str,
-    ):
-        if self.conn is None:
-            return [], [], []
-
-        rows = self.conn.execute(
-            """
-            SELECT
-                elapsed_s,
-                robot_time,
-                value_num
-            FROM telemetry
-            WHERE signal = ?
-              AND value_num IS NOT NULL
-            ORDER BY elapsed_s
-            """,
-            (signal,),
-        ).fetchall()
-
-        elapsed = [
-            row[0]
-            for row in rows
-        ]
-
-        robot = [
-            row[1]
-            for row in rows
-        ]
-
-        values = [
-            row[2]
-            for row in rows
-        ]
-
-        return (
-            elapsed,
-            robot,
-            values,
-        )
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
 
     def add_selected_signals(self):
-        for item in (
-            self.signal_list.selectedItems()
-        ):
-            signal = item.text()
-
-            if signal in self.plot_curves:
-                continue
-
-            elapsed, robot, values = (
-                self.get_signal_data(
-                    signal
-                )
-            )
-
-            self.signal_data[
-                signal
-            ] = (
-                elapsed,
-                robot,
-                values,
-            )
-
-            x = self._choose_x(
-                elapsed,
-                robot,
-            )
-
-            curve = self.plot_widget.plot(
-                x,
-                values,
-                name=signal,
-            )
-
-            self.plot_curves[
-                signal
-            ] = curve
-
-            self.plotted_list.addItem(
-                signal
-            )
-
-        self._update_x_label()
-
-        # PyQtGraph automatically ranges the view when the first curve is
-        # added. For an all-zero signal that produces an absurdly tiny
-        # Y-range around 0. Force a useful default range instead.
+        for item in self.signal_list.selectedItems():
+            self._add_signal(item.text())
         self.ensure_sensible_zero_only_view()
+        self.refresh_markers()
 
-        self.refresh_fault_markers()
+    def _add_signal(self, name: str):
+        if name in self.plot_curves:
+            return
+        s = self._series(name, "main")
+        x = self._x_values(s, "main")
+        finite = np.isfinite(x) & np.isfinite(s.values)
+        curve = self.plot_widget.plot(x[finite], s.values[finite], name=name)
+        self.plot_curves[name] = curve
+        self.plotted_list.addItem(name)
 
-    def _choose_x(
-        self,
-        elapsed,
-        robot,
-    ):
-        if (
-            self.x_axis_combo.currentData()
-            != "robot"
-        ):
-            return elapsed
-
-        if (
-            robot
-            and all(
-                value is not None
-                for value in robot
-            )
-        ):
-            first = robot[0]
-
-            span = (
-                max(robot)
-                - min(robot)
-                if len(robot) > 1
-                else 0
-            )
-
-            if abs(span) > 1000:
-                return [
-                    (value - first)
-                    / 1000.0
-                    for value in robot
-                ]
-
-            return [
-                value
-                - first
-                for value in robot
-            ]
-
-        return elapsed
-
-    def _update_x_label(self):
-        if (
-            self.x_axis_combo.currentData()
-            == "robot"
-        ):
-            self.plot_widget.setLabel(
-                "bottom",
-                "Relative robot time",
-                units="s",
-            )
-
-        else:
-            self.plot_widget.setLabel(
-                "bottom",
-                "Elapsed time",
-                units="s",
-            )
+        if self.compare_conn is not None:
+            cs = self._series(name, "compare")
+            cx = self._x_values(cs, "compare")
+            cfinite = np.isfinite(cx) & np.isfinite(cs.values)
+            if cfinite.any():
+                pen = pg.mkPen(style=Qt.PenStyle.DashLine, width=2)
+                ccurve = self.plot_widget.plot(cx[cfinite], cs.values[cfinite], pen=pen, name=f"{name} [compare]")
+                self.compare_curves[name] = ccurve
 
     def reload_plots(self):
-        for signal, curve in (
-            self.plot_curves.items()
-        ):
-            elapsed, robot, values = (
-                self.signal_data[
-                    signal
-                ]
-            )
-
-            curve.setData(
-                self._choose_x(
-                    elapsed,
-                    robot,
-                ),
-                values,
-            )
-
-        self._update_x_label()
-        self.refresh_fault_markers()
-
-
-    # =================================================================
-    # Temporary selected-curve highlighting
-    # =================================================================
-
-    def on_plotted_selection_changed(self):
-        """
-        Highlight the selected plotted signal in bright blue.
-
-        The curve is forced visible while selected. Its previous visibility,
-        pen and Z-order are restored when the selection is cleared or another
-        plotted signal is selected.
-        """
-        selected = self.plotted_list.selectedItems()
-
-        new_signal = (
-            selected[0].text()
-            if selected
-            else None
-        )
-
-        if new_signal == self.highlighted_signal:
-            return
-
-        self.restore_highlighted_curve()
-
-        if new_signal is None:
-            return
-
-        curve = self.plot_curves.get(
-            new_signal
-        )
-
-        if curve is None:
-            return
-
-        self.highlighted_signal = new_signal
-        self.highlighted_original_pen = curve.opts.get(
-            "pen"
-        )
-        self.highlighted_original_visible = curve.isVisible()
-        self.highlighted_original_z = curve.zValue()
-
-        # A selected signal must always be visible, even if it had previously
-        # been hidden by some other interaction.
-        curve.setVisible(
-            True
-        )
-
-        # Bright blue, deliberately thicker than normal plot lines so it is
-        # obvious which signal is being inspected.
-        curve.setPen(
-            pg.mkPen(
-                color=(0, 120, 255),
-                width=4,
-            )
-        )
-
-        # Draw the highlighted curve over the other traces.
-        curve.setZValue(
-            1000
-        )
-
-    def restore_highlighted_curve(self):
-        """
-        Restore the previously highlighted signal exactly as it was before
-        selection, including whether it was hidden.
-        """
-        if self.highlighted_signal is None:
-            return
-
-        curve = self.plot_curves.get(
-            self.highlighted_signal
-        )
-
-        if curve is not None:
-            if self.highlighted_original_pen is not None:
-                curve.setPen(
-                    self.highlighted_original_pen
-                )
-
-            if self.highlighted_original_visible is not None:
-                curve.setVisible(
-                    self.highlighted_original_visible
-                )
-
-            if self.highlighted_original_z is not None:
-                curve.setZValue(
-                    self.highlighted_original_z
-                )
-
-        self.highlighted_signal = None
-        self.highlighted_original_pen = None
-        self.highlighted_original_visible = None
-        self.highlighted_original_z = None
-
-    def eventFilter(
-        self,
-        watched,
-        event,
-    ):
-        """
-        Clear the temporary plotted-signal selection whenever the user clicks
-        outside the \"Currently plotted\" QListWidget.
-
-        This is what makes a curve that was hidden before selection disappear
-        again immediately after the user clicks elsewhere in the GUI.
-        """
-        if (
-            event.type()
-            == QEvent.Type.MouseButtonPress
-            and hasattr(self, "plotted_list")
-            and self.plotted_list.selectedItems()
-        ):
-            widget = watched
-            inside_plotted_list = False
-
-            # Mouse events may be delivered to the list viewport, scrollbar,
-            # or another child widget, so walk up the QWidget parent chain.
-            while isinstance(widget, QWidget):
-                if widget is self.plotted_list:
-                    inside_plotted_list = True
-                    break
-
-                widget = widget.parentWidget()
-
-            if not inside_plotted_list:
-                self.plotted_list.clearSelection()
-
-        return super().eventFilter(
-            watched,
-            event,
-        )
-
-
-    def ensure_sensible_zero_only_view(self):
-        """
-        If every finite sample on every visible curve is exactly zero, force
-        a useful default Y range instead of allowing PyQtGraph to zoom into a
-        microscopic range such as +/-1e-12.
-
-        X still fits the available recording time so the zero trace is useful.
-        """
-        if not self.plot_curves:
-            return False
-
-        finite_x = []
-        saw_finite_y = False
-
-        for signal, curve in self.plot_curves.items():
-            if not curve.isVisible():
-                continue
-
-            data = self.signal_data.get(signal)
-            if not data:
-                continue
-
-            elapsed, robot, values = data
-            x_values = self._choose_x(elapsed, robot)
-
-            for x_value, y_value in zip(x_values, values):
-                try:
-                    x = float(x_value)
-                    y = float(y_value)
-                except (TypeError, ValueError):
-                    continue
-
-                if not (math.isfinite(x) and math.isfinite(y)):
-                    continue
-
-                saw_finite_y = True
-
-                # As soon as there is any real non-zero data this is not the
-                # special zero-only case.
-                if y != 0.0:
-                    return False
-
-                finite_x.append(x)
-
-        if not saw_finite_y:
-            return False
-
-        # Keep a normal, human-readable vertical range around zero.
-        self.plot_widget.setYRange(
-            -1.0,
-            1.0,
-            padding=0.0,
-        )
-
-        # Fit the time axis without allowing a zero-width range.
-        if finite_x:
-            x_min = min(finite_x)
-            x_max = max(finite_x)
-
-            if x_min == x_max:
-                x_min -= 0.5
-                x_max += 0.5
-            else:
-                x_pad = max((x_max - x_min) * 0.05, 0.05)
-                x_min -= x_pad
-                x_max += x_pad
-
-            self.plot_widget.setXRange(
-                x_min,
-                x_max,
-                padding=0.0,
-            )
-        else:
-            self.plot_widget.setXRange(
-                0.0,
-                10.0,
-                padding=0.0,
-            )
-
-        return True
-
-
-    def auto_scale_plots(self):
-        """
-        Fit all currently visible plotted telemetry onto the screen.
-
-        The bounds are calculated manually from finite telemetry samples rather
-        than using PyQtGraph's generic autoRange().  This deliberately ignores
-        NaN/Inf samples and non-data items such as fault-marker InfiniteLines
-        and text labels, preventing errors such as:
-
-            Exception: Cannot set range [nan, nan]
-        """
-        if not self.plot_curves:
-            return
-
-        x_min = None
-        x_max = None
-        y_min = None
-        y_max = None
-
-        for signal, curve in self.plot_curves.items():
-            # Hidden curves should not affect the requested view.  A curve that
-            # is temporarily highlighted is forced visible, so it is included.
-            if not curve.isVisible():
-                continue
-
-            data = self.signal_data.get(signal)
-            if not data:
-                continue
-
-            elapsed, robot, values = data
-            x_values = self._choose_x(elapsed, robot)
-
-            for x_value, y_value in zip(x_values, values):
-                try:
-                    x = float(x_value)
-                    y = float(y_value)
-                except (TypeError, ValueError):
-                    continue
-
-                if not (math.isfinite(x) and math.isfinite(y)):
-                    continue
-
-                if x_min is None or x < x_min:
-                    x_min = x
-                if x_max is None or x > x_max:
-                    x_max = x
-                if y_min is None or y < y_min:
-                    y_min = y
-                if y_max is None or y > y_max:
-                    y_max = y
-
-        # There may be plotted signals but no finite visible samples.
-        if None in (x_min, x_max, y_min, y_max):
-            self.statusBar().showMessage(
-                "Auto Scale: no finite visible telemetry data to scale."
-            )
-            return
-
-        # All-zero data is a special case. PyQtGraph's normal auto-ranging can
-        # choose a microscopic range around zero, which is not useful. Reset
-        # to a sensible default vertical view instead.
-        if y_min == 0.0 and y_max == 0.0:
-            self.ensure_sensible_zero_only_view()
-            self.statusBar().showMessage(
-                "Auto Scale: visible telemetry is all zero; using default zero range."
-            )
-            return
-
-        # ViewBox needs a non-zero range on each axis.
-        if x_min == x_max:
-            x_pad = max(abs(x_min) * 0.05, 1.0)
-            x_min -= x_pad
-            x_max += x_pad
-
-        if y_min == y_max:
-            y_pad = max(abs(y_min) * 0.05, 1.0)
-            y_min -= y_pad
-            y_max += y_pad
-
-        # Disable continuous auto-ranging after calculating the one-shot fit,
-        # otherwise later plot/item changes can unexpectedly alter the view.
-        self.plot_widget.disableAutoRange()
-
-        self.plot_widget.setRange(
-            xRange=(x_min, x_max),
-            yRange=(y_min, y_max),
-            padding=0.05,
-        )
-
-        self.statusBar().showMessage(
-            "Auto Scale: fitted all visible finite telemetry."
-        )
+        names = list(self.plot_curves)
+        self.clear_plot_items_only()
+        self.plotted_list.clear()
+        for name in names:
+            self._add_signal(name)
+        self.refresh_markers()
+        self.update_cursor_values()
+        self.update_measurement()
+
+    def clear_plot_items_only(self):
+        self.restore_highlight()
+        for curve in list(self.plot_curves.values()) + list(self.compare_curves.values()):
+            self.plot_widget.removeItem(curve)
+        self.plot_curves.clear()
+        self.compare_curves.clear()
 
     def remove_selected_plot(self):
-        selected_items = list(
-            self.plotted_list.selectedItems()
-        )
-
-        # Restore temporary styling/visibility before deleting the curve.
-        self.restore_highlighted_curve()
-
-        for item in selected_items:
-            signal = item.text()
-
-            curve = self.plot_curves.pop(
-                signal,
-                None,
-            )
-
+        for item in list(self.plotted_list.selectedItems()):
+            name = item.text()
+            self.restore_highlight()
+            curve = self.plot_curves.pop(name, None)
             if curve is not None:
-                self.plot_widget.removeItem(
-                    curve
-                )
-
-            self.signal_data.pop(
-                signal,
-                None,
-            )
-
-            self.plotted_list.takeItem(
-                self.plotted_list.row(
-                    item
-                )
-            )
+                self.plot_widget.removeItem(curve)
+            ccurve = self.compare_curves.pop(name, None)
+            if ccurve is not None:
+                self.plot_widget.removeItem(ccurve)
+            self.plotted_list.takeItem(self.plotted_list.row(item))
+        self.update_cursor_values()
 
     def clear_plots(self):
-        self.restore_highlighted_curve()
-
-        for curve in (
-            self.plot_curves.values()
-        ):
-            self.plot_widget.removeItem(
-                curve
-            )
-
-        self.plot_curves.clear()
-        self.signal_data.clear()
+        self.clear_plot_items_only()
         self.plotted_list.clear()
+        self.cursor_table.setRowCount(0)
+        self.cursor_line.hide()
+        self.refresh_markers()
 
-        # Fault lines remain conceptually independent of selected signals.
-        self.refresh_fault_markers()
+    def auto_scale_plots(self):
+        visible = []
+        for name, curve in self.plot_curves.items():
+            if not curve.isVisible():
+                continue
+            s = self._series(name, "main")
+            x = self._x_values(s, "main")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            if mask.any():
+                visible.append((x[mask], s.values[mask]))
 
-    # =================================================================
-    # Fault markers
-    # =================================================================
+        for name, curve in self.compare_curves.items():
+            if not curve.isVisible():
+                continue
+            s = self._series(name, "compare")
+            x = self._x_values(s, "compare")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            if mask.any():
+                visible.append((x[mask], s.values[mask]))
 
-    def get_faults(self):
-        if (
-            self.conn is None
-            or not self.table_exists(
-                "faults"
-            )
-        ):
-            return []
-
-        return self.conn.execute(
-            """
-            SELECT
-                elapsed_s,
-                wall_time,
-                label
-            FROM faults
-            ORDER BY elapsed_s
-            """
-        ).fetchall()
-
-    def clear_fault_markers(self):
-        for line in self.fault_lines:
-            try:
-                self.plot_widget.removeItem(
-                    line
-                )
-            except Exception:
-                pass
-
-        for label in self.fault_labels:
-            try:
-                self.plot_widget.removeItem(
-                    label
-                )
-            except Exception:
-                pass
-
-        self.fault_lines.clear()
-        self.fault_labels.clear()
-
-    def refresh_fault_markers(self):
-        self.clear_fault_markers()
-
-        if (
-            self.conn is None
-            or not self.show_faults_checkbox.isChecked()
-        ):
+        if not visible:
             return
 
-        # Fault positions are recorded in elapsed PC time.
-        # If robot-time mode is selected, convert elapsed fault times to the
-        # closest available relative robot time so the marker still aligns.
-        for fault_number, (
-            elapsed_s,
-            wall_time,
-            label_text,
-        ) in enumerate(
-            self.get_faults(),
-            start=1,
-        ):
-            x_position = self.fault_x_position(
-                elapsed_s
-            )
+        all_x = np.concatenate([x for x, _ in visible])
+        all_y = np.concatenate([y for _, y in visible])
 
-            # Explicit bright red requested for manual fault markers.
-            line = pg.InfiniteLine(
-                pos=x_position,
-                angle=90,
-                movable=False,
-                pen=pg.mkPen(
-                    color=(255, 0, 0),
-                    width=3,
-                ),
-            )
+        if np.all(all_y == 0):
+            xmin, xmax = float(np.min(all_x)), float(np.max(all_x))
+            if xmin == xmax:
+                xmin, xmax = xmin - 0.5, xmax + 0.5
+            else:
+                pad = max((xmax - xmin) * 0.05, 0.05)
+                xmin, xmax = xmin - pad, xmax + pad
+            self.plot_widget.setXRange(xmin, xmax, padding=0)
+            self.plot_widget.setYRange(-1.0, 1.0, padding=0)
+            return
 
-            self.plot_widget.addItem(
-                line
-            )
+        xmin, xmax = float(np.min(all_x)), float(np.max(all_x))
+        ymin, ymax = float(np.min(all_y)), float(np.max(all_y))
 
-            self.fault_lines.append(
-                line
-            )
+        if xmin == xmax:
+            xmin, xmax = xmin - 0.5, xmax + 0.5
+        else:
+            px = max((xmax - xmin) * 0.05, 0.05)
+            xmin, xmax = xmin - px, xmax + px
 
-            label = pg.TextItem(
-                text=(
-                    f"FAULT {fault_number}"
-                ),
-                color=(255, 0, 0),
-                anchor=(0, 1),
-            )
+        if ymin == ymax:
+            py = max(abs(ymin) * 0.1, 1.0)
+        else:
+            py = (ymax - ymin) * 0.08
 
-            label.setPos(
-                x_position,
-                0,
-            )
+        self.plot_widget.setXRange(xmin, xmax, padding=0)
+        self.plot_widget.setYRange(ymin - py, ymax + py, padding=0)
 
-            self.plot_widget.addItem(
-                label
-            )
+    def ensure_sensible_zero_only_view(self):
+        ys = []
+        xs = []
+        for name in self.plot_curves:
+            s = self._series(name, "main")
+            x = self._x_values(s, "main")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            if mask.any():
+                xs.append(x[mask]); ys.append(s.values[mask])
+        if ys and all(np.all(y == 0) for y in ys):
+            x = np.concatenate(xs)
+            xmin, xmax = float(np.min(x)), float(np.max(x))
+            if xmin == xmax:
+                xmin, xmax = xmin - 0.5, xmax + 0.5
+            self.plot_widget.setXRange(xmin, xmax, padding=0)
+            self.plot_widget.setYRange(-1, 1, padding=0)
+            return True
+        return False
 
-            self.fault_labels.append(
-                label
-            )
+    # ------------------------------------------------------------------
+    # Temporary blue highlight
+    # ------------------------------------------------------------------
 
-    def fault_x_position(
-        self,
-        elapsed_s: float,
-    ) -> float:
-        if (
-            self.x_axis_combo.currentData()
-            != "robot"
-        ):
-            return float(
-                elapsed_s
-            )
+    def highlight_selected_curve(self):
+        self.restore_highlight()
+        items = self.plotted_list.selectedItems()
+        if not items:
+            return
+        name = items[0].text()
+        curve = self.plot_curves.get(name)
+        if curve is None:
+            return
+        self.highlighted_signal = name
+        self.highlighted_original_pen = curve.opts.get("pen")
+        self.highlighted_original_visible = curve.isVisible()
+        self.highlighted_original_z = curve.zValue()
+        curve.setVisible(True)
+        curve.setPen(pg.mkPen((0, 120, 255), width=4))
+        curve.setZValue(500)
 
-        if self.conn is None:
-            return float(
-                elapsed_s
-            )
+    def restore_highlight(self):
+        if self.highlighted_signal is None:
+            return
+        curve = self.plot_curves.get(self.highlighted_signal)
+        if curve is not None:
+            if self.highlighted_original_pen is not None:
+                curve.setPen(self.highlighted_original_pen)
+            curve.setVisible(bool(self.highlighted_original_visible))
+            curve.setZValue(self.highlighted_original_z or 0)
+        self.highlighted_signal = None
 
-        # Find the telemetry sample nearest to the manual fault.
-        row = self.conn.execute(
-            """
-            SELECT
-                robot_time
-            FROM telemetry
-            WHERE robot_time IS NOT NULL
-            ORDER BY ABS(
-                elapsed_s - ?
-            )
-            LIMIT 1
-            """,
-            (elapsed_s,),
-        ).fetchone()
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonPress and self.highlighted_signal is not None:
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else None
+            if pos is not None:
+                local = self.plotted_list.mapFromGlobal(pos)
+                if not self.plotted_list.rect().contains(local):
+                    self.restore_highlight()
+                    self.plotted_list.clearSelection()
+        return super().eventFilter(obj, event)
 
-        first = self.conn.execute(
-            """
-            SELECT
-                robot_time
-            FROM telemetry
-            WHERE robot_time IS NOT NULL
-            ORDER BY elapsed_s
-            LIMIT 1
-            """
-        ).fetchone()
+    # ------------------------------------------------------------------
+    # Cursor
+    # ------------------------------------------------------------------
 
-        last = self.conn.execute(
-            """
-            SELECT
-                robot_time
-            FROM telemetry
-            WHERE robot_time IS NOT NULL
-            ORDER BY elapsed_s DESC
-            LIMIT 1
-            """
-        ).fetchone()
+    def plot_clicked(self, ev):
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self.plot_widget.getPlotItem().sceneBoundingRect().contains(ev.scenePos()):
+            return
+        mouse = self.plot_widget.getPlotItem().vb.mapSceneToView(ev.scenePos())
+        self.cursor_line.setPos(mouse.x())
+        self.cursor_line.show()
+        self.update_cursor_values()
 
-        if (
-            row is None
-            or first is None
-            or row[0] is None
-            or first[0] is None
-        ):
-            return float(
-                elapsed_s
-            )
+    def update_cursor_values(self):
+        if not self.cursor_line.isVisible():
+            return
+        x0 = float(self.cursor_line.value())
+        rows = []
 
-        robot_time = float(
-            row[0]
+        for name in self.plot_curves:
+            s = self._series(name, "main")
+            x = self._x_values(s, "main")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            if not mask.any():
+                continue
+            xf, yf = x[mask], s.values[mask]
+            idx = int(np.argmin(np.abs(xf - x0)))
+            rows.append((name, yf[idx]))
+
+        for name in self.compare_curves:
+            s = self._series(name, "compare")
+            x = self._x_values(s, "compare")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            if not mask.any():
+                continue
+            xf, yf = x[mask], s.values[mask]
+            idx = int(np.argmin(np.abs(xf - x0)))
+            rows.append((f"{name} [compare]", yf[idx]))
+
+        self.cursor_table.setRowCount(len(rows))
+        for r, (name, value) in enumerate(rows):
+            self.cursor_table.setItem(r, 0, QTableWidgetItem(name))
+            self.cursor_table.setItem(r, 1, QTableWidgetItem(f"{value:.8g}"))
+        self.statusBar().showMessage(f"Cursor: {x0:.4f} s")
+
+    # ------------------------------------------------------------------
+    # Measurement region
+    # ------------------------------------------------------------------
+
+    def toggle_measure_region(self):
+        if self.measure_region.isVisible():
+            self.measure_region.hide()
+            self.measure_label.setText("Measurement region: off")
+            self.measure_button.setText("Measure Region")
+            return
+
+        xr = self.plot_widget.getPlotItem().vb.viewRange()[0]
+        a = xr[0] + 0.35 * (xr[1] - xr[0])
+        b = xr[0] + 0.65 * (xr[1] - xr[0])
+        self.measure_region.setRegion((a, b))
+        self.measure_region.show()
+        self.measure_button.setText("Hide Measure Region")
+        self.update_measurement()
+
+    def update_measurement(self):
+        if not self.measure_region.isVisible():
+            return
+        a, b = sorted(self.measure_region.getRegion())
+        lines = [f"{a:.3f}–{b:.3f} s  (Δt={b-a:.3f}s)"]
+        for name in self.plot_curves:
+            s = self._series(name, "main")
+            x = self._x_values(s, "main")
+            mask = np.isfinite(x) & np.isfinite(s.values) & (x >= a) & (x <= b)
+            vals = s.values[mask]
+            if len(vals):
+                std = float(np.std(vals)) if len(vals) > 1 else 0.0
+                lines.append(
+                    f"{name}: n={len(vals)} min={np.min(vals):.5g} max={np.max(vals):.5g} "
+                    f"mean={np.mean(vals):.5g} std={std:.5g} Δ={vals[-1]-vals[0]:.5g}"
+                )
+        self.measure_label.setText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Derived signals
+    # ------------------------------------------------------------------
+
+    def add_derived_signal(self):
+        name, ok = QInputDialog.getText(self, "Derived signal", "New signal name:")
+        if not ok or not name.strip():
+            return
+        expr, ok = QInputDialog.getText(
+            self,
+            "Derived signal expression",
+            'Expression, e.g. sig("drive.left_rpm") - sig("drive.right_rpm"):',
         )
+        if not ok or not expr.strip():
+            return
 
-        first_robot_time = float(
-            first[0]
-        )
+        name = name.strip()
+        try:
+            self.derived[name] = expr.strip()
+            self.signal_cache.pop(("main", name), None)
+            self._series(name, "main")  # validate now
+        except Exception as exc:
+            self.derived.pop(name, None)
+            QMessageBox.warning(self, "Derived signal error", str(exc))
+            return
 
-        span = 0.0
+        self.signal_list.addItem(name)
+        self._add_signal(name)
+        self.statusBar().showMessage(f"Derived signal added: {name}")
 
-        if (
-            last is not None
-            and last[0] is not None
-        ):
-            span = (
-                float(last[0])
-                - first_robot_time
-            )
+    # ------------------------------------------------------------------
+    # Event markers
+    # ------------------------------------------------------------------
 
-        if abs(span) > 1000:
-            return (
-                robot_time
-                - first_robot_time
-            ) / 1000.0
+    def _remove_markers(self):
+        for item in self.marker_items:
+            try:
+                self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+        self.marker_items.clear()
 
-        return (
-            robot_time
-            - first_robot_time
-        )
+    def _add_marker(self, x: float, label: str, color, width=2, style=Qt.PenStyle.SolidLine):
+        line = pg.InfiniteLine(pos=x, angle=90, movable=False, pen=pg.mkPen(color=color, width=width, style=style))
+        line.setZValue(800)
+        text = pg.InfLineLabel(line, text=label, position=0.92, rotateAxis=(1, 0), anchor=(1, 1))
+        self.plot_widget.addItem(line)
+        self.marker_items.extend([line, text])
 
-    # =================================================================
+    def refresh_markers(self):
+        self._remove_markers()
+        if self.conn is None or self.x_axis_combo.currentData() != "elapsed":
+            return
+
+        if self.show_faults.isChecked() and self.table_exists(self.conn, "faults"):
+            for elapsed, label in self.conn.execute("SELECT elapsed_s,label FROM faults ORDER BY elapsed_s"):
+                self._add_marker(float(elapsed), str(label), (255, 0, 0), width=3)
+
+        if self.show_commands.isChecked() and self.table_exists(self.conn, "commands"):
+            for elapsed, name in self.conn.execute("SELECT elapsed_s,command FROM commands ORDER BY elapsed_s"):
+                self._add_marker(float(elapsed), f"CMD {name}", (0, 170, 255), style=Qt.PenStyle.DashLine)
+
+        if self.show_parameters.isChecked() and self.table_exists(self.conn, "parameters"):
+            for elapsed, name in self.conn.execute("SELECT elapsed_s,name FROM parameters ORDER BY elapsed_s"):
+                self._add_marker(float(elapsed), f"PARAM {name}", (255, 170, 0), style=Qt.PenStyle.DotLine)
+
+        if self.show_states.isChecked() and self.table_exists(self.conn, "states"):
+            for elapsed, in self.conn.execute("SELECT elapsed_s FROM states ORDER BY elapsed_s"):
+                self._add_marker(float(elapsed), "STATE", (170, 0, 255), style=Qt.PenStyle.DashDotLine)
+
+    # ------------------------------------------------------------------
     # Events
-    # =================================================================
+    # ------------------------------------------------------------------
 
     def load_events(self):
-        self.events_table.setRowCount(
-            0
-        )
-
+        self.events_table.setRowCount(0)
         if self.conn is None:
             return
-
         events = []
 
-        if (
-            self.show_fault_events.isChecked()
-            and self.table_exists(
-                "faults"
-            )
-        ):
-            for (
-                elapsed,
-                label,
-            ) in self.conn.execute(
-                """
-                SELECT
-                    elapsed_s,
-                    label
-                FROM faults
-                """
-            ):
-                events.append(
-                    (
-                        elapsed,
-                        "FAULT",
-                        label,
-                        "Manual fault marker",
-                    )
-                )
+        if self.ev_fault.isChecked() and self.table_exists(self.conn, "faults"):
+            for t, label in self.conn.execute("SELECT elapsed_s,label FROM faults"):
+                events.append((t, "FAULT", label, "Manual fault marker"))
 
-        if self.show_logs.isChecked():
-            for (
-                elapsed,
-                level,
-                message,
-            ) in self.conn.execute(
-                """
-                SELECT
-                    elapsed_s,
-                    level,
-                    message
-                FROM logs
-                """
-            ):
-                events.append(
-                    (
-                        elapsed,
-                        "Log",
-                        level,
-                        message,
-                    )
-                )
+        if self.ev_logs.isChecked() and self.table_exists(self.conn, "logs"):
+            for t, level, msg in self.conn.execute("SELECT elapsed_s,level,message FROM logs"):
+                events.append((t, "LOG", level, msg))
 
-        if self.show_commands.isChecked():
-            for (
-                elapsed,
-                command,
-                arguments,
-            ) in self.conn.execute(
-                """
-                SELECT
-                    elapsed_s,
-                    command,
-                    arguments_json
-                FROM commands
-                """
-            ):
-                events.append(
-                    (
-                        elapsed,
-                        "Command",
-                        command,
-                        arguments,
-                    )
-                )
+        if self.ev_commands.isChecked() and self.table_exists(self.conn, "commands"):
+            for t, cmd, args in self.conn.execute("SELECT elapsed_s,command,arguments_json FROM commands"):
+                events.append((t, "COMMAND", cmd, args))
 
-        if self.show_parameters.isChecked():
-            for (
-                elapsed,
-                name,
-                value,
-            ) in self.conn.execute(
-                """
-                SELECT
-                    elapsed_s,
-                    name,
-                    value_json
-                FROM parameters
-                """
-            ):
-                events.append(
-                    (
-                        elapsed,
-                        "Parameter",
-                        name,
-                        value,
-                    )
-                )
+        if self.ev_parameters.isChecked() and self.table_exists(self.conn, "parameters"):
+            for t, name, value in self.conn.execute("SELECT elapsed_s,name,value_json FROM parameters"):
+                events.append((t, "PARAMETER", name, value))
 
-        if self.show_states.isChecked():
-            for (
-                elapsed,
-                state_json,
-            ) in self.conn.execute(
-                """
-                SELECT
-                    elapsed_s,
-                    state_json
-                FROM states
-                """
-            ):
-                events.append(
-                    (
-                        elapsed,
-                        "State",
-                        "",
-                        state_json,
-                    )
-                )
+        if self.ev_states.isChecked() and self.table_exists(self.conn, "states"):
+            for t, state in self.conn.execute("SELECT elapsed_s,state_json FROM states"):
+                events.append((t, "STATE", "Robot state", state))
 
-        events.sort(
-            key=lambda item: item[0]
-        )
+        if self.ev_annotations.isChecked() and self.table_exists(self.conn, "annotations"):
+            for t, label, note in self.conn.execute("SELECT elapsed_s,label,note FROM annotations"):
+                events.append((t, "ANNOTATION", label, note))
 
-        self.events_table.setRowCount(
-            len(events)
-        )
+        events.sort(key=lambda x: x[0])
+        self.events_table.setRowCount(len(events))
+        for row, event in enumerate(events):
+            for col, value in enumerate(event):
+                self.events_table.setItem(row, col, QTableWidgetItem(f"{value:.3f}" if col == 0 else str(value)))
 
-        for row, event in enumerate(
-            events
-        ):
-            display = (
-                f"{event[0]:.3f}",
-                event[1],
-                event[2],
-                event[3],
-            )
+    def jump_to_event(self, row: int, _col: int):
+        item = self.events_table.item(row, 0)
+        if item is None:
+            return
+        try:
+            t = float(item.text())
+        except ValueError:
+            return
+        self.tabs.setCurrentIndex(0)
+        self.plot_widget.setXRange(t - 3.0, t + 3.0, padding=0)
+        self.cursor_line.setPos(t)
+        self.cursor_line.show()
+        self.update_cursor_values()
 
-            for column, value in enumerate(
-                display
-            ):
-                self.events_table.setItem(
-                    row,
-                    column,
-                    QTableWidgetItem(
-                        str(value)
-                    ),
-                )
+    # ------------------------------------------------------------------
+    # Anomalies
+    # ------------------------------------------------------------------
 
-    # =================================================================
-    # Raw serial
-    # =================================================================
+    def clear_anomalies(self):
+        for item in self.anomaly_items:
+            try:
+                self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+        self.anomaly_items.clear()
 
-    def load_raw_serial(self):
-        self.raw_table.setRowCount(
-            0
-        )
-
-        if self.conn is None:
+    def find_anomalies(self):
+        self.clear_anomalies()
+        if not self.plot_curves:
             return
 
-        rows = self.conn.execute(
-            """
-            SELECT
-                elapsed_s,
-                wall_time,
-                line
-            FROM raw_serial
-            ORDER BY elapsed_s
-            """
-        ).fetchall()
+        total = 0
+        for name in self.plot_curves:
+            s = self._series(name, "main")
+            x = self._x_values(s, "main")
+            mask = np.isfinite(x) & np.isfinite(s.values)
+            x, y = x[mask], s.values[mask]
+            if len(y) < 8:
+                continue
 
-        self.raw_table.setRowCount(
-            len(rows)
-        )
+            median = np.median(y)
+            mad = np.median(np.abs(y - median))
+            if mad > 0:
+                robust_z = 0.6745 * (y - median) / mad
+                idx = np.where(np.abs(robust_z) > 6.0)[0]
+            else:
+                idx = np.array([], dtype=int)
 
-        for row, values in enumerate(
-            rows
-        ):
-            display = (
-                f"{values[0]:.3f}",
-                values[1],
-                values[2],
-            )
+            dy = np.diff(y)
+            if len(dy) >= 5:
+                dmed = np.median(dy)
+                dmad = np.median(np.abs(dy - dmed))
+                didx = np.where(np.abs(0.6745 * (dy - dmed) / dmad) > 8.0)[0] + 1 if dmad > 0 else np.array([], dtype=int)
+                idx = np.unique(np.concatenate([idx, didx]))
 
-            for column, value in enumerate(
-                display
-            ):
-                self.raw_table.setItem(
-                    row,
-                    column,
-                    QTableWidgetItem(
-                        str(value)
-                    ),
-                )
+            # Collapse markers closer than 50 ms.
+            last = -1e99
+            for i in idx:
+                if x[i] - last < 0.05:
+                    continue
+                line = pg.InfiniteLine(pos=float(x[i]), angle=90, movable=False, pen=pg.mkPen((255, 0, 255), width=1))
+                line.setZValue(700)
+                self.plot_widget.addItem(line)
+                self.anomaly_items.append(line)
+                last = x[i]
+                total += 1
 
-    # =================================================================
+        self.statusBar().showMessage(f"Anomaly scan: {total} candidate points marked in magenta")
+
+    # ------------------------------------------------------------------
+    # Raw / metadata
+    # ------------------------------------------------------------------
+
+    def load_raw(self):
+        self.raw_table.setRowCount(0)
+        if self.conn is None or not self.table_exists(self.conn, "raw_serial"):
+            return
+        rows = self.conn.execute("SELECT elapsed_s,wall_time,line FROM raw_serial ORDER BY elapsed_s").fetchall()
+        self.raw_table.setRowCount(len(rows))
+        for r, values in enumerate(rows):
+            for c, value in enumerate(values):
+                self.raw_table.setItem(r, c, QTableWidgetItem(f"{value:.3f}" if c == 0 else str(value)))
+
+    def load_metadata(self):
+        if self.conn is None:
+            self.metadata_text.clear()
+            return
+        meta = self.get_metadata(self.conn)
+        lines = ["SESSION METADATA", "================"]
+        for key in sorted(meta):
+            lines.append(f"{key}: {meta[key]}")
+
+        if self.table_exists(self.conn, "parameter_snapshots"):
+            row = self.conn.execute(
+                "SELECT elapsed_s,snapshot_json FROM parameter_snapshots ORDER BY elapsed_s LIMIT 1"
+            ).fetchone()
+            if row:
+                lines.extend(["", "PARAMETER SNAPSHOT", "==================", f"at {row[0]:.3f} s"])
+                try:
+                    snap = json.loads(row[1])
+                    for key in sorted(snap):
+                        lines.append(f"{key}: {snap[key]}")
+                except Exception:
+                    lines.append(str(row[1]))
+
+        self.metadata_text.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
     # Export
-    # =================================================================
+    # ------------------------------------------------------------------
 
     def export_selected_csv(self):
         if self.conn is None:
-            QMessageBox.information(
-                self,
-                "No recording",
-                "Open a recording first.",
-            )
             return
-
-        selected = [
-            item.text()
-            for item in (
-                self.signal_list.selectedItems()
-            )
-        ]
-
-        if not selected:
-            selected = list(
-                self.plot_curves.keys()
-            )
-
-        if not selected:
-            QMessageBox.information(
-                self,
-                "No signals selected",
-                "Select one or more signals in the signal list first.",
-            )
+        names = [i.text() for i in self.plotted_list.selectedItems()]
+        if not names:
+            names = list(self.plot_curves)
+        if not names:
+            QMessageBox.information(self, "Export", "Plot or select at least one signal first.")
             return
 
         filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Telemetry CSV",
-            str(
-                self.db_path.with_suffix(
-                    ".csv"
-                )
-            ),
-            "CSV Files (*.csv)",
+            self, "Export telemetry CSV", str(DATA_DIR / "telemetry_export.csv"), "CSV (*.csv)"
         )
-
         if not filename:
             return
 
-        placeholders = ",".join(
-            "?"
-            for _ in selected
-        )
+        rows = []
+        for name in names:
+            s = self._series(name, "main")
+            for t, v in zip(s.elapsed, s.values):
+                if np.isfinite(t) and np.isfinite(v):
+                    rows.append((float(t), name, float(v)))
+        rows.sort()
 
-        rows = self.conn.execute(
-            f"""
-            SELECT
-                elapsed_s,
-                wall_time,
-                robot_time,
-                signal,
-                value_num,
-                value_text,
-                value_type
-            FROM telemetry
-            WHERE signal IN (
-                {placeholders}
-            )
-            ORDER BY
-                elapsed_s,
-                signal
-            """,
-            selected,
-        ).fetchall()
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["elapsed_s", "signal", "value"])
+            w.writerows(rows)
 
-        with open(
-            filename,
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            writer = csv.writer(
-                file
-            )
+        self.statusBar().showMessage(f"Exported {len(rows)} rows to {filename}")
 
-            writer.writerow(
-                [
-                    "elapsed_s",
-                    "wall_time",
-                    "robot_time",
-                    "signal",
-                    "value_num",
-                    "value_text",
-                    "value_type",
-                ]
-            )
-
-            writer.writerows(
-                rows
-            )
-
-        self.statusBar().showMessage(
-            f"Exported {len(rows):,} rows to {filename}"
-        )
-
-    # =================================================================
-    # Shutdown
-    # =================================================================
-
-    def closeEvent(
-        self,
-        event,
-    ):
+    def closeEvent(self, event):
         if self.conn is not None:
             self.conn.close()
-
+        if self.compare_conn is not None:
+            self.compare_conn.close()
         event.accept()
 
 
 def main():
-    app = QApplication(
-        sys.argv
-    )
-
-    app.setApplicationName(
-        "Robot Data Visualiser"
-    )
-
-    window = DataVisualiser()
-
-    window.show()
-
-    sys.exit(
-        app.exec()
-    )
+    app = QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True)
+    win = DataVisualiser()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
