@@ -21,6 +21,7 @@ Required beside this file:
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 import subprocess
@@ -310,6 +311,7 @@ class RobotDebugGUI(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self.load_local_debug_config()
 
         self.port_refresh_timer = QTimer(self)
         self.port_refresh_timer.timeout.connect(
@@ -336,6 +338,33 @@ class RobotDebugGUI(QMainWindow):
         self.health_timer.start(500)
 
         self.refresh_ports()
+
+    def load_local_debug_config(self):
+        """Populate controls even when wireless definition frames are lost."""
+        config_path = (
+            Path(__file__).resolve().parents[2]
+            / "PlatformIO"
+            / "debug_config.json"
+        )
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            self.add_log(
+                "WARNING",
+                f"Could not load local debug controls: {error}",
+            )
+            return
+
+        for parameter in config.get("parameters", []):
+            if isinstance(parameter, dict):
+                self.on_parameter_definition(dict(parameter))
+
+        for command in config.get("commands", []):
+            if isinstance(command, dict):
+                definition = dict(command)
+                definition.pop("action", None)
+                definition.pop("debug_mode_required", None)
+                self.on_command_definition(definition)
 
     # =================================================================
     # Recording

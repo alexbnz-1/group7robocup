@@ -1,0 +1,81 @@
+{
+  "parameters": [
+    {
+      "name": "debug.telemetry_interval_ms",
+      "label": "Telemetry interval",
+      "description": "Delay between telemetry packets",
+      "datatype": "int",
+      "unit": "ms",
+      "value": 200,
+      "min": 50,
+      "max": 2000,
+      "step": 50
+    }
+  ],
+  "commands": [
+    {
+      "name": "ping",
+      "label": "Ping Teensy",
+      "action": "ping",
+      "args": []
+    },
+    {
+      "name": "stop",
+      "label": "Stop Robot",
+      "action": "stop",
+      "args": []
+    },
+    {
+      "name": "run",
+      "label": "Run Robot",
+      "action": "run",
+      "debug_mode_required": true,
+      "args": []
+    },
+    {
+      "name": "set_herkulex_angle",
+      "label": "Set Herkulex relative angle",
+      "action": "herkulex_angle",
+      "debug_mode_required": true,
+      "args": [
+        {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1},
+        {"name": "angle_deg", "type": "float", "min": -160, "max": 160, "step": 1, "default": 0},
+        {"name": "move_time_ms", "type": "int", "min": 50, "max": 2850, "step": 50, "default": 500}
+      ]
+    },
+    {
+      "name": "read_herkulex_angle",
+      "label": "Read Herkulex angle",
+      "action": "herkulex_read_angle",
+      "args": [
+        {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
+      ]
+    },
+    {
+      "name": "zero_herkulex_here",
+      "label": "Zero Herkulex here",
+      "action": "herkulex_zero_here",
+      "args": [
+        {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
+      ]
+    },
+    {
+      "name": "set_herkulex_velocity",
+      "label": "Set continuous velocity",
+      "action": "herkulex_velocity",
+      "debug_mode_required": true,
+      "args": [
+        {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1},
+        {"name": "speed", "type": "int", "min": -1023, "max": 1023, "step": 25, "default": 100}
+      ]
+    },
+    {
+      "name": "stop_herkulex_turn",
+      "label": "Stop continuous rotation",
+      "action": "herkulex_stop_velocity",
+      "args": [
+        {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
+      ]
+    }
+  ]
+}

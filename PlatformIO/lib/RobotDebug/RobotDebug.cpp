@@ -1,7 +1,7 @@
 #include "RobotDebug.h"
 
-RobotDebug::RobotDebug(Stream& stream, MessageHandler handler)
-    : stream_(stream), handler_(handler)
+RobotDebug::RobotDebug(Stream& stream, MessageHandler handler, void* context)
+    : stream_(stream), handler_(handler), context_(context)
 {
 }
 
@@ -53,7 +53,7 @@ void RobotDebug::finishLine()
         return;
     }
     if (handler_ != nullptr)
-        handler_(message);
+        handler_(message, context_);
 }
 
 void RobotDebug::send(JsonDocument& message)
@@ -94,6 +94,16 @@ void RobotDebug::parameterValue(const char* name, float value)
 {
     JsonDocument message;
     message["type"] = "parameter_value";
+    message["name"] = name;
+    message["value"] = value;
+    send(message);
+}
+
+void RobotDebug::telemetry(const char* name, float value)
+{
+    JsonDocument message;
+    message["type"] = "telemetry";
+    message["time"] = millis();
     message["name"] = name;
     message["value"] = value;
     send(message);

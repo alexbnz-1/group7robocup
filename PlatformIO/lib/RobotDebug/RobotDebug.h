@@ -5,19 +5,21 @@
 
 class RobotDebug {
 public:
-    using MessageHandler = void (*)(JsonDocument& message);
+    using MessageHandler = void (*)(JsonDocument& message, void* context);
 
-    RobotDebug(Stream& stream, MessageHandler handler);
+    RobotDebug(Stream& stream, MessageHandler handler, void* context = nullptr);
     void update();
     void log(const char* level, const char* message);
     void error(const char* message);
     void state(bool debugMode, bool stopped, bool fault = false);
     void parameterValue(const char* name, float value);
+    void telemetry(const char* name, float value);
     void send(JsonDocument& message);
 
 private:
     Stream& stream_;
     MessageHandler handler_;
+    void* context_;
     char buffer_[768] = {};
     size_t length_ = 0;
     bool droppingLine_ = false;

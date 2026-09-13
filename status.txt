@@ -1,0 +1,924 @@
+GROUP 7 ROBOCUP PROJECT STATUS
+Last updated: 2026-09-14 (Pacific/Auckland)
+Repository: C:\Users\alex\Desktop\group7robocup
+Current branch: testing
+Current committed revision: 5b5daed - Added code for teensy to communicate with app
+
+===============================================================================
+1. PURPOSE OF THIS FILE
+===============================================================================
+
+This file is the self-contained technical handover for the repository. It
+records what exists, how the pieces connect, what has been verified, what is
+currently only present in the working tree, and what remains to be integrated
+or tested. A new team member should read this file before changing firmware,
+wiring, the Bluetooth protocol, or the desktop tools.
+
+The project currently consists of four main areas:
+
+1. Teensy 4.0 firmware managed by PlatformIO.
+2. A live Bluetooth/serial robot-debugging GUI.
+3. Recording, visualisation, and command-line analysis tools for saved runs.
+4. A collection of supplied hardware example sketches used as references.
+
+The newest work makes the debug GUI data-driven. GUI parameter and command
+controls are described in one JSON file. The PlatformIO build validates and
+embeds that JSON, while a firmware library handles the complete serial workflow.
+
+===============================================================================
+2. CURRENT HARDWARE COMMUNICATION LAYOUT
+===============================================================================
+
+Controller:
+
+- Teensy 4.0.
+- Firmware framework: Arduino through PlatformIO.
+- Firmware environment name: teensy40.
+
+Bluetooth debug connection:
+
+- Hardware: supplied, pre-matched CH9143 Bluetooth serial board pair.
+- One board plugs into the robot carrier board.
+- The other board connects to the computer through USB-C.
+- The pair behaves as a transparent serial cable. The desktop software sees a
+  conventional Windows COM port and does not implement a separate radio layer.
+- Robot-side connector: SERIAL1.
+- Teensy UART: Serial1.
+- Teensy Serial1 pins: RX1 pin 0 and TX1 pin 1.
+- Baud rate: 115200.
+- Framing: 8 data bits, no parity, 1 stop bit.
+- Application framing: one JSON object followed by a newline.
+- During verified testing, Windows identified the receiver as
+  "USB-BLE-SERIAL CH9143" on COM10.
+- During the same testing, COM7 was the Teensy's direct USB programming port.
+- COM numbers are assigned by Windows and may change. Select the device by its
+  description instead of relying permanently on COM10.
+
+Herkulex smart-servo connection:
+
+- Bluetooth now occupies SERIAL1.
+- The Herkulex bus is therefore configured to use Teensy Serial2.
+- The Herkulex cable must be plugged into the carrier board's SERIAL2 connector.
+- Servo UART baud rate: 115200.
+- Sorting-gate default ID: 1.
+- Kicker-cam default ID: 2.
+- Accepted position-command range: approximately -160 to +160 degrees.
+- Movement time accepted by the debug command: 50 to 2850 ms.
+- Startup, STOP, and leaving Debug Mode disable broadcast servo torque.
+
+Important configuration inconsistency to clean up:
+
+- PlatformIO/include/config.h correctly assigns HerkulexConfig::PORT to
+  Serial2 and BluetoothConfig::PORT to Serial1.
+- The older Pins::SMART_SERVO_RX and Pins::SMART_SERVO_TX constants and nearby
+  comments still say pins 0 and 1. Those constants are stale and conflict with
+  the current Serial2 assignment. The active workflow uses the HardwareSerial
+  object, so the working code is not using those stale constants, but the names
+  and comments should be corrected before other firmware starts depending on
+  them.
+
+Other configured hardware assignments:
+
+- Drive left PPM: pin 2.
+- Drive right PPM: pin 3.
+- Reel left PPM: pin 4.
+- Reel right PPM: pin 5.
+- Front ultrasonic trigger: pin 9.
+- Front ultrasonic echo: pin 10.
+- Inductive proximity input: pin 11.
+- Left analogue IR: A0.
+- Right analogue IR: A1.
+- TOF sensor bus: Wire / I2C bus 0.
+- Colour sensor bus: Wire1 / I2C bus 1.
+- SX1509 expander address: 0x3F.
+- Planned short-range TOF addresses begin at 0x30.
+- Planned long-range TOF addresses begin at 0x35.
+
+Several values in config.h are explicitly placeholders. Sorting-gate angles,
+kicker angles, sensor counts, XSHUT expander pins, and the analogue IR presence
+threshold must be tuned or confirmed on the completed robot.
+
+===============================================================================
+3. TEENSY BUILD SYSTEM
+===============================================================================
+
+Firmware root:
+
+    PlatformIO\
+
+PlatformIO/platformio.ini configures:
+
+- Platform: teensy.
+- Board: teensy40.
+- Framework: arduino.
+- Serial-monitor speed: 115200.
+- Warnings: -Wall and -Wextra.
+- Include path: PlatformIO/include.
+- A pre-build JSON embedding script.
+
+Declared libraries:
+
+- ArduinoJson 7.4-compatible release.
+- Pololu VL53L0X 1.3.1.
+- Pololu VL53L1X 1.3.1.
+- SparkFun SX1509 IO Expander 3.0.6.
+- Local HerkulexTeensy library.
+- Local RobotDebug library.
+- Local BluetoothDebugWorkflow library.
+
+Known local PlatformIO executable on this development computer:
+
+    C:\Users\alex\.platformio\penv\Scripts\platformio.exe
+
+Build command from the PlatformIO directory:
+
+    C:\Users\alex\.platformio\penv\Scripts\platformio.exe run
+
+Upload command used while the Teensy was COM7:
+
+    C:\Users\alex\.platformio\penv\Scripts\platformio.exe run --target upload --upload-port COM7
+
+The newest JSON-driven refactor compiles successfully. After adding angle
+feedback, its measured code size was approximately 56,176 bytes, with ample
+Teensy flash and RAM remaining.
+
+Current upload state:
+
+- The JSON-driven workflow, including Set Herkulex angle and Read Herkulex
+  angle, has been compiled and flashed successfully to the Teensy on COM7.
+- The physical CH9143 link on COM10 advertised all configured controls.
+- The latest verification received 17 valid JSON messages, zero invalid lines,
+  and passed handshake, definition, state, and telemetry checks.
+- The Read Herkulex angle control definition was observed in received data.
+
+===============================================================================
+4. CURRENT MAIN PROGRAM
+===============================================================================
+
+File:
+
+    PlatformIO/src/main.cpp
+
+The file has deliberately been reduced to construction and two calls. It:
+
+- Creates one BluetoothDebugWorkflow object.
+- Passes it the configured Bluetooth and Herkulex UARTs.
+- Calls debugGui.begin() once from setup().
+- Calls debugGui.update() repeatedly from loop().
+
+There is no protocol parsing, JSON construction, command dispatch, telemetry
+formatting, or servo-control logic in main.cpp. This is intentional. Future
+normal robot operations can be added around debugGui.update() without moving
+the debugging implementation back into main.cpp.
+
+===============================================================================
+5. JSON-DRIVEN GUI CONFIGURATION
+===============================================================================
+
+Human-edited source file:
+
+    PlatformIO/debug_config.json
+
+Generated build file:
+
+    PlatformIO/include/debug_config.generated.h
+
+Generator:
+
+    PlatformIO/scripts/embed_debug_config.py
+
+Detailed editing guide:
+
+    PlatformIO/DEBUG_GUI_CONFIG.md
+
+Build process:
+
+1. PlatformIO runs embed_debug_config.py before compiling firmware.
+2. The script reads debug_config.json using Python's strict JSON parser.
+3. Invalid JSON stops the build and reports the editing error early.
+4. Valid JSON is compacted.
+5. The compact JSON is written into debug_config.generated.h as a C++ string.
+6. The BluetoothDebugWorkflow library parses the embedded string during Teensy
+   startup.
+7. When the desktop GUI connects, the library advertises every configured
+   parameter and command.
+
+Do not edit debug_config.generated.h manually. Any manual edit will be replaced
+on the next PlatformIO build.
+
+Current JSON parameters:
+
+- debug.telemetry_interval_ms
+  - Label: Telemetry interval.
+  - Type: integer.
+  - Unit: milliseconds.
+  - Default: 200 ms, giving 5 telemetry updates per second.
+  - Minimum: 50 ms.
+  - Maximum: 2000 ms.
+  - Step: 50 ms.
+  - This parameter is connected to live behavior; changing it changes the
+    actual firmware telemetry period.
+
+Current JSON commands:
+
+- ping
+  - Action: ping.
+  - No arguments.
+  - Returns "Pong from Teensy" as a log and sends current state.
+
+- stop
+  - Action: stop.
+  - No arguments.
+  - Broadcasts torque-off to the Herkulex bus.
+  - Sets stopped state true.
+  - Sends state and a warning log.
+
+- run
+  - Label: Run Robot.
+  - Action: run.
+  - Requires Debug Mode.
+  - Clears stopped mode without moving or energising a servo by itself.
+  - A relative movement command remains necessary before torque is enabled.
+
+- set_herkulex_angle
+  - Label: Set Herkulex angle.
+  - Action: herkulex_angle.
+  - Requires Debug Mode.
+  - Arguments:
+      id: integer from 1 through 253, default 1.
+      angle_deg: numeric from -160 through +160, default 0.
+      move_time_ms: integer from 50 through 2850, default 500.
+  - Clears the selected servo's errors, enables its torque, sends the movement,
+    updates commanded-position telemetry, and reports running state.
+
+- read_herkulex_angle
+  - Label: Read Herkulex angle.
+  - Action: herkulex_read_angle.
+  - Argument: servo ID from 1 through 253, default 1.
+  - Requests position feedback from the selected servo.
+  - Publishes a valid result as servo.measured_angle_deg telemetry.
+  - Reports an error if no valid response packet is received.
+  - The first successful manual read enables automatic reads for that servo ID
+    every 200 ms until the Teensy resets.
+
+- zero_herkulex_here
+  - Label: Zero Herkulex here.
+  - Action: herkulex_zero_here.
+  - Argument: servo ID from 1 through 253, default 1.
+  - Reads the current physical position without moving the servo.
+  - Stores that position as the temporary software-zero offset for that ID.
+  - All later movement angles for that ID are interpreted relative to this zero.
+  - The offset is held in RAM and is cleared by reset or power loss.
+  - Movement is rejected until the selected servo has been zeroed.
+
+What is automatic when editing JSON:
+
+- Adding a parameter object creates a GUI parameter control.
+- Removing a parameter object removes that control.
+- Numeric parameter changes are validated, clamped to JSON min/max values,
+  held in Teensy RAM, and confirmed to the GUI.
+- Adding a command object creates a GUI command control.
+- Removing a command object removes that control.
+- Command arguments generate the appropriate integer/float/boolean/string/enum
+  controls supported by the desktop GUI.
+- Setting debug_mode_required protects a command until Debug Mode is enabled.
+- Selecting an already implemented action connects the GUI command to that
+  firmware behavior.
+
+What is not possible from JSON alone:
+
+- JSON can describe a control and select an existing action, but it cannot
+  invent new electrical or mechanical behavior.
+- A completely new action name requires one matching C++ implementation in
+  BluetoothDebugWorkflow.cpp.
+- A generic parameter is stored and displayed automatically, but using it in a
+  new drivetrain, sensor, or control algorithm requires that algorithm to read
+  or bind the value.
+- Parameter values are currently temporary and return to JSON defaults after a
+  Teensy reset. Persistent EEPROM/configuration storage has not been added.
+
+===============================================================================
+6. BLUETOOTH DEBUG WORKFLOW LIBRARY
+===============================================================================
+
+Files:
+
+    PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h
+    PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp
+
+Responsibilities:
+
+- Start the Bluetooth UART.
+- Start the Herkulex UART.
+- place Herkulex servos in safe torque-off state at startup.
+- Parse the embedded GUI configuration.
+- Process incoming desktop messages.
+- Advertise parameter and command definitions.
+- Apply and confirm parameter changes.
+- Route configured commands to built-in actions.
+- Enforce Debug Mode for protected commands.
+- Send state, logs, errors, and periodic telemetry.
+- Pace definition messages to avoid overflowing the CH9143 radio link.
+- Suppress duplicate startup definition bursts.
+
+Incoming computer-to-robot message types handled:
+
+- hello.
+- request_definitions.
+- command.
+- parameter.
+- parameter_request.
+
+Outgoing robot-to-computer message types produced:
+
+- telemetry.
+- parameter_definition.
+- parameter_value.
+- command_definition.
+- log.
+- state.
+- error.
+
+Startup behavior:
+
+1. Bluetooth Serial1 opens at 115200.
+2. Herkulex Serial2 opens at 115200.
+3. Broadcast torque-off is sent to servo ID 0xFE.
+4. Embedded JSON is parsed.
+5. The configured telemetry interval is loaded.
+6. A ready log and safe state are transmitted.
+
+Connection behavior:
+
+1. Desktop sends hello.
+2. Firmware sends a connected log and current state.
+3. Firmware immediately sends definitions.
+4. Desktop also sends request_definitions.
+5. Firmware suppresses that request if definitions were sent within the last
+   500 ms, avoiding duplicate traffic during radio startup.
+
+The immediate advertisement was added because physical testing showed that the
+matched bridge could occasionally deliver hello but lose the next back-to-back
+request. Definition packets are separated by 40 ms, and normal telemetry is
+limited to 5 Hz by default. This eliminated observed packet corruption without
+requiring RTS/CTS wiring.
+
+Current telemetry signals:
+
+- system.uptime_s.
+- system.debug_mode.
+- system.stopped.
+- bluetooth.messages_received.
+- servo.last_id.
+- servo.commanded_angle_deg.
+- servo.measured_angle_deg, after the first successful angle read.
+- servo.zeroed.
+- servo.zero_offset_deg, after the selected servo has been zeroed.
+- servo.auto_read_enabled.
+- servo.responding.
+- servo.tracking_fault.
+- servo.position_error_deg, once a target and measurement are available.
+
+Commanded angle records the most recent movement request. Measured angle records
+position feedback returned by the servo and remains absent until a read succeeds.
+Once zeroed, both commanded and measured angles are relative to the stored zero.
+Absolute targets are checked against the servo's +/-160 degree protocol range.
+Automatic monitoring tolerates individual packet losses. Three consecutive
+read failures mark the servo unresponsive and set fault state. After a movement
+has had its requested duration plus 300 ms to settle, three consecutive readings
+more than 8 degrees from target set a tracking fault. Recovery clears the fault.
+
+===============================================================================
+7. LOW-LEVEL ROBOT DEBUG SERIAL LIBRARY
+===============================================================================
+
+Files:
+
+    PlatformIO/lib/RobotDebug/RobotDebug.h
+    PlatformIO/lib/RobotDebug/RobotDebug.cpp
+
+Responsibilities:
+
+- Maintain a fixed receive buffer for serial bytes.
+- Reassemble messages that arrive over several UART reads.
+- Use newline as the packet boundary.
+- Ignore carriage returns.
+- Reject lines exceeding 767 bytes.
+- Parse JSON with ArduinoJson.
+- Reject malformed JSON and non-object JSON values.
+- Call the workflow's message handler with an instance context pointer.
+- Serialize outgoing JSON followed by a newline.
+- Provide helpers for logs, errors, state, and parameter confirmations.
+
+The callback was refactored to carry a context pointer. This allows the reusable
+BluetoothDebugWorkflow instance to receive parsed messages without putting
+application routing in main.cpp or relying on a global singleton.
+
+===============================================================================
+8. HERKULEX LIBRARY
+===============================================================================
+
+Files:
+
+    PlatformIO/lib/HerkulexTeensy/HerkulexTeensy.h
+    PlatformIO/lib/HerkulexTeensy/HerkulexTeensy.cpp
+    PlatformIO/lib/HerkulexTeensy/library.json
+
+Implemented operations:
+
+- Open and close a selected Teensy hardware UART.
+- Reboot a servo.
+- Clear errors.
+- Enable and disable torque.
+- Move using a raw position.
+- Move using degrees.
+- Initialize one servo.
+- Initialize all servos.
+- Read position.
+- Read angle.
+- Read status.
+- Flush received data.
+- Construct Herkulex packets and calculate both checksums.
+- Validate response headers, sizes, and checksums.
+
+The angle helper clamps commands to about +/-160 degrees and converts angle to
+the Herkulex 0-1023 position representation around centre 512. Movement time is
+limited to the protocol/library maximum of approximately 2856 ms.
+
+This library was tested successfully earlier, and physical Herkulex movement
+was reported working. The Bluetooth angle command uses this same library.
+
+===============================================================================
+9. SENSOR LIBRARIES
+===============================================================================
+
+IR library:
+
+    PlatformIO/lib/Ir/Ir.h
+    PlatformIO/lib/Ir/Ir.cpp
+
+The project includes an IR abstraction. The configuration notes record that
+analogue distance readings were too noisy for dependable ranging, especially
+off-angle. The intended use is therefore object-presence detection with a raw
+ADC threshold. The current configured threshold is 400 and requires tuning on
+the installed sensors.
+
+TOF library:
+
+    PlatformIO/lib/Tof/Tof.h
+    PlatformIO/lib/Tof/Tof.cpp
+
+The project includes support structure for Pololu VL53L0X short-range and
+VL53L1X long-range sensors, with shutdown lines intended to be controlled by an
+SX1509 I/O expander. Address allocation and sensor counts are configured in
+config.h. Final physical sensor count, bus layout, expander pins, and mounting
+still require confirmation.
+
+Neither sensor library is currently integrated into the minimal main program or
+the active Bluetooth telemetry set.
+
+===============================================================================
+10. DESKTOP LIVE DEBUG GUI
+===============================================================================
+
+Folder:
+
+    Non-Teensy-Files/BluetoothDebugGUI/
+
+Main files:
+
+- DebugGUI.py
+  - PyQt6 graphical application.
+  - COM-port selection and refresh.
+  - Baud-rate selection.
+  - Connection status.
+  - Dashboard.
+  - Live telemetry table.
+  - Live plots.
+  - Dynamically generated parameter controls.
+  - Dynamically generated command controls.
+  - Logs.
+  - Raw serial view.
+  - Recording controls and fault markers.
+  - Automatically prefers a port whose description contains CH9143, preventing
+    accidental selection of the Teensy USB programming port when both exist.
+
+- BluetoothSerial.py
+  - Discovers serial ports using pyserial.
+  - Opens the selected COM port in a worker thread.
+  - Prevents serial I/O from freezing the GUI.
+  - Sends compact newline-delimited JSON.
+  - Parses received JSON dictionaries.
+  - Routes telemetry, definitions, values, commands, logs, states, and errors
+    into Qt signals.
+  - Sends hello and request_definitions after connection.
+
+- DataRecorder.py
+  - Records a complete live session into SQLite-backed .rdbg files.
+  - Writes from a background thread.
+  - Uses queued, batched commits.
+  - Stores metadata, telemetry, logs, commands, parameter changes, snapshots,
+    states, raw serial, faults, and annotations.
+
+- smoke_test.py
+  - Opens a specified COM port.
+  - Performs a non-actuating hello and definition request.
+  - Reads responses for a bounded period.
+  - Validates that lines are JSON objects.
+  - Requires log, state, parameter-definition, command-definition, and telemetry
+    message types for a pass.
+  - Discards the first partial line after opening to synchronize with continuous
+    telemetry.
+
+- communicationProtocol.md
+  - Full protocol design and examples.
+  - Explains framing, connection sequence, message types, GUI behavior,
+    telemetry timing, safety, validation, and extension conventions.
+
+- setup.ps1
+  - Creates a local .venv.
+  - Uses the normal Python launcher when available.
+  - Falls back to a python executable or PlatformIO's bundled Python.
+  - Installs required GUI packages.
+
+- run_gui.ps1
+  - Starts DebugGUI.py using the folder's .venv.
+  - Produces a clear error if setup has not been run.
+
+- requirements.txt
+  - PyQt6.
+  - pyqtgraph.
+  - pyserial.
+  - NumPy.
+
+The GUI environment was created successfully on the current development
+computer. PyQt6, its Qt runtime, pyqtgraph, pyserial, NumPy, and supporting
+packages installed successfully. Importing BluetoothSerial, DataRecorder, and
+DebugGUI was verified successfully.
+
+Launch commands:
+
+    cd C:\Users\alex\Desktop\group7robocup\Non-Teensy-Files\BluetoothDebugGUI
+    .\run_gui.ps1
+
+One-time setup if the environment is missing:
+
+    .\setup.ps1
+
+Non-actuating link test, using the currently observed receiver port:
+
+    .\.venv\Scripts\python.exe .\smoke_test.py COM10
+
+===============================================================================
+11. VERIFIED BLUETOOTH RESULTS
+===============================================================================
+
+Initial failure:
+
+- The robot-side Bluetooth board was physically connected to SERIAL1.
+- An early firmware version transmitted debug data through Serial2 to keep the
+  former Herkulex assignment untouched.
+- The desktop therefore received zero bytes.
+- Examination of the supplied matched-board instructions and the stated socket
+  selection identified the UART mismatch.
+
+Correction:
+
+- Bluetooth was changed to Serial1.
+- Herkulex was moved to Serial2.
+- The firmware was rebuilt and flashed.
+
+Successful physical tests:
+
+- One test received 35 valid JSON messages through the physical CH9143 pair.
+- It included handshake, state, parameters, commands, and live telemetry.
+- A later clean test received 21 valid JSON messages with zero invalid lines.
+- After adding the Herkulex GUI control, a burst test exposed malformed and
+  missing messages during startup.
+- The cause was excessive back-to-back traffic through the transparent link.
+- Definition pacing, duplicate-request suppression, and a 200 ms telemetry
+  interval were added.
+- The final pre-refactor test received 16 valid JSON messages and zero invalid
+  lines and reported PASS for handshake, definitions, state, and telemetry.
+
+No actuator movement was performed by the automated link checks. The smoke test
+only sends hello and request_definitions.
+
+The JSON-driven refactor is running on the Teensy and has passed the CH9143
+smoke test. The angle-read control's advertisement is verified. A physical
+feedback read still depends on a powered, responsive servo on SERIAL2.
+
+===============================================================================
+12. SAVED RUN RECORDING AND OFFLINE ANALYSIS
+===============================================================================
+
+Recording directory:
+
+    Non-Teensy-Files/DataVisualisationAfter/Data/
+
+Known recordings currently present:
+
+- RobotRun_2026-09-05_23-11-40.rdbg
+- RobotRun_2026-09-05_23-28-05.rdbg
+- RobotRun_2026-09-05_23-49-27.rdbg
+- RobotRun_2026-09-06_12-08-13.rdbg
+- RobotRun_2026-09-06_12-09-41.rdbg
+- RobotRun_2026-09-14_09-14-21.rdbg
+
+The last three appeared as untracked files during the earlier working-tree
+inventory. Their contents were not modified during the Bluetooth work.
+
+Offline visualiser:
+
+    Non-Teensy-Files/DataVisualisationAfter/DataVisualiser.py
+
+Features documented in the repository include:
+
+- Browse recordings.
+- Display session metadata and summaries.
+- Search signals.
+- Plot selected signals.
+- Safe automatic scaling, including all-zero signals.
+- Click-to-inspect cursor.
+- Measurement regions.
+- Elapsed-time or robot-time axes.
+- Fault, command, parameter, and state event markers.
+- Compare two recordings.
+- Align comparison around a first fault.
+- Derived signals.
+- Automatic anomaly inspection.
+- Raw serial inspection.
+- CSV export.
+
+Command-line analysis tool:
+
+    Non-Teensy-Files/DataVisualisationAfter/DataAnalysisCLI.py
+
+Documented commands include:
+
+- summary.
+- signals.
+- faults.
+- events.
+- context.
+- stats.
+- range.
+- correlate.
+- pid.
+- anomalies.
+- export-json.
+- report.
+
+Workflow documentation:
+
+- Non-Teensy-Files/DataVisualisationAfter/ROBOT_DATA_WORKFLOW.md
+- Non-Teensy-Files/ROBOT_DEBUG_TOOLKIT_GUIDE.md
+
+The root requirements.txt contains the broader desktop tool stack: NumPy,
+SciPy, Matplotlib, pandas, pyserial, PyQt6, and pyqtgraph. Root setup_env.py can
+create a repository-level virtual environment and install those packages.
+
+===============================================================================
+13. SUPPLIED EXAMPLE CODE
+===============================================================================
+
+The PROVIDED EXAMPLE CODE directory is reference material rather than the
+active PlatformIO application. It contains examples for:
+
+- IMU.
+- Colour sensor.
+- IR XY position.
+- Several VL53L0X/VL53L1X TOF layouts.
+- Serial mini TOF.
+- Eight-sensor matrix lidar, including a supplied archive.
+- Analogue IR distance.
+- Digital ultrasonic sensor.
+- Load cell.
+- Encoder.
+- Limit switch.
+- RFID, including a supplied archive.
+- Optical-flow sensor and its readme.
+- Herkulex smart-servo basics, blinking, bus scanning, and coordinated moves.
+- Stepper motor.
+- DC motor.
+- Conventional RC servo.
+- FastLED smart LED strip.
+
+These examples should be treated as hardware references. They are not all
+compiled together and are not proof that every device is integrated into the
+current robot firmware.
+
+An experimental HXT12K/HW-399 sketch was created temporarily, then removed when
+that work was explicitly shelved. No active HXT12K control remains in the
+current firmware.
+
+===============================================================================
+14. SAFETY MODEL
+===============================================================================
+
+The desktop STOP button is a debugging convenience, not a physical emergency
+stop. Wireless data can be delayed, dropped, corrupted, or disconnected.
+
+Current firmware protections:
+
+- Herkulex torque is disabled during workflow startup.
+- Leaving Debug Mode disables broadcast servo torque.
+- STOP disables broadcast servo torque.
+- Herkulex movement requires Debug Mode.
+- Servo ID, angle, and movement time are range checked in firmware.
+- Parameter values are checked and clamped in firmware.
+- Unknown message types, parameters, commands, and action names return errors.
+- Oversized or malformed JSON messages are rejected.
+
+Still required at robot level:
+
+- Physical emergency stop or power cutoff.
+- Safe actuator power-up procedure.
+- Motor-driver enable handling.
+- Hardware current limiting.
+- Mechanical travel-limit verification.
+- Communication-loss timeout for any future continuous motion commands.
+- Watchdog strategy.
+- Final validation of all placeholder limits.
+
+Always perform first actuator tests with mechanisms clear and the robot lifted
+or otherwise restrained. Start with small angle changes and keep a physical
+power cutoff within reach.
+
+===============================================================================
+15. VERSION-CONTROL STATE
+===============================================================================
+
+Branch history shows the following major milestones, newest first:
+
+- 5b5daed: Teensy-to-application communication code.
+- acebecb: expanded toolkit functionality and usage documentation.
+- 10e0419: bug fixes.
+- d284623: visualiser functionality.
+- f24f856: debug GUI and post-run analysis tools.
+- c6570a2: project restructure.
+- 08315ea: requirements and automatic virtual-environment setup.
+- 060a296: peer-to-peer Bluetooth debug/testing structure.
+- 9d33bf0: Herkulex configuration files.
+- 0cef38a: Herkulex Teensy library.
+- fb2713c: IR library and branch preparation.
+- 83afcd4: example code and initial library migration.
+
+At the time this status was written, the newest JSON-driven refactor was not
+committed. Modified tracked files included:
+
+- PlatformIO/lib/RobotDebug/RobotDebug.cpp
+- PlatformIO/lib/RobotDebug/RobotDebug.h
+- PlatformIO/platformio.ini
+- PlatformIO/src/main.cpp
+
+New working-tree files/directories included:
+
+- PlatformIO/debug_config.json
+- PlatformIO/include/debug_config.generated.h
+- PlatformIO/scripts/embed_debug_config.py
+- PlatformIO/lib/BluetoothDebugWorkflow/
+- PlatformIO/DEBUG_GUI_CONFIG.md
+- status.txt
+
+Preserve these changes when switching branches or cleaning the repository.
+Do not use a destructive checkout/reset until the work has been reviewed and
+committed.
+
+===============================================================================
+16. IMMEDIATE NEXT STEPS
+===============================================================================
+
+Required follow-up checks:
+
+1. Launch the GUI and confirm Parameter and Command controls match
+   debug_config.json.
+2. Press Read Herkulex angle with the powered servo bus on SERIAL2 and confirm
+   servo.measured_angle_deg appears.
+3. Enter Debug Mode and perform a small, mechanically safe Herkulex movement.
+4. Read the angle again and compare measured and commanded values.
+5. Press STOP and confirm torque-off behavior.
+6. Correct the stale SMART_SERVO pin constants/comments in config.h.
+7. Review and commit the JSON-driven workflow as one coherent change.
+
+Recommended next integration work:
+
+- Add actual robot sensor values to Bluetooth telemetry.
+- Add explicit APIs for normal robot code to publish telemetry through the
+  workflow without exposing protocol details.
+- Add parameter-binding helpers so JSON parameters can be connected cleanly to
+  PID gains and other runtime variables.
+- Add a registration mechanism for project-specific command handlers, keeping
+  built-in transport logic separate from robot mechanisms.
+- Add measured Herkulex position/status telemetry if bus timing permits.
+- Decide which parameters should persist across reset and implement storage.
+- Integrate drive, intake, sorter, and sensor subsystems into normal operation.
+- Add firmware-side tests for malformed messages, boundaries, and unknown
+  actions.
+- Add a loopback or mock-stream test for the complete workflow library.
+
+===============================================================================
+17. QUICK OPERATING CHECKLIST
+===============================================================================
+
+Firmware:
+
+[ ] Bluetooth board plugged into SERIAL1.
+[ ] Herkulex bus plugged into SERIAL2.
+[ ] Teensy visible over USB for upload.
+[ ] Current PlatformIO firmware built and flashed.
+[ ] Robot mechanisms clear before enabling Debug Mode.
+
+Desktop:
+
+[ ] CH9143 USB receiver connected.
+[ ] Run Non-Teensy-Files\BluetoothDebugGUI\run_gui.ps1.
+[ ] Select the port labelled USB-BLE-SERIAL CH9143.
+[ ] Select 115200 baud.
+[ ] Click Connect.
+[ ] Confirm Frames/s is nonzero.
+[ ] Confirm Signals/s is nonzero.
+[ ] Confirm telemetry rows update.
+[ ] Confirm Parameters and Commands populate from debug_config.json.
+[ ] Use Ping Teensy before actuator commands.
+[ ] Enter Debug Mode only when ready.
+[ ] Use a small initial servo movement.
+[ ] Press STOP after testing.
+
+Recording:
+
+[ ] Enter a meaningful test name and notes.
+[ ] Start recording before the physical test.
+[ ] Add a fault marker immediately when an issue is observed.
+[ ] Stop recording cleanly.
+[ ] Verify the new .rdbg file in DataVisualisationAfter\Data.
+[ ] Inspect metadata, telemetry, raw serial, commands, parameters, and faults.
+
+===============================================================================
+18. HERKULEX DRS-0101 CONTINUOUS-VELOCITY CONTROL
+===============================================================================
+
+Continuous-turn support has now been added to the reusable Herkulex and
+Bluetooth debug libraries. The DRS-0101 does not treat infinite rotation as a
+position beyond its approximately 320-degree position-control range. It uses a
+separate turn/velocity mode. The firmware therefore keeps position commands and
+continuous-velocity commands as distinct operations.
+
+The HerkulexTeensy library now exposes moveVelocity(). Its signed speed input is
+limited to -1023 through +1023. The magnitude selects the requested drive level;
+the sign selects direction. A speed of zero requests no rotation. The outgoing
+S_JOG packet sets the DRS turn-mode bit and encodes negative direction with the
+protocol's direction flag.
+
+Two JSON-defined GUI commands were added:
+
+- Set continuous velocity: accepts servo ID and signed speed.
+- Stop continuous rotation: accepts servo ID, sends zero speed, and removes
+  torque.
+
+Set continuous velocity requires Debug Mode and the Run Robot state. The
+suggested first test is a low magnitude such as +100 or -100 with the mechanism
+clear. The firmware changes modes using the safe sequence required by the servo:
+torque off, clear errors, send a zero-speed turn-mode command, torque on, then
+send the requested velocity. The position command follows the corresponding
+torque-off mode-switch sequence before executing a position move.
+
+The ordinary STOP command also cancels the stored continuous-rotation state and
+removes servo torque. While continuous rotation is active, position tracking
+fault checks are suspended because a continuously turning shaft does not have a
+fixed target. Automatic angle reads may continue, and telemetry now includes:
+
+- servo.continuous_velocity_active
+- servo.commanded_velocity
+
+Zero Here is rejected while the selected servo is actively in continuous mode.
+Stop Continuous Rotation first, then read/zero or issue position commands.
+
+Recommended continuous-turn test sequence:
+
+1. Ensure the mechanism can rotate freely.
+2. Connect the desktop GUI to the CH9143 Bluetooth serial port at 115200 baud.
+3. Enter Debug Mode.
+4. Press Run Robot.
+5. Use Set continuous velocity with speed +100 or -100.
+6. Confirm the direction and telemetry.
+7. Press Stop continuous rotation before changing operating modes.
+
+Verification completed on 14 September 2026:
+
+- The Teensy 4.0 firmware compiled successfully in PlatformIO.
+- The resulting firmware uploaded successfully to the Teensy through COM7.
+- The non-actuating COM10 smoke test passed after the GUI released the port. It
+  received the Bluetooth handshake, parameter and command definitions, state,
+  logs, and telemetry. Both continuous-turn commands were present.
+- smoke_test.py now retains partial serial data across timeouts. This prevents a
+  slow wireless frame from being incorrectly treated as a complete JSON line.
+- The CH9143 link was observed intermittently losing catalogue frames while
+  continuing to deliver telemetry. The desktop GUI now loads the shared
+  PlatformIO/debug_config.json directly at startup, so parameter and command
+  controls are always present. Definitions received wirelessly remain supported
+  and update the already-created controls.
+
+===============================================================================
+END OF STATUS
+===============================================================================
