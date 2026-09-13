@@ -40,6 +40,10 @@ namespace Pins {
     constexpr uint8_t SMART_SERVO_RX = 0;
     constexpr uint8_t SMART_SERVO_TX = 1;
 
+    // CH9143 matched Bluetooth board connected to SERIAL1.
+    constexpr uint8_t BLUETOOTH_RX = 0;
+    constexpr uint8_t BLUETOOTH_TX = 1;
+
 
     // --------------------------------------------------------
     // Sensors
@@ -70,7 +74,8 @@ namespace Pins {
 namespace HerkulexConfig {
 
     // Teensy hardware UART used for all Herkulex servos.
-    inline HardwareSerial& SERIAL = Serial1;
+    // Bluetooth occupies Serial1, so plug the Herkulex bus into SERIAL2.
+    inline HardwareSerial& PORT = Serial2;
 
     constexpr uint32_t BAUD = 115200;
 
@@ -148,6 +153,14 @@ namespace HerkulexConfig {
     } // namespace KickerCam
 
 } // namespace HerkulexConfig
+
+namespace BluetoothConfig {
+
+    inline HardwareSerial& PORT = Serial1;
+    constexpr uint32_t BAUD = 115200;
+    constexpr uint32_t TELEMETRY_INTERVAL_MS = 200;
+
+} // namespace BluetoothConfig
 
 
 // ============================================================
