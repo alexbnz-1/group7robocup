@@ -1651,6 +1651,17 @@ class RobotDebugGUI(QMainWindow):
             or saved_device
         )
 
+        # This project's matched receiver identifies itself as CH9143.
+        # Prefer it over the Teensy's USB programming port, including when an
+        # old COM-port choice was saved in QSettings.
+        ch9143_devices = {
+            port["device"]
+            for port in ports
+            if "CH9143" in port["description"].upper()
+        }
+        if ch9143_devices and target_device not in ch9143_devices:
+            target_device = sorted(ch9143_devices)[0]
+
         existing_devices = {
             self.port_combo.itemData(i)
             for i in range(

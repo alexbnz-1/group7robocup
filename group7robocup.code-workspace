@@ -9,5 +9,7 @@
             "path": "PlatformIO"
         }
     ],
-    "settings": {}
+    "settings": {
+        "powershell.cwd": "Group 7 Robocup"
+    }
 }
