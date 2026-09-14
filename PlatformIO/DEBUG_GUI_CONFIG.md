@@ -38,7 +38,8 @@ registry; connecting them to new robot algorithms requires a matching C++ use.
 Add an object to the `commands` array. The `action` selects firmware behaviour:
 
 - `ping`: responds with a log and state.
-- `stop`: disables all Herkulex torque and reports stopped state.
+- `stop`: disables all Herkulex torque, sends the 203 DC motor neutral, and
+  reports stopped state.
 - `run`: leaves stopped mode without commanding motion or enabling torque.
 - `herkulex_angle`: validates and sends a Herkulex angle command.
 - `herkulex_read_angle`: requests position feedback and publishes the measured
@@ -51,6 +52,11 @@ Add an object to the `commands` array. The `action` selects firmware behaviour:
   signed speed from -1023 to +1023. It requires Debug Mode and Run state.
 - `herkulex_stop_velocity`: commands zero velocity and disables that servo's
   torque. Use it before setting zero or returning to position control.
+- `dc_motor_203_speed`: applies independent signed -100% to +100% commands to
+  the two 203 DC motor channels on Serial7 TX7/pin 29 and RX7/pin 28. It
+  requires Debug Mode and Run.
+- `dc_motor_203_stop`: immediately writes the 1500 us neutral pulse to both
+  channels.
 
 Example:
 

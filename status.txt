@@ -920,5 +920,79 @@ Verification completed on 14 September 2026:
   and update the already-created controls.
 
 ===============================================================================
+19. 203 DC MOTOR CONTROLLER ON SERIAL3
+===============================================================================
+
+Support for the 203_DCMotor controller has been added as a reusable library and
+integrated into the Bluetooth debug workflow. Although it is plugged into the
+SERIAL3 connector, it does not use UART messages. Its two channels expect
+repeating servo-style control pulses. Teensy TX3/pin 14 controls channel A and
+RX3/pin 15 controls channel B.
+
+The DcMotor203 library implements the documented pulse range:
+
+- -100 percent: 1050 microseconds, full reverse.
+- 0 percent: 1500 microseconds, stopped/neutral.
+- +100 percent: 1950 microseconds, full forward.
+
+Intermediate signed percentages are mapped linearly. Both inputs are clamped to
+-100 through +100. begin() attaches both pulse outputs and immediately commands
+neutral, so startup does not deliberately turn either motor.
+
+The JSON catalogue now creates Set 203 DC motor speed and Stop 203 DC motor
+controls. Motion requires Debug Mode and Run Robot. The dedicated motor stop,
+global STOP, and leaving Debug Mode all write the 1500-microsecond neutral pulse.
+Run Robot only clears stopped mode and never starts the motor itself.
+
+Telemetry fields are:
+
+- dc_motor_203.active
+- dc_motor_203.channel_a_percent
+- dc_motor_203.channel_b_percent
+- dc_motor_203.channel_a_pulse_us
+- dc_motor_203.channel_b_pulse_us
+
+The firmware compiled and uploaded successfully to the Teensy through COM7 on
+14 September 2026. Physical rotation was not commanded during verification.
+
+The initial integration incorrectly treated the board as a single-channel
+controller and drove only TX3/pin 14. Comparison with PROVIDED EXAMPLE
+CODE/203_DCMotor/203_DCMotor.ino showed that the supplied controller exposes two
+independent servo-pulse channels. This was corrected on 14 September 2026:
+
+- Channel A uses TX3/pin 14.
+- Channel B uses RX3/pin 15.
+- Two Servo objects are attached with plain attach(pin), matching the example.
+- The speed control now accepts channel_a_percent and channel_b_percent.
+- Stop and startup write 1500 microseconds to both channels.
+- Telemetry reports the percentage and pulse width for each channel separately.
+
+The corrected two-channel firmware compiled and uploaded successfully to COM7.
+
+The controller location was subsequently corrected by the operator: it is on
+SERIAL7, not SERIAL3. The final channel mapping is therefore channel A on
+TX7/Teensy pin 29 and channel B on RX7/Teensy pin 28. Configuration, direct test
+code, and debug-workflow motor code all use these shared corrected pin constants.
+
+For direct bench diagnosis, PlatformIO/src/main.cpp was temporarily changed to
+bypass the Bluetooth debug workflow. It creates DcMotor203 directly, holds both
+channels at neutral for two seconds during startup, then commands channel A and
+channel B to +25 percent continuously. This diagnostic build must not be flashed
+unless both motors are mechanically clear. Restore the BluetoothDebugWorkflow
+main program after the direct output test is complete.
+
+The first direct-test build was compiled but deliberately not uploaded. After no
+motion was reported, main.cpp was changed again to reproduce the supplied
+203_DCMotor example exactly on Serial3's two Teensy signals: both channels at
+1050 microseconds for 1.5 seconds, both at 1950 for 1.5 seconds, opposite
+directions for 1.5 seconds, then both at 1500 neutral for 1.5 seconds. This
+sequence repeats and bypasses all debug-GUI logic.
+
+After the direct motor test, main.cpp was restored to the normal minimal
+BluetoothDebugWorkflow program. The automatic cycling test is no longer active.
+The reusable 203 motor integration and corrected Serial7 pin mapping remain in
+place for later diagnosis.
+
+===============================================================================
 END OF STATUS
 ===============================================================================

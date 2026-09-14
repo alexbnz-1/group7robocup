@@ -9,6 +9,7 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
 )
     : bluetoothPort_(bluetoothPort),
       servos_(herkulexPort, HerkulexConfig::BAUD),
+      dcMotor203_(Pins::DC_MOTOR_203_CHANNEL_A, Pins::DC_MOTOR_203_CHANNEL_B),
       link_(bluetoothPort, dispatch, this)
 {
 }
@@ -18,6 +19,7 @@ void BluetoothDebugWorkflow::begin()
     bluetoothPort_.begin(BluetoothConfig::BAUD);
     servos_.begin();
     servos_.torqueOff(0xFE);
+    dcMotor203_.begin();
 
     const DeserializationError error = deserializeJson(config_, EmbeddedDebugConfig::JSON);
     if (error)
@@ -99,6 +101,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         {
             stopped_ = true;
             servos_.torqueOff(0xFE);
+            dcMotor203_.stop();
+            dcMotor203Active_ = false;
         }
         sendState();
         link_.log("INFO", debugMode_ ? "Debug mode enabled" : "Debug mode disabled; torque off");
@@ -129,6 +133,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         servos_.torqueOff(0xFE);
         continuousVelocityActive_ = false;
         commandedVelocity_ = 0;
+        dcMotor203_.stop();
+        dcMotor203Active_ = false;
         stopped_ = true;
         sendState();
         link_.log("WARNING", "STOP received; servo torque disabled");
@@ -316,6 +322,33 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         }
         link_.log("INFO", "Herkulex continuous rotation stopped; torque off");
     }
+    else if (strcmp(action, "dc_motor_203_speed") == 0)
+    {
+        if (stopped_)
+        {
+            link_.error("Robot is stopped; press Run Robot before driving motor");
+            return;
+        }
+
+        const int channelA = message["channel_a_percent"] | 0;
+        const int channelB = message["channel_b_percent"] | 0;
+        if (channelA < -100 || channelA > 100 || channelB < -100 || channelB > 100)
+        {
+            link_.error("Both 203 DC motor speeds must be from -100 to 100 percent");
+            return;
+        }
+
+        dcMotor203_.setPercent(static_cast<int16_t>(channelA), static_cast<int16_t>(channelB));
+        dcMotor203Active_ = channelA != 0 || channelB != 0;
+        link_.log(dcMotor203Active_ ? "WARNING" : "INFO",
+                  dcMotor203Active_ ? "203 DC motor command applied" : "203 DC motor stopped");
+    }
+    else if (strcmp(action, "dc_motor_203_stop") == 0)
+    {
+        dcMotor203_.stop();
+        dcMotor203Active_ = false;
+        link_.log("INFO", "203 DC motor stopped at neutral pulse");
+    }
     else
     {
         link_.error("Command action has no firmware handler");
@@ -486,6 +519,11 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["servo.tracking_fault"] = trackingFault_;
     data["servo.continuous_velocity_active"] = continuousVelocityActive_;
     data["servo.commanded_velocity"] = commandedVelocity_;
+    data["dc_motor_203.active"] = dcMotor203Active_;
+    data["dc_motor_203.channel_a_percent"] = dcMotor203_.channelAPercent();
+    data["dc_motor_203.channel_b_percent"] = dcMotor203_.channelBPercent();
+    data["dc_motor_203.channel_a_pulse_us"] = dcMotor203_.channelAPulseUs();
+    data["dc_motor_203.channel_b_pulse_us"] = dcMotor203_.channelBPulseUs();
     if (servoZeroed_[lastServoId_])
         data["servo.zero_offset_deg"] = servoZeroOffsetsDeg_[lastServoId_];
     if (!isnan(measuredServoAngleDeg_))

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DcMotor203.h>
 #include <HerkulexTeensy.h>
 #include <RobotDebug.h>
 
@@ -15,6 +16,7 @@ public:
 private:
     HardwareSerial& bluetoothPort_;
     HerkulexTeensy servos_;
+    DcMotor203 dcMotor203_;
     RobotDebug link_;
     JsonDocument config_;
 
@@ -37,6 +39,7 @@ private:
     uint16_t lastMoveDurationMs_ = 0;
     bool continuousVelocityActive_ = false;
     int16_t commandedVelocity_ = 0;
+    bool dcMotor203Active_ = false;
     uint32_t telemetryIntervalMs_ = 200;
     uint32_t lastTelemetryMs_ = 0;
     uint32_t lastDefinitionsMs_ = 0;

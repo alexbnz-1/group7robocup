@@ -44,6 +44,11 @@ namespace Pins {
     constexpr uint8_t BLUETOOTH_RX = 0;
     constexpr uint8_t BLUETOOTH_TX = 1;
 
+    // 203_DCMotor controller plugged into the SERIAL7 connector. Its two wires
+    // are independent servo-style inputs, not UART data.
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_A = 29; // TX7
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_B = 28; // RX7
+
 
     // --------------------------------------------------------
     // Sensors
