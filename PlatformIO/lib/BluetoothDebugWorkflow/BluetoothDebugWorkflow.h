@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <DcMotor203.h>
 #include <HerkulexTeensy.h>
+#include <Hx12kServo.h>
 #include <RobotDebug.h>
 
 class BluetoothDebugWorkflow {
@@ -17,6 +18,10 @@ private:
     HardwareSerial& bluetoothPort_;
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
+    Hx12kServo hx12kA_;
+    Hx12kServo hx12kB_;
+    Hx12kServo hx12kC_;
+    Hx12kServo hx12kD_;
     RobotDebug link_;
     JsonDocument config_;
 

@@ -35,7 +35,9 @@ registry; connecting them to new robot algorithms requires a matching C++ use.
 
 ## Commands
 
-Add an object to the `commands` array. The `action` selects firmware behaviour:
+Add an object to the `commands` array. The `action` selects firmware behaviour.
+The optional `category` is displayed as a badge inside the command card, for
+example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
 
 - `ping`: responds with a log and state.
 - `stop`: disables all Herkulex torque, sends the 203 DC motor neutral, and
@@ -57,6 +59,11 @@ Add an object to the `commands` array. The `action` selects firmware behaviour:
   requires Debug Mode and Run.
 - `dc_motor_203_stop`: immediately writes the 1500 us neutral pulse to both
   channels.
+- `hx12k_angles`: accepts independent selection flags and 0-135 degree targets
+  for level-shifter outputs A-D. Only selected outputs are changed. It requires
+  Debug Mode and Run.
+- `hx12k_disable`: detaches the PWM output. Global STOP and leaving Debug Mode
+  also detach all four outputs.
 
 Example:
 

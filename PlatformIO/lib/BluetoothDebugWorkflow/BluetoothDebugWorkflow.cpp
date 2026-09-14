@@ -10,6 +10,10 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
     : bluetoothPort_(bluetoothPort),
       servos_(herkulexPort, HerkulexConfig::BAUD),
       dcMotor203_(Pins::DC_MOTOR_203_CHANNEL_A, Pins::DC_MOTOR_203_CHANNEL_B),
+      hx12kA_(Pins::HX12K_OUTPUT_A),
+      hx12kB_(Pins::HX12K_OUTPUT_B),
+      hx12kC_(Pins::HX12K_OUTPUT_C),
+      hx12kD_(Pins::HX12K_OUTPUT_D),
       link_(bluetoothPort, dispatch, this)
 {
 }
@@ -20,6 +24,10 @@ void BluetoothDebugWorkflow::begin()
     servos_.begin();
     servos_.torqueOff(0xFE);
     dcMotor203_.begin();
+    hx12kA_.begin();
+    hx12kB_.begin();
+    hx12kC_.begin();
+    hx12kD_.begin();
 
     const DeserializationError error = deserializeJson(config_, EmbeddedDebugConfig::JSON);
     if (error)
@@ -103,6 +111,10 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             servos_.torqueOff(0xFE);
             dcMotor203_.stop();
             dcMotor203Active_ = false;
+            hx12kA_.disable();
+            hx12kB_.disable();
+            hx12kC_.disable();
+            hx12kD_.disable();
         }
         sendState();
         link_.log("INFO", debugMode_ ? "Debug mode enabled" : "Debug mode disabled; torque off");
@@ -135,6 +147,10 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         commandedVelocity_ = 0;
         dcMotor203_.stop();
         dcMotor203Active_ = false;
+        hx12kA_.disable();
+        hx12kB_.disable();
+        hx12kC_.disable();
+        hx12kD_.disable();
         stopped_ = true;
         sendState();
         link_.log("WARNING", "STOP received; servo torque disabled");
@@ -349,6 +365,51 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         dcMotor203Active_ = false;
         link_.log("INFO", "203 DC motor stopped at neutral pulse");
     }
+    else if (strcmp(action, "hx12k_angles") == 0)
+    {
+        if (stopped_)
+        {
+            link_.error("Robot is stopped; press Run Robot before moving HX12K servos");
+            return;
+        }
+
+        const bool selectA = message["select_a"] | false;
+        const bool selectB = message["select_b"] | false;
+        const bool selectC = message["select_c"] | false;
+        const bool selectD = message["select_d"] | false;
+        if (!selectA && !selectB && !selectC && !selectD)
+        {
+            link_.error("Select at least one HX12K servo");
+            return;
+        }
+
+        const float angleA = message["angle_a_deg"] | 67.5f;
+        const float angleB = message["angle_b_deg"] | 67.5f;
+        const float angleC = message["angle_c_deg"] | 67.5f;
+        const float angleD = message["angle_d_deg"] | 67.5f;
+        if (angleA < 0.0f || angleA > 135.0f ||
+            angleB < 0.0f || angleB > 135.0f ||
+            angleC < 0.0f || angleC > 135.0f ||
+            angleD < 0.0f || angleD > 135.0f)
+        {
+            link_.error("Every HX12K angle must be from 0 to 135 degrees");
+            return;
+        }
+
+        if (selectA) hx12kA_.setAngle(angleA);
+        if (selectB) hx12kB_.setAngle(angleB);
+        if (selectC) hx12kC_.setAngle(angleC);
+        if (selectD) hx12kD_.setAngle(angleD);
+        link_.log("INFO", "Selected HX12K angles applied");
+    }
+    else if (strcmp(action, "hx12k_disable") == 0)
+    {
+        hx12kA_.disable();
+        hx12kB_.disable();
+        hx12kC_.disable();
+        hx12kD_.disable();
+        link_.log("INFO", "All HX12K pulse outputs disabled");
+    }
     else
     {
         link_.error("Command action has no firmware handler");
@@ -524,6 +585,14 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["dc_motor_203.channel_b_percent"] = dcMotor203_.channelBPercent();
     data["dc_motor_203.channel_a_pulse_us"] = dcMotor203_.channelAPulseUs();
     data["dc_motor_203.channel_b_pulse_us"] = dcMotor203_.channelBPulseUs();
+    data["hx12k.a.enabled"] = hx12kA_.enabled();
+    data["hx12k.a.angle_deg"] = hx12kA_.commandedAngle();
+    data["hx12k.b.enabled"] = hx12kB_.enabled();
+    data["hx12k.b.angle_deg"] = hx12kB_.commandedAngle();
+    data["hx12k.c.enabled"] = hx12kC_.enabled();
+    data["hx12k.c.angle_deg"] = hx12kC_.commandedAngle();
+    data["hx12k.d.enabled"] = hx12kD_.enabled();
+    data["hx12k.d.angle_deg"] = hx12kD_.commandedAngle();
     if (servoZeroed_[lastServoId_])
         data["servo.zero_offset_deg"] = servoZeroOffsetsDeg_[lastServoId_];
     if (!isnan(measuredServoAngleDeg_))

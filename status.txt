@@ -994,5 +994,60 @@ The reusable 203 motor integration and corrected Serial7 pin mapping remain in
 place for later diagnosis.
 
 ===============================================================================
+20. HX12K SERVO THROUGH DIGITAL LEVEL SHIFT
+===============================================================================
+
+The CPU and level-shifter diagrams in Parts Summary 2026B-compressed.pdf were
+reviewed for this integration. The chosen route is the CPU board's 8-pin DIGITAL
+RAW1 header through the 502_Digital_Level_Shift board. DIGITAL RAW1 is labelled
+3V, GND, D30, D31, D32, D33, GND, 3V. The firmware uses Teensy pin D30.
+
+The level-shifter power jumper must be in Ex when an external servo supply is
+used. The external supply connects to the level-shifter power input with correct
+polarity. The servo connects to output D with ground, external supply, and
+signal aligned to the board markings. Servo current must not be drawn from a
+Teensy 3.3 V pin.
+
+Physical testing confirmed that DIGITAL RAW1 D30 appears on level-shifter output
+D, not output A. The firmware pin was already D30 and therefore worked when the
+servo was moved to output D. Documentation and source comments were corrected;
+no firmware behavior change was needed.
+
+PlatformIO/lib/Hx12kServo now contains a reusable positional-servo library. It
+uses the 1000-2000 microsecond range shown by the supplied 204_Servo example and
+maps it to the HX12K's approximately 135-degree usable travel. Startup leaves
+the PWM output detached, avoiding an unsolicited movement. setAngle(),
+setPulseMicroseconds(), centre(), disable(), and status accessors are provided.
+
+The JSON debug catalogue includes Set HX12K servo angles and Disable HX12K
+output. Movement requires Debug Mode and Run Robot. Global STOP and leaving
+Debug Mode detach the outputs. Telemetry reports enabled state and commanded
+angle for each channel. PlatformIO/HX12K_WIRING.md contains the wiring and safe
+first-test procedure.
+
+The HX12K integration was expanded to all four Digital Level Shift outputs. The
+mapping is A=D33, B=D32, C=D31, and D=D30; D30-to-D was physically confirmed and
+the other channels follow the connector's reversed ordering. The Set HX12K servo
+angles command has a selection checkbox and independent angle for every output.
+Only selected servos receive a new position. Global STOP, leaving Debug Mode,
+and Disable HX12K output detach all four channels.
+
+The desktop Commands tab now uses a three-column grid instead of a single
+vertical list. Every command card has a star toggle. Favourites are saved using
+the application's persistent settings and only starred commands appear on the
+Dashboard; un-starring a command removes its dashboard card. An offscreen GUI
+test confirmed 12 command cards, three grid columns, and working favourite
+add/remove behavior. The multi-servo firmware compiled and uploaded to COM7.
+
+Command cards now display a category badge read from each command's JSON
+category field. Current badges are System, Herkulex, HX12K, and 203 DC Motor.
+The Dashboard's permanent Emergency / General panel now has a large green RUN
+ROBOT button beside the large red STOP ROBOT button. Run uses the existing safe
+run command: the connection must be active and firmware still requires Debug
+Mode before leaving stopped state. An offscreen GUI test verified all badge
+types and the Run/Stop pair. The synchronized catalogue compiled and uploaded
+to COM7.
+
+===============================================================================
 END OF STATUS
 ===============================================================================

@@ -16,18 +16,21 @@
     {
       "name": "ping",
       "label": "Ping Teensy",
+      "category": "System",
       "action": "ping",
       "args": []
     },
     {
       "name": "stop",
       "label": "Stop Robot",
+      "category": "System",
       "action": "stop",
       "args": []
     },
     {
       "name": "run",
       "label": "Run Robot",
+      "category": "System",
       "action": "run",
       "debug_mode_required": true,
       "args": []
@@ -35,6 +38,7 @@
     {
       "name": "set_herkulex_angle",
       "label": "Set Herkulex relative angle",
+      "category": "Herkulex",
       "action": "herkulex_angle",
       "debug_mode_required": true,
       "args": [
@@ -46,6 +50,7 @@
     {
       "name": "read_herkulex_angle",
       "label": "Read Herkulex angle",
+      "category": "Herkulex",
       "action": "herkulex_read_angle",
       "args": [
         {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
@@ -54,6 +59,7 @@
     {
       "name": "zero_herkulex_here",
       "label": "Zero Herkulex here",
+      "category": "Herkulex",
       "action": "herkulex_zero_here",
       "args": [
         {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
@@ -62,6 +68,7 @@
     {
       "name": "set_herkulex_velocity",
       "label": "Set continuous velocity",
+      "category": "Herkulex",
       "action": "herkulex_velocity",
       "debug_mode_required": true,
       "args": [
@@ -72,6 +79,7 @@
     {
       "name": "stop_herkulex_turn",
       "label": "Stop continuous rotation",
+      "category": "Herkulex",
       "action": "herkulex_stop_velocity",
       "args": [
         {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1}
@@ -80,6 +88,7 @@
     {
       "name": "set_dc_motor_203_speed",
       "label": "Set 203 DC motor speed",
+      "category": "203 DC Motor",
       "action": "dc_motor_203_speed",
       "debug_mode_required": true,
       "args": [
@@ -90,7 +99,33 @@
     {
       "name": "stop_dc_motor_203",
       "label": "Stop 203 DC motor",
+      "category": "203 DC Motor",
       "action": "dc_motor_203_stop",
+      "args": []
+    },
+    {
+      "name": "set_hx12k_angles",
+      "label": "Set HX12K servo angles",
+      "category": "HX12K",
+      "description": "Select any combination of level-shifter outputs and send each selected servo its angle.",
+      "action": "hx12k_angles",
+      "debug_mode_required": true,
+      "args": [
+        {"name": "select_a", "label": "Select A (D33)", "type": "bool", "default": false},
+        {"name": "angle_a_deg", "label": "A angle", "type": "float", "min": 0, "max": 135, "step": 1, "default": 67.5},
+        {"name": "select_b", "label": "Select B (D32)", "type": "bool", "default": false},
+        {"name": "angle_b_deg", "label": "B angle", "type": "float", "min": 0, "max": 135, "step": 1, "default": 67.5},
+        {"name": "select_c", "label": "Select C (D31)", "type": "bool", "default": false},
+        {"name": "angle_c_deg", "label": "C angle", "type": "float", "min": 0, "max": 135, "step": 1, "default": 67.5},
+        {"name": "select_d", "label": "Select D (D30)", "type": "bool", "default": true},
+        {"name": "angle_d_deg", "label": "D angle", "type": "float", "min": 0, "max": 135, "step": 1, "default": 67.5}
+      ]
+    },
+    {
+      "name": "disable_hx12k",
+      "label": "Disable HX12K output",
+      "category": "HX12K",
+      "action": "hx12k_disable",
       "args": []
     }
   ]

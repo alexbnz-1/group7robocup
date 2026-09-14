@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -201,7 +202,14 @@ class ValueEditor(QWidget):
 
 
 class CommandWidget(QGroupBox):
-    def __init__(self, definition: dict, send_callback, parent=None):
+    def __init__(
+        self,
+        definition: dict,
+        send_callback,
+        favourite_callback=None,
+        is_favourite=False,
+        parent=None,
+    ):
         name = str(definition.get("name", "command"))
         label = str(definition.get("label", name))
 
@@ -212,6 +220,34 @@ class CommandWidget(QGroupBox):
         self.argument_editors = {}
 
         layout = QFormLayout(self)
+
+        category = str(definition.get("category", "General"))
+        category_label = QLabel(category)
+        category_label.setStyleSheet(
+            "QLabel {"
+            " background: #334155; color: white; border-radius: 7px;"
+            " padding: 3px 8px; font-weight: bold;"
+            "}"
+        )
+        category_label.setMaximumWidth(150)
+        layout.addRow(category_label)
+
+        self.favourite_button = QPushButton()
+        self.favourite_button.setCheckable(True)
+        self.favourite_button.setChecked(bool(is_favourite))
+        self.favourite_button.setMaximumWidth(42)
+        self.favourite_button.setToolTip(
+            "Show this command on the Dashboard"
+        )
+        self._update_favourite_icon(bool(is_favourite))
+        self.favourite_button.toggled.connect(
+            self._update_favourite_icon
+        )
+        if favourite_callback is not None:
+            self.favourite_button.toggled.connect(
+                lambda checked: favourite_callback(self.name, checked)
+            )
+        layout.addRow("Dashboard", self.favourite_button)
 
         description = definition.get("description")
 
@@ -260,6 +296,15 @@ class CommandWidget(QGroupBox):
 
         layout.addRow(run_button)
 
+    def _update_favourite_icon(self, favourite):
+        self.favourite_button.setText("★" if favourite else "☆")
+
+    def set_favourite(self, favourite):
+        self.favourite_button.blockSignals(True)
+        self.favourite_button.setChecked(bool(favourite))
+        self._update_favourite_icon(bool(favourite))
+        self.favourite_button.blockSignals(False)
+
     def _execute(self):
         arguments = {
             name: editor.value()
@@ -294,7 +339,15 @@ class RobotDebugGUI(QMainWindow):
         self.telemetry_history = {}
         self.parameter_editors = {}
         self.command_widgets = {}
+        self.command_definitions = {}
         self.dashboard_command_widgets = {}
+        try:
+            saved_favourites = json.loads(
+                str(self.settings.value("favourite_commands", "[]"))
+            )
+        except (TypeError, json.JSONDecodeError):
+            saved_favourites = []
+        self.favourite_commands = set(saved_favourites)
         self.plot_curves = {}
 
         # Recording metadata / parameter snapshot support.
@@ -1006,7 +1059,7 @@ class RobotDebugGUI(QMainWindow):
             "Emergency / General"
         )
 
-        stop_layout = QVBoxLayout(
+        stop_layout = QHBoxLayout(
             stop_group
         )
 
@@ -1022,8 +1075,32 @@ class RobotDebugGUI(QMainWindow):
             False
         )
 
+        self.dashboard_stop_button.setStyleSheet(
+            "QPushButton { background: #b91c1c; color: white; font-weight: bold; }"
+        )
+
+        self.dashboard_run_button = QPushButton(
+            "RUN ROBOT"
+        )
+
+        self.dashboard_run_button.setMinimumHeight(
+            45
+        )
+
+        self.dashboard_run_button.setEnabled(
+            False
+        )
+
+        self.dashboard_run_button.setStyleSheet(
+            "QPushButton { background: #15803d; color: white; font-weight: bold; }"
+        )
+
         stop_layout.addWidget(
             self.dashboard_stop_button
+        )
+
+        stop_layout.addWidget(
+            self.dashboard_run_button
         )
 
         command_panel_layout.addWidget(
@@ -1363,7 +1440,7 @@ class RobotDebugGUI(QMainWindow):
         )
 
         info = QLabel(
-            "Commands advertised by the robot are generated here automatically."
+            "Commands are arranged in a grid. Star a command to show it on the Dashboard."
         )
 
         layout.addWidget(
@@ -1378,13 +1455,17 @@ class RobotDebugGUI(QMainWindow):
 
         self.command_container = QWidget()
 
-        self.command_layout = QVBoxLayout(
+        self.command_layout = QGridLayout(
             self.command_container
         )
 
         self.command_layout.setAlignment(
             Qt.AlignmentFlag.AlignTop
         )
+        self.command_layout.setHorizontalSpacing(12)
+        self.command_layout.setVerticalSpacing(12)
+        for column in range(3):
+            self.command_layout.setColumnStretch(column, 1)
 
         self.command_scroll.setWidget(
             self.command_container
@@ -1564,6 +1645,13 @@ class RobotDebugGUI(QMainWindow):
         self.dashboard_stop_button.clicked.connect(
             lambda: self.execute_command(
                 "stop",
+                {},
+            )
+        )
+
+        self.dashboard_run_button.clicked.connect(
+            lambda: self.execute_command(
+                "run",
                 {},
             )
         )
@@ -1832,6 +1920,10 @@ class RobotDebugGUI(QMainWindow):
                 True
             )
 
+            self.dashboard_run_button.setEnabled(
+                True
+            )
+
             self.record_button.setEnabled(
                 True
             )
@@ -1887,6 +1979,10 @@ class RobotDebugGUI(QMainWindow):
             )
 
             self.dashboard_stop_button.setEnabled(
+                False
+            )
+
+            self.dashboard_run_button.setEnabled(
                 False
             )
 
@@ -2347,36 +2443,66 @@ class RobotDebugGUI(QMainWindow):
         if not name:
             return
 
+        self.command_definitions[name] = dict(definition)
+
         if name not in self.command_widgets:
             command_widget = CommandWidget(
                 definition,
                 self.execute_command,
+                self.set_command_favourite,
+                name in self.favourite_commands,
             )
 
             self.command_widgets[
                 name
             ] = command_widget
 
-            self.command_layout.addWidget(
-                command_widget
-            )
+            index = len(self.command_widgets) - 1
+            self.command_layout.addWidget(command_widget, index // 3, index % 3)
 
-        if (
-            name
-            not in self.dashboard_command_widgets
-        ):
-            dashboard_widget = CommandWidget(
-                definition,
-                self.execute_command,
-            )
+        if name in self.favourite_commands:
+            self.add_dashboard_command(name)
 
-            self.dashboard_command_widgets[
-                name
-            ] = dashboard_widget
+    def add_dashboard_command(self, name):
+        if name in self.dashboard_command_widgets:
+            return
+        definition = self.command_definitions.get(name)
+        if definition is None:
+            return
 
-            self.dashboard_command_layout.addWidget(
-                dashboard_widget
-            )
+        dashboard_widget = CommandWidget(
+            definition,
+            self.execute_command,
+            self.set_command_favourite,
+            True,
+        )
+
+        self.dashboard_command_widgets[name] = dashboard_widget
+        self.dashboard_command_layout.addWidget(dashboard_widget)
+
+    def set_command_favourite(self, name, favourite):
+        if favourite:
+            self.favourite_commands.add(name)
+        else:
+            self.favourite_commands.discard(name)
+
+        self.settings.setValue(
+            "favourite_commands",
+            json.dumps(sorted(self.favourite_commands)),
+        )
+
+        command_widget = self.command_widgets.get(name)
+        if command_widget is not None:
+            command_widget.set_favourite(favourite)
+
+        if favourite:
+            self.add_dashboard_command(name)
+        else:
+            dashboard_widget = self.dashboard_command_widgets.pop(name, None)
+            if dashboard_widget is not None:
+                self.dashboard_command_layout.removeWidget(dashboard_widget)
+                dashboard_widget.setParent(None)
+                dashboard_widget.deleteLater()
 
     def execute_command(
         self,

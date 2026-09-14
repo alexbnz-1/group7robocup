@@ -49,6 +49,13 @@ namespace Pins {
     constexpr uint8_t DC_MOTOR_203_CHANNEL_A = 29; // TX7
     constexpr uint8_t DC_MOTOR_203_CHANNEL_B = 28; // RX7
 
+    // Digital Raw 1 -> Digital Level Shift servo outputs. D30-to-D was
+    // confirmed physically; the remaining channels follow the reverse order.
+    constexpr uint8_t HX12K_OUTPUT_A = 33;
+    constexpr uint8_t HX12K_OUTPUT_B = 32;
+    constexpr uint8_t HX12K_OUTPUT_C = 31;
+    constexpr uint8_t HX12K_OUTPUT_D = 30;
+
 
     // --------------------------------------------------------
     // Sensors
