@@ -222,6 +222,7 @@ class BluetoothSerial(QObject):
     connection_changed = pyqtSignal(bool, str)
 
     telemetry_received = pyqtSignal(str, object, object)
+    tof_8x8_received = pyqtSignal(dict)
 
     parameter_definition_received = pyqtSignal(dict)
     parameter_value_received = pyqtSignal(str, object)
@@ -501,6 +502,9 @@ class BluetoothSerial(QObject):
                     message.get("value"),
                     timestamp,
                 )
+
+        elif message_type == "tof_8x8":
+            self.tof_8x8_received.emit(message)
 
         # --------------------------------------------------------------
         # Parameter definition

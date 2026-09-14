@@ -33,6 +33,29 @@ The special parameter `debug.telemetry_interval_ms` also controls the actual
 telemetry interval. Other parameters are available through the workflow's JSON
 registry; connecting them to new robot algorithms requires a matching C++ use.
 
+## TOF sensors
+
+Add each VL53 TOF sensor to the top-level `tof_sensors` array. No change to
+`main.cpp` or the desktop GUI is required:
+
+```json
+"tof_sensors": [
+  {"name": "front", "label": "Front TOF", "type": "long", "port": "XSHUT1"},
+  {"name": "left", "label": "Left TOF", "type": "short", "port": "XSHUT2"}
+]
+```
+
+- `name` is a unique short identifier used in telemetry names.
+- `label` documents the physical sensor location.
+- `type` is `long` for VL53L1X or `short` for VL53L0X.
+- `port` is `XSHUT0` through `XSHUT7` (the integers 0-7 are also accepted).
+
+Names and ports must be unique, and at most eight sensors can be configured.
+The firmware holds all XSHUT lines low, starts listed sensors one at a time,
+and assigns address `0x30 + XSHUT number`. Each entry appears separately in
+Live Telemetry as `tof.<name>.available`, `tof.<name>.timed_out`, and
+`tof.<name>.distance_mm`. Unlisted sensors remain shut down.
+
 ## Commands
 
 Add an object to the `commands` array. The `action` selects firmware behaviour.
@@ -64,6 +87,8 @@ example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
   Debug Mode and Run.
 - `hx12k_disable`: detaches the PWM output. Global STOP and leaving Debug Mode
   also detach all four outputs.
+- `tof_read_all`: immediately reads every configured TOF sensor. All sensors
+  are also read automatically with normal telemetry packets.
 
 Example:
 

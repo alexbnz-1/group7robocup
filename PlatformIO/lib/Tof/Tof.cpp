@@ -9,76 +9,88 @@
 namespace {
 
 SX1509 expander;
-VL53L0X shortSensors[TofConfig::SHORT_COUNT];
-VL53L1X longSensors[TofConfig::LONG_COUNT];
+VL53L0X shortSensors[TofConfig::MAX_SENSOR_COUNT];
+VL53L1X longSensors[TofConfig::MAX_SENSOR_COUNT];
+Tof::SensorDefinition sensorDefinitions[TofConfig::MAX_SENSOR_COUNT] = {};
+bool sensorReady[TofConfig::MAX_SENSOR_COUNT] = {};
+uint8_t sensorCount = 0;
 
 // Holds every sensor's XSHUT low so they all boot at the same default I2C
 // address (0x29) without colliding, ready to be brought up one at a time.
 void resetAllSensors() {
-  for (uint8_t i = 0; i < TofConfig::SHORT_COUNT; i++) {
-    expander.pinMode(TofConfig::SHORT_XSHUT_PINS[i], OUTPUT);
-    expander.digitalWrite(TofConfig::SHORT_XSHUT_PINS[i], LOW);
-  }
-  for (uint8_t i = 0; i < TofConfig::LONG_COUNT; i++) {
-    expander.pinMode(TofConfig::LONG_XSHUT_PINS[i], OUTPUT);
-    expander.digitalWrite(TofConfig::LONG_XSHUT_PINS[i], LOW);
+  // Hold every CPU-board XSHUT connector low. This prevents an unlisted sensor
+  // remaining at the shared factory address 0x29 and colliding during setup.
+  for (uint8_t pin = 0; pin < TofConfig::MAX_SENSOR_COUNT; ++pin) {
+    expander.pinMode(pin, OUTPUT);
+    expander.digitalWrite(pin, LOW);
   }
 }
 
 } // namespace
 
-void Tof::begin() {
+bool Tof::begin(const SensorDefinition* definitions, uint8_t count) {
+  sensorCount = count > TofConfig::MAX_SENSOR_COUNT ? TofConfig::MAX_SENSOR_COUNT : count;
+  for (uint8_t i = 0; i < TofConfig::MAX_SENSOR_COUNT; ++i) sensorReady[i] = false;
+
   Wire.begin();
   Wire.setClock(400000);
-  expander.begin(TofConfig::EXPANDER_I2C_ADDRESS);
+  if (!expander.begin(TofConfig::EXPANDER_I2C_ADDRESS)) {
+    return false;
+  }
 
   resetAllSensors();
+  delay(10);
+  bool allReady = true;
 
-  // Bring each short sensor up one at a time, giving it a unique address
-  // before the next one is powered on.
-  for (uint8_t i = 0; i < TofConfig::SHORT_COUNT; i++) {
-    expander.digitalWrite(TofConfig::SHORT_XSHUT_PINS[i], HIGH);
+  for (uint8_t i = 0; i < sensorCount; ++i) {
+    sensorDefinitions[i] = definitions[i];
+    expander.digitalWrite(sensorDefinitions[i].xshutPin, HIGH);
     delay(10);
 
-    shortSensors[i].setTimeout(500);
-    if (!shortSensors[i].init()) {
-      Serial.print("Tof: failed to init short sensor ");
-      Serial.println(i);
-      while (true) {} // halt — a missing/misaddressed sensor can't be recovered here
+    if (sensorDefinitions[i].type == SensorType::Short) {
+      shortSensors[i].setTimeout(500);
+      if (!shortSensors[i].init()) {
+        allReady = false;
+        expander.digitalWrite(sensorDefinitions[i].xshutPin, LOW);
+        continue;
+      }
+      shortSensors[i].setAddress(sensorDefinitions[i].address);
+      shortSensors[i].startContinuous(50);
+    } else {
+      longSensors[i].setTimeout(500);
+      if (!longSensors[i].init()) {
+        allReady = false;
+        expander.digitalWrite(sensorDefinitions[i].xshutPin, LOW);
+        continue;
+      }
+      longSensors[i].setAddress(sensorDefinitions[i].address);
+      longSensors[i].startContinuous(50);
     }
-    shortSensors[i].setAddress(TofConfig::VL53L0X_ADDRESS_START + i);
-    shortSensors[i].startContinuous(50);
+    sensorReady[i] = true;
   }
 
-  // Same bring-up sequence for the long-range sensors.
-  for (uint8_t i = 0; i < TofConfig::LONG_COUNT; i++) {
-    expander.digitalWrite(TofConfig::LONG_XSHUT_PINS[i], HIGH);
-    delay(10);
-
-    longSensors[i].setTimeout(500);
-    if (!longSensors[i].init()) {
-      Serial.print("Tof: failed to init long sensor ");
-      Serial.println(i);
-      while (true) {}
-    }
-    longSensors[i].setAddress(TofConfig::VL53L1X_ADDRESS_START + i);
-    longSensors[i].startContinuous(50);
-  }
+  return allReady;
 }
 
 // Latest continuous-mode reading, mm.
-int16_t Tof::readShort(uint8_t index) {
-  return shortSensors[index].readRangeContinuousMillimeters();
+uint8_t Tof::count() {
+  return sensorCount;
 }
 
-int16_t Tof::readLong(uint8_t index) {
+int16_t Tof::read(uint8_t index) {
+  if (index >= sensorCount || !sensorReady[index]) return -1;
+  if (sensorDefinitions[index].type == SensorType::Short)
+    return shortSensors[index].readRangeContinuousMillimeters();
   return longSensors[index].read();
 }
 
-bool Tof::shortTimedOut(uint8_t index) {
-  return shortSensors[index].timeoutOccurred();
+bool Tof::available(uint8_t index) {
+  return index < sensorCount && sensorReady[index];
 }
 
-bool Tof::longTimedOut(uint8_t index) {
+bool Tof::timedOut(uint8_t index) {
+  if (index >= sensorCount || !sensorReady[index]) return true;
+  if (sensorDefinitions[index].type == SensorType::Short)
+    return shortSensors[index].timeoutOccurred();
   return longSensors[index].timeoutOccurred();
 }

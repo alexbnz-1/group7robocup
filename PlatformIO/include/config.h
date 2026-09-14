@@ -182,43 +182,24 @@ namespace BluetoothConfig {
 // TOF sensor XSHUT pins are controlled using the onboard
 // SX1509 IO expander rather than raw Teensy GPIO.
 //
-// Placeholder counts / expander pins.
-// Confirm against the final sensor layout.
+// Current fitted layout: one VL53L1X long-range sensor on XSHUT1.
 // ============================================================
 
 namespace TofConfig {
 
     constexpr uint8_t EXPANDER_I2C_ADDRESS = 0x3F;
-
-    // New addresses assigned to sensors after startup.
-    constexpr uint8_t VL53L0X_ADDRESS_START = 0x30; // short-range
-    constexpr uint8_t VL53L1X_ADDRESS_START = 0x35; // long-range
-
-
-    // --------------------------------------------------------
-    // Short-range TOF sensors
-    // --------------------------------------------------------
-
-    constexpr uint8_t SHORT_COUNT = 2;
-
-    constexpr uint8_t SHORT_XSHUT_PINS[SHORT_COUNT] = {
-        0,
-        1
-    };
-
-
-    // --------------------------------------------------------
-    // Long-range TOF sensors
-    // --------------------------------------------------------
-
-    constexpr uint8_t LONG_COUNT = 2;
-
-    constexpr uint8_t LONG_XSHUT_PINS[LONG_COUNT] = {
-        2,
-        3
-    };
+    constexpr uint8_t MAX_SENSOR_COUNT = 8;
+    // 0x33 is reserved by the SEN0628 8x8 sensor.
+    constexpr uint8_t FIRST_ASSIGNED_ADDRESS = 0x40;
 
 } // namespace TofConfig
+
+namespace Tof8x8Config {
+
+    constexpr uint8_t I2C_ADDRESS = 0x33;
+    constexpr uint32_t FRAME_INTERVAL_MS = 250;
+
+} // namespace Tof8x8Config
 
 
 // ============================================================

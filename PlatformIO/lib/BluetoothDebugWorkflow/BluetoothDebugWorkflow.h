@@ -6,6 +6,8 @@
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
 #include <RobotDebug.h>
+#include <Tof.h>
+#include <Tof8x8.h>
 
 class BluetoothDebugWorkflow {
 public:
@@ -15,6 +17,7 @@ public:
     void update();
 
 private:
+    static constexpr uint8_t MAX_TOF_SENSORS = 8;
     HardwareSerial& bluetoothPort_;
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
@@ -23,6 +26,7 @@ private:
     Hx12kServo hx12kC_;
     Hx12kServo hx12kD_;
     RobotDebug link_;
+    Tof8x8 tof8x8_;
     JsonDocument config_;
 
     bool debugMode_ = false;
@@ -49,6 +53,12 @@ private:
     uint32_t lastTelemetryMs_ = 0;
     uint32_t lastDefinitionsMs_ = 0;
     uint32_t receivedMessages_ = 0;
+    uint8_t tofSensorCount_ = 0;
+    char tofSensorNames_[MAX_TOF_SENSORS][25] = {};
+    bool tofAvailable_[MAX_TOF_SENSORS] = {};
+    bool tofTimedOut_[MAX_TOF_SENSORS] = {};
+    int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
+    uint32_t lastTof8x8FrameMs_ = 0;
 
     static void dispatch(JsonDocument& message, void* context);
     void handleMessage(JsonDocument& message);
@@ -57,6 +67,10 @@ private:
     void sendDefinitions();
     void sendState();
     void sendTelemetry();
+    void initialiseTofSensors();
+    void readTofSensors();
+    void updateTof8x8();
+    void sendTof8x8Frame();
     void updateAutomaticServoRead();
     void updateTrackingState(float absoluteAngle);
     JsonObject findParameter(const char* name);

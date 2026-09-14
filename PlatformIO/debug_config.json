@@ -1,4 +1,19 @@
 {
+  "tof_sensors": [
+    {
+      "name": "front",
+      "label": "Front long-range TOF",
+      "type": "long",
+      "port": "XSHUT1"
+    },
+    {
+      "name": "left",
+      "label": "Left short-range TOF",
+      "type": "short",
+      "port": "XSHUT2"
+    }
+
+  ],
   "parameters": [
     {
       "name": "debug.telemetry_interval_ms",
@@ -126,6 +141,14 @@
       "label": "Disable HX12K output",
       "category": "HX12K",
       "action": "hx12k_disable",
+      "args": []
+    },
+    {
+      "name": "read_all_tof",
+      "label": "Read all TOF sensors now",
+      "category": "TOF",
+      "description": "Read every TOF sensor listed in tof_sensors and publish each distance separately.",
+      "action": "tof_read_all",
       "args": []
     }
   ]

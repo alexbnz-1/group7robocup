@@ -14,7 +14,8 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
       hx12kB_(Pins::HX12K_OUTPUT_B),
       hx12kC_(Pins::HX12K_OUTPUT_C),
       hx12kD_(Pins::HX12K_OUTPUT_D),
-      link_(bluetoothPort, dispatch, this)
+      link_(bluetoothPort, dispatch, this),
+      tof8x8_(Tof8x8Config::I2C_ADDRESS, Wire1)
 {
 }
 
@@ -28,7 +29,6 @@ void BluetoothDebugWorkflow::begin()
     hx12kB_.begin();
     hx12kC_.begin();
     hx12kD_.begin();
-
     const DeserializationError error = deserializeJson(config_, EmbeddedDebugConfig::JSON);
     if (error)
     {
@@ -36,12 +36,17 @@ void BluetoothDebugWorkflow::begin()
         return;
     }
 
+    initialiseTofSensors();
+    const bool tof8x8Ready = tof8x8_.begin();
+
     JsonObject interval = findParameter("debug.telemetry_interval_ms");
     if (!interval.isNull())
         telemetryIntervalMs_ = constrain(interval["value"] | 200UL, 50UL, 2000UL);
 
     delay(100);
     link_.log("INFO", "Teensy Bluetooth workflow ready");
+    link_.log(tof8x8Ready ? "INFO" : "WARNING",
+              tof8x8Ready ? "SEN0628 8x8 TOF ready" : "SEN0628 8x8 TOF not detected");
     sendState();
 }
 
@@ -49,6 +54,7 @@ void BluetoothDebugWorkflow::update()
 {
     link_.update();
     updateAutomaticServoRead();
+    updateTof8x8();
     sendTelemetry();
 }
 
@@ -410,6 +416,12 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kD_.disable();
         link_.log("INFO", "All HX12K pulse outputs disabled");
     }
+    else if (strcmp(action, "tof_read_all") == 0)
+    {
+        lastTelemetryMs_ = millis() - telemetryIntervalMs_;
+        sendTelemetry();
+        link_.log("INFO", "Configured TOF sensors read");
+    }
     else
     {
         link_.error("Command action has no firmware handler");
@@ -564,6 +576,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         return;
     lastTelemetryMs_ = now;
 
+    readTofSensors();
+
     JsonDocument message;
     message["type"] = "telemetry";
     message["time"] = now;
@@ -593,12 +607,138 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["hx12k.c.angle_deg"] = hx12kC_.commandedAngle();
     data["hx12k.d.enabled"] = hx12kD_.enabled();
     data["hx12k.d.angle_deg"] = hx12kD_.commandedAngle();
+    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    {
+        char key[56];
+        snprintf(key, sizeof(key), "tof.%s.available", tofSensorNames_[i]);
+        data[key] = tofAvailable_[i];
+        snprintf(key, sizeof(key), "tof.%s.timed_out", tofSensorNames_[i]);
+        data[key] = tofTimedOut_[i];
+        if (tofAvailable_[i] && !tofTimedOut_[i] && tofDistanceMm_[i] >= 0)
+        {
+            snprintf(key, sizeof(key), "tof.%s.distance_mm", tofSensorNames_[i]);
+            data[key] = tofDistanceMm_[i];
+        }
+    }
     if (servoZeroed_[lastServoId_])
         data["servo.zero_offset_deg"] = servoZeroOffsetsDeg_[lastServoId_];
     if (!isnan(measuredServoAngleDeg_))
         data["servo.measured_angle_deg"] = measuredServoAngleDeg_;
     if (!isnan(servoPositionErrorDeg_))
         data["servo.position_error_deg"] = servoPositionErrorDeg_;
+    link_.send(message);
+}
+
+void BluetoothDebugWorkflow::initialiseTofSensors()
+{
+    Tof::SensorDefinition definitions[MAX_TOF_SENSORS];
+    JsonArray configured = config_["tof_sensors"].as<JsonArray>();
+
+    for (JsonObject sensor : configured)
+    {
+        if (tofSensorCount_ >= MAX_TOF_SENSORS)
+        {
+            link_.error("Maximum of eight TOF sensors exceeded");
+            break;
+        }
+
+        const char* name = sensor["name"] | "";
+        const char* type = sensor["type"] | "";
+        int port = -1;
+        if (sensor["port"].is<int>())
+            port = sensor["port"].as<int>();
+        else
+        {
+            const char* portText = sensor["port"] | "";
+            if ((strncmp(portText, "XSHUT", 5) == 0 || strncmp(portText, "xshut", 5) == 0) &&
+                portText[5] >= '0' && portText[5] <= '7' && portText[6] == '\0')
+                port = portText[5] - '0';
+        }
+
+        const bool validType = strcmp(type, "long") == 0 || strcmp(type, "short") == 0;
+        bool duplicate = false;
+        for (uint8_t i = 0; i < tofSensorCount_; ++i)
+            duplicate = duplicate || strcmp(name, tofSensorNames_[i]) == 0 ||
+                        definitions[i].xshutPin == port;
+
+        if (name[0] == '\0' || strlen(name) >= sizeof(tofSensorNames_[0]) ||
+            !validType || port < 0 || port > 7 || duplicate)
+        {
+            link_.error("Invalid or duplicate TOF JSON entry");
+            continue;
+        }
+
+        strncpy(tofSensorNames_[tofSensorCount_], name, sizeof(tofSensorNames_[0]) - 1);
+        definitions[tofSensorCount_].type = strcmp(type, "long") == 0
+            ? Tof::SensorType::Long : Tof::SensorType::Short;
+        definitions[tofSensorCount_].xshutPin = static_cast<uint8_t>(port);
+        definitions[tofSensorCount_].address = TofConfig::FIRST_ASSIGNED_ADDRESS + port;
+        ++tofSensorCount_;
+    }
+
+    Tof::begin(definitions, tofSensorCount_);
+    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    {
+        tofAvailable_[i] = Tof::available(i);
+        tofTimedOut_[i] = !tofAvailable_[i];
+        tofDistanceMm_[i] = -1;
+    }
+
+    link_.log("INFO", "JSON-configured TOF sensor setup complete");
+}
+
+void BluetoothDebugWorkflow::readTofSensors()
+{
+    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    {
+        tofAvailable_[i] = Tof::available(i);
+        if (!tofAvailable_[i])
+        {
+            tofTimedOut_[i] = true;
+            tofDistanceMm_[i] = -1;
+            continue;
+        }
+
+        tofDistanceMm_[i] = Tof::read(i);
+        tofTimedOut_[i] = Tof::timedOut(i);
+    }
+}
+
+void BluetoothDebugWorkflow::updateTof8x8()
+{
+    const uint32_t now = millis();
+    if (now - lastTof8x8FrameMs_ < Tof8x8Config::FRAME_INTERVAL_MS)
+        return;
+    lastTof8x8FrameMs_ = now;
+
+    if (tof8x8_.available())
+        tof8x8_.read();
+    sendTof8x8Frame();
+}
+
+void BluetoothDebugWorkflow::sendTof8x8Frame()
+{
+    JsonDocument message;
+    message["type"] = "tof_8x8";
+    message["time"] = millis();
+    message["name"] = "matrix";
+    message["available"] = tof8x8_.available();
+    message["valid"] = tof8x8_.lastReadSucceeded();
+    message["frame"] = tof8x8_.frameNumber();
+    message["address"] = tof8x8_.detectedAddress();
+    message["address_ack_mask"] = tof8x8_.addressAckMask();
+    message["address_52_ack"] = tof8x8_.address52Acknowledged();
+    message["bus"] = "I2C1";
+    JsonArray i2cAddresses = message["i2c_addresses"].to<JsonArray>();
+    for (uint8_t address = 0x08; address <= 0x77; ++address)
+        if (tof8x8_.addressAcknowledged(address))
+            i2cAddresses.add(address);
+
+    JsonArray zones = message["data"].to<JsonArray>();
+    if (tof8x8_.lastReadSucceeded())
+        for (uint8_t i = 0; i < Tof8x8::ZONE_COUNT; ++i)
+            zones.add(tof8x8_.data()[i]);
+
     link_.send(message);
 }
 

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -900,6 +900,7 @@ class RobotDebugGUI(QMainWindow):
         )
 
         self._build_dashboard_tab()
+        self._build_tof8x8_tab()
         self._build_plot_tab()
         self._build_parameter_tab()
         self._build_command_tab()
@@ -1156,6 +1157,143 @@ class RobotDebugGUI(QMainWindow):
         self.tabs.addTab(
             page,
             "Dashboard",
+        )
+
+    # =================================================================
+    # 8x8 TOF heatmap
+    # =================================================================
+
+    def _build_tof8x8_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        controls = QHBoxLayout()
+        title = QLabel("SEN0628 8x8 TOF distance map")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        controls.addWidget(title)
+        controls.addStretch()
+
+        self.tof8x8_auto_range = QCheckBox("Auto colour range")
+        controls.addWidget(self.tof8x8_auto_range)
+        controls.addWidget(QLabel("Maximum (mm):"))
+        self.tof8x8_max_distance = QSpinBox()
+        self.tof8x8_max_distance.setRange(100, 10000)
+        self.tof8x8_max_distance.setSingleStep(100)
+        self.tof8x8_max_distance.setValue(3500)
+        controls.addWidget(self.tof8x8_max_distance)
+        layout.addLayout(controls)
+
+        self.tof8x8_status = QLabel("Waiting for an 8x8 TOF frame")
+        layout.addWidget(self.tof8x8_status)
+
+        grid_group = QGroupBox("Distance by zone (mm) - X left to right, Y top to bottom")
+        grid = QGridLayout(grid_group)
+        grid.setSpacing(4)
+        self.tof8x8_cells = []
+
+        grid.addWidget(QLabel("Y \\ X"), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
+        for column in range(8):
+            label = QLabel(f"X{column}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, 0, column + 1)
+
+        for row in range(8):
+            label = QLabel(f"Y{row}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, row + 1, 0)
+            row_cells = []
+            for column in range(8):
+                cell = QLabel("-")
+                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setMinimumSize(62, 48)
+                cell.setStyleSheet(
+                    "QLabel { background: #374151; color: white; "
+                    "border: 1px solid #111827; font-weight: bold; }"
+                )
+                grid.addWidget(cell, row + 1, column + 1)
+                row_cells.append(cell)
+            self.tof8x8_cells.append(row_cells)
+
+        layout.addWidget(grid_group, 1)
+        legend = QLabel("Near  red    →    yellow/green    →    blue  far")
+        legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(legend)
+        self.tabs.addTab(page, "8x8 TOF")
+
+    def on_tof8x8_frame(self, message: dict):
+        bus_name = str(message.get("bus", "I2C"))
+        available = bool(message.get("available", False))
+        valid = bool(message.get("valid", False))
+        frame_number = int(message.get("frame", 0))
+        values = message.get("data", [])
+
+        if not available:
+            all_addresses = message.get("i2c_addresses", [])
+            ack_mask = int(message.get("address_ack_mask", 0))
+            address_52_ack = bool(message.get("address_52_ack", False))
+            acknowledged = [
+                f"0x{0x30 + index:02X}"
+                for index in range(4)
+                if ack_mask & (1 << index)
+            ]
+            if address_52_ack:
+                acknowledged.append("0x52")
+            detail = (
+                "responding addresses: " + ", ".join(acknowledged)
+                if acknowledged
+                else "nothing responded at 0x30-0x33 or 0x52"
+            )
+            bus_detail = (
+                ", ".join(f"0x{int(address):02X}" for address in all_addresses)
+                if isinstance(all_addresses, list) and all_addresses
+                else "none"
+            )
+            self.tof8x8_status.setText(
+                f"SEN0628 unavailable on {bus_name} ({detail}); all bus devices: {bus_detail}"
+            )
+            return
+        if not valid or not isinstance(values, list) or len(values) != 64:
+            self.tof8x8_status.setText("SEN0628 connected, but the latest frame is invalid")
+            return
+
+        numeric = [float(value) for value in values if isinstance(value, (int, float)) and value > 0]
+        if not numeric:
+            self.tof8x8_status.setText("Frame contains no valid distance values")
+            return
+
+        colour_max = (
+            max(numeric)
+            if self.tof8x8_auto_range.isChecked()
+            else float(self.tof8x8_max_distance.value())
+        )
+        colour_max = max(colour_max, 1.0)
+
+        for index, raw_value in enumerate(values):
+            cell = self.tof8x8_cells[index // 8][index % 8]
+            if not isinstance(raw_value, (int, float)) or raw_value <= 0:
+                cell.setText("-")
+                cell.setStyleSheet(
+                    "QLabel { background: #374151; color: white; "
+                    "border: 1px solid #111827; font-weight: bold; }"
+                )
+                continue
+
+            ratio = min(max(float(raw_value) / colour_max, 0.0), 1.0)
+            colour = QColor.fromHsvF(0.66 * ratio, 0.82, 0.88)
+            text_colour = "black" if 0.12 < ratio < 0.62 else "white"
+            cell.setText(str(int(raw_value)))
+            cell.setStyleSheet(
+                f"QLabel {{ background: {colour.name()}; color: {text_colour}; "
+                "border: 1px solid #111827; font-weight: bold; }"
+            )
+
+        address = int(message.get("address", 0))
+        self.tof8x8_status.setText(
+            f"{bus_name} 0x{address:02X} | frame {frame_number} | min {int(min(numeric))} mm | "
+            f"max {int(max(numeric))} mm | updated {time.strftime('%H:%M:%S')}"
         )
 
     # =================================================================
@@ -1690,6 +1828,10 @@ class RobotDebugGUI(QMainWindow):
 
         self.bluetooth.telemetry_received.connect(
             self.on_telemetry
+        )
+
+        self.bluetooth.tof_8x8_received.connect(
+            self.on_tof8x8_frame
         )
 
         self.bluetooth.parameter_definition_received.connect(
