@@ -1190,6 +1190,70 @@ changed again to Wire1 at the course-example address 0x33. The complete 0x08-
 the tested bus as I2C1.
 The raw-I2C1 test firmware compiled and uploaded successfully to COM7.
 
+The 8x8 TOF page gained a Raw/Fused view selector. Raw displays the exact 64
+sensor measurements. Fused retains the same 8x8 dimensions but combines each
+zone with agreeing cardinal neighbours and its previous-frame value using
+weighted averaging. Depth-difference gates prevent blending across likely
+object boundaries, and invalid measurements are not introduced into valid
+zones. Switching the selector immediately redraws the latest received frame.
+The updated desktop source passed Python bytecode compilation and repository
+whitespace validation.
+
+The earlier fused-grid interpretation was replaced after clarification. The
+view selector now offers Raw grid and Smoothed image. Raw grid retains all 64
+numeric cells. Smoothed image converts the same 8x8 distance colours into an
+enlarged bilinearly interpolated heatmap, producing the continuous blurry-image
+appearance of a low-resolution thermal camera without claiming extra measured
+spatial resolution.
+
+A third 8x8 view, Stable detail, was added for dependable interpretation. It
+maintains five raw frames and filters every physical zone independently using a
+temporal median followed by conservative smoothing. Invalid samples can be
+covered briefly by recent valid measurements, while changes more than 250 mm
+nearer are accepted immediately so a newly appearing obstacle is not hidden by
+old history. Farther jumps remain filtered so a single noisy reading cannot
+make an obstacle disappear. No neighbouring zones are averaged, preserving measured boundaries.
+The filtered map is displayed with the same smooth colour interpolation.
+
+The recording Weight8x8.rdbg was analysed directly for matrix performance. It
+contained 263 valid 8x8 frames across 65.20 seconds, averaging 4.02 Hz. The
+median frame interval was 0.249 seconds and the longest was 0.319 seconds. A
+typical frame contained all 64 valid zones and the minimum was 63. Consecutive
+valid measurements had a median absolute change of 0 mm and a 95th percentile
+of 72 mm; 2.86 percent changed by more than 250 mm. The scene changed strongly
+throughout the test, including an object approaching from roughly 304 mm to
+74-91 mm before the final view became broadly uniform near 300-370 mm. The
+recording showed healthy acquisition and transport, with the main caution being
+occasional large edge/range transitions that benefit from obstacle-safe
+temporal filtering.
+
+The 8x8 view selector gained Raw v2. It presents a smoothly enlarged current
+frame, colours measurements below 200 mm neutral grey, and removes isolated
+spatial spikes. A pixel is replaced by its neighbourhood median only when at
+least four valid surrounding pixels agree within 250 mm and the candidate
+differs from that median by more than 600 mm. This deliberately retains coherent
+near objects, wide changes, and genuine depth edges rather than applying a
+blanket blur.
+
+The recording WeightWallTubeWall.rdbg was analysed for the angled black-wall
+case. It contained 177 valid matrix frames over 43.79 seconds at 4.02 Hz, with
+63-64 valid zones per frame. Normal consecutive changes were small (median 2 mm
+and 95th percentile 43 mm), but the dark angled surface caused coherent groups
+of upper zones to jump from the approximately 500 mm wall surface to roughly
+1500-1900 mm, with occasional transitions above 3000 mm. This is a low-return
+or grazing-angle depth failure affecting adjacent zones, not isolated random
+noise. The isolated-pixel Raw v2 filter therefore cannot safely remove all of
+it; a future surface-consistency/persistence stage is required.
+
+The 8x8 selector gained Dark surface safe. This mode accepts nearer changes
+immediately but requires a jump more than 400 mm farther to persist for three
+frames before discarding a known nearer surface. It then performs two
+conservative surface-repair passes: a far zone is replaced only when at least
+three surrounding zones agree within 220 mm and the zone is more than 450 mm
+behind their median. The limited passes can repair small coherent dark-surface
+holes without flattening large genuine openings. Values below 200 mm use the
+same neutral-grey display treatment as Raw v2.
+
 ===============================================================================
 END OF STATUS
 ===============================================================================

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -1176,6 +1176,14 @@ class RobotDebugGUI(QMainWindow):
         controls.addWidget(title)
         controls.addStretch()
 
+        controls.addWidget(QLabel("View:"))
+        self.tof8x8_view_mode = QComboBox()
+        self.tof8x8_view_mode.addItems(
+            ["Raw grid", "Raw v2", "Smoothed image", "Stable detail", "Dark surface safe"]
+        )
+        self.tof8x8_view_mode.currentIndexChanged.connect(self._refresh_tof8x8_view)
+        controls.addWidget(self.tof8x8_view_mode)
+
         self.tof8x8_auto_range = QCheckBox("Auto colour range")
         controls.addWidget(self.tof8x8_auto_range)
         controls.addWidget(QLabel("Maximum (mm):"))
@@ -1187,6 +1195,12 @@ class RobotDebugGUI(QMainWindow):
         layout.addLayout(controls)
 
         self.tof8x8_status = QLabel("Waiting for an 8x8 TOF frame")
+        self.tof8x8_latest_message = None
+        self.tof8x8_frame_history = deque(maxlen=5)
+        self.tof8x8_stable_values = None
+        self.tof8x8_filtered_frame_number = None
+        self.tof8x8_dark_safe_values = None
+        self.tof8x8_far_jump_counts = [0] * 64
         layout.addWidget(self.tof8x8_status)
 
         grid_group = QGroupBox("Distance by zone (mm) - X left to right, Y top to bottom")
@@ -1217,13 +1231,21 @@ class RobotDebugGUI(QMainWindow):
                 row_cells.append(cell)
             self.tof8x8_cells.append(row_cells)
 
+        self.tof8x8_grid_group = grid_group
         layout.addWidget(grid_group, 1)
+        self.tof8x8_image = QLabel()
+        self.tof8x8_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tof8x8_image.setMinimumSize(640, 480)
+        self.tof8x8_image.setStyleSheet("QLabel { background: #111827; border: 1px solid #374151; }")
+        self.tof8x8_image.hide()
+        layout.addWidget(self.tof8x8_image, 1)
         legend = QLabel("Near  red    →    yellow/green    →    blue  far")
         legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(legend)
         self.tabs.addTab(page, "8x8 TOF")
 
     def on_tof8x8_frame(self, message: dict):
+        self.tof8x8_latest_message = message
         bus_name = str(message.get("bus", "I2C"))
         available = bool(message.get("available", False))
         valid = bool(message.get("valid", False))
@@ -1259,6 +1281,16 @@ class RobotDebugGUI(QMainWindow):
             self.tof8x8_status.setText("SEN0628 connected, but the latest frame is invalid")
             return
 
+        self._update_tof8x8_stable(values, frame_number)
+        self._update_tof8x8_dark_safe(values, frame_number)
+        view_mode = self.tof8x8_view_mode.currentText()
+        if view_mode == "Raw v2":
+            values = self._filter_tof8x8_isolated_pixels(values)
+        elif view_mode == "Stable detail":
+            values = self.tof8x8_stable_values
+        elif view_mode == "Dark surface safe":
+            values = self.tof8x8_dark_safe_values
+
         numeric = [float(value) for value in values if isinstance(value, (int, float)) and value > 0]
         if not numeric:
             self.tof8x8_status.setText("Frame contains no valid distance values")
@@ -1270,6 +1302,18 @@ class RobotDebugGUI(QMainWindow):
             else float(self.tof8x8_max_distance.value())
         )
         colour_max = max(colour_max, 1.0)
+
+        smooth_view = view_mode in (
+            "Raw v2", "Smoothed image", "Stable detail", "Dark surface safe"
+        )
+        self.tof8x8_grid_group.setVisible(not smooth_view)
+        self.tof8x8_image.setVisible(smooth_view)
+        if smooth_view:
+            self._render_tof8x8_image(
+                values,
+                colour_max,
+                grey_below_200=(view_mode in ("Raw v2", "Dark surface safe")),
+            )
 
         for index, raw_value in enumerate(values):
             cell = self.tof8x8_cells[index // 8][index % 8]
@@ -1292,9 +1336,149 @@ class RobotDebugGUI(QMainWindow):
 
         address = int(message.get("address", 0))
         self.tof8x8_status.setText(
-            f"{bus_name} 0x{address:02X} | frame {frame_number} | min {int(min(numeric))} mm | "
+            f"{self.tof8x8_view_mode.currentText()} | {bus_name} 0x{address:02X} | "
+            f"frame {frame_number} | min {int(min(numeric))} mm | "
             f"max {int(max(numeric))} mm | updated {time.strftime('%H:%M:%S')}"
         )
+
+    def _refresh_tof8x8_view(self):
+        if isinstance(self.tof8x8_latest_message, dict):
+            self.on_tof8x8_frame(self.tof8x8_latest_message)
+
+    def _render_tof8x8_image(self, values: list, colour_max: float, grey_below_200: bool = False):
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        for index, raw_value in enumerate(values):
+            if not isinstance(raw_value, (int, float)) or raw_value <= 0:
+                colour = QColor("#374151")
+            elif grey_below_200 and raw_value < 200:
+                colour = QColor("#808080")
+            else:
+                ratio = min(max(float(raw_value) / colour_max, 0.0), 1.0)
+                colour = QColor.fromHsvF(0.66 * ratio, 0.82, 0.88)
+            image.setPixelColor(index % 8, index // 8, colour)
+
+        target = self.tof8x8_image.size()
+        pixmap = QPixmap.fromImage(image).scaled(
+            max(target.width() - 8, 64),
+            max(target.height() - 8, 64),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.tof8x8_image.setPixmap(pixmap)
+
+    def _filter_tof8x8_isolated_pixels(self, values: list) -> list:
+        """Replace isolated spikes while retaining coherent objects and edges."""
+        filtered = list(values)
+        for index, current in enumerate(values):
+            if not isinstance(current, (int, float)) or current <= 0:
+                continue
+            row, column = divmod(index, 8)
+            neighbours = []
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    y, x = row + dy, column + dx
+                    if 0 <= y < 8 and 0 <= x < 8:
+                        value = values[y * 8 + x]
+                        if isinstance(value, (int, float)) and value > 0:
+                            neighbours.append(float(value))
+            if len(neighbours) < 4:
+                continue
+            neighbours.sort()
+            median = neighbours[len(neighbours) // 2]
+            agreeing = sum(abs(value - median) <= 250 for value in neighbours)
+            if agreeing >= 4 and abs(float(current) - median) > 600:
+                filtered[index] = int(round(median))
+        return filtered
+
+    def _update_tof8x8_stable(self, values: list, frame_number: int):
+        if self.tof8x8_filtered_frame_number == frame_number:
+            return
+        self.tof8x8_filtered_frame_number = frame_number
+        self.tof8x8_frame_history.append(list(values))
+
+        stable = []
+        previous = self.tof8x8_stable_values
+        for index, current in enumerate(values):
+            samples = sorted(
+                float(frame[index])
+                for frame in self.tof8x8_frame_history
+                if isinstance(frame[index], (int, float)) and frame[index] > 0
+            )
+            if not samples:
+                stable.append(0)
+                continue
+
+            median = samples[len(samples) // 2]
+            current_valid = isinstance(current, (int, float)) and current > 0
+            old = previous[index] if isinstance(previous, list) and len(previous) == 64 else None
+
+            # A substantially nearer reading may be a newly appearing obstacle;
+            # accept it immediately. Farther jumps remain filtered so one noisy
+            # sample cannot suddenly make an obstacle disappear.
+            if current_valid and old is not None and old > 0 and float(current) < float(old) - 250:
+                result = float(current)
+            elif old is not None and old > 0:
+                result = 0.65 * float(old) + 0.35 * median
+            else:
+                result = median
+            stable.append(int(round(result)))
+
+        self.tof8x8_stable_values = stable
+
+    def _update_tof8x8_dark_safe(self, values: list, frame_number: int):
+        if getattr(self, "tof8x8_dark_safe_frame_number", None) == frame_number:
+            return
+        self.tof8x8_dark_safe_frame_number = frame_number
+        previous = self.tof8x8_dark_safe_values
+        safe = list(values)
+
+        # Nearer changes are safety-relevant and pass immediately. A large
+        # farther jump must persist for three frames before replacing a known
+        # nearer surface; invalid samples are held for the same short interval.
+        for index, current in enumerate(values):
+            old = previous[index] if isinstance(previous, list) and len(previous) == 64 else None
+            current_valid = isinstance(current, (int, float)) and current > 0
+            suspicious_far = (
+                old is not None and old > 0 and
+                (not current_valid or float(current) > float(old) + 400)
+            )
+            if suspicious_far:
+                self.tof8x8_far_jump_counts[index] += 1
+                if self.tof8x8_far_jump_counts[index] < 3:
+                    safe[index] = old
+            else:
+                self.tof8x8_far_jump_counts[index] = 0
+
+        # Two conservative passes repair holes at the boundary of a coherent
+        # nearby surface. Iteration lets the correction reach a small cluster,
+        # but the neighbour agreement requirement protects genuine openings.
+        for _ in range(2):
+            source = list(safe)
+            for index, current in enumerate(source):
+                if not isinstance(current, (int, float)) or current <= 0:
+                    continue
+                row, column = divmod(index, 8)
+                neighbours = []
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        y, x = row + dy, column + dx
+                        if 0 <= y < 8 and 0 <= x < 8:
+                            value = source[y * 8 + x]
+                            if isinstance(value, (int, float)) and value > 0:
+                                neighbours.append(float(value))
+                if len(neighbours) < 3:
+                    continue
+                neighbours.sort()
+                median = neighbours[len(neighbours) // 2]
+                agreeing = sum(abs(value - median) <= 220 for value in neighbours)
+                if agreeing >= 3 and float(current) > median + 450:
+                    safe[index] = int(round(median))
+
+        self.tof8x8_dark_safe_values = safe
 
     # =================================================================
     # Plots
