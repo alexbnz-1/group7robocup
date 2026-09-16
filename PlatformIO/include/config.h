@@ -168,9 +168,9 @@ namespace HerkulexConfig {
 
 namespace BluetoothConfig {
 
-    inline HardwareSerial& PORT = Serial1;
+    inline HardwareSerialIMXRT& PORT = Serial1;
     constexpr uint32_t BAUD = 115200;
-    constexpr uint32_t TELEMETRY_INTERVAL_MS = 200;
+    constexpr uint32_t TELEMETRY_INTERVAL_MS = 500;
 
 } // namespace BluetoothConfig
 
@@ -197,7 +197,7 @@ namespace TofConfig {
 namespace Tof8x8Config {
 
     constexpr uint8_t I2C_ADDRESS = 0x33;
-    constexpr uint32_t FRAME_INTERVAL_MS = 250;
+    constexpr uint32_t FRAME_INTERVAL_MS = 500;
 
 } // namespace Tof8x8Config
 

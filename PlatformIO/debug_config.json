@@ -21,7 +21,7 @@
       "description": "Delay between telemetry packets",
       "datatype": "int",
       "unit": "ms",
-      "value": 200,
+      "value": 500,
       "min": 50,
       "max": 2000,
       "step": 50

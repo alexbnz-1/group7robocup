@@ -1254,6 +1254,96 @@ behind their median. The limited passes can repair small coherent dark-surface
 holes without flattening large genuine openings. Values below 200 mm use the
 same neutral-grey display treatment as Raw v2.
 
+HX12K angle-command responsiveness was hardened after individual GUI commands
+sometimes appeared to be missed until the operator clicked repeatedly. The GUI
+now sends the idempotent HX12K angle command immediately and repeats it after
+60 ms and 120 ms. The servo driver programs the requested pulse width before
+attaching the output, so its first emitted pulse is the target rather than the
+library's centre default, and attach uses explicit 1000-2000 microsecond bounds.
+The Teensy sends updated state immediately after applying an HX12K command so
+the application receives prompt confirmation of the commanded channels.
+The desktop source passed Python bytecode compilation and the firmware built
+successfully. An upload was attempted, but the Teensy programming USB device
+was not present; only Bluetooth COM3/COM4 and the CH9143 on COM10 were visible.
+The firmware-side first-pulse and confirmation changes therefore remain pending
+upload, while the desktop retry behaviour will take effect after restarting the
+application.
+
+Malformed incoming JSON was observed when issuing Herkulex movements over the
+Bluetooth serial link. The generated position-command JSON is valid, so this
+indicates a damaged or truncated wireless serial line rather than invalid GUI
+encoding. Set Herkulex angle now receives the same short guarded retransmission
+used for HX12K positions: immediate send plus retries at 80 ms and 160 ms. Each
+command type has a generation token, so pressing a new target cancels pending
+retries of the older target and prevents stale motion. HX12K retries were moved
+to this guarded mechanism as well.
+
+Follow-up testing showed the first Herkulex move succeeded but the next command
+could fail, demonstrating that automatic repeats were worsening link pressure.
+Those repeats were removed. The actual desktop transport faults were corrected:
+outgoing JSON now loops until every byte has been accepted and flushes the
+serial writer, while incoming bytes are accumulated across read timeouts and
+decoded only after a newline arrives. Previously, readline could return a
+partial Bluetooth fragment after its 50 ms timeout and the application treated
+that fragment as a complete protocol line. A 65536-byte guard prevents an
+unterminated corrupt stream from growing memory without limit.
+
+An automated full Qt application reproduction then isolated the remaining
+Herkulex failure to connection startup. The GUI sent hello followed immediately
+by a duplicate request_definitions. Each request made the Teensy broadcast the
+entire catalogue with a transmit flush and 120 ms delay after every definition,
+blocking incoming processing for several seconds. Motion commands accumulated
+past the Teensy UART receive capacity and subsequently appeared as malformed
+JSON. The duplicate desktop request was removed, and the unnecessary per-item
+flushes and delays were removed from firmware definition transmission. Hardware
+serial writes already apply the required backpressure.
+
+The follow-up Qt reproduction kept telemetry and the event loop healthy but
+showed that 57-58 byte zero/read commands arrived while the 91-92 byte position
+commands disappeared without acknowledgement. This isolated an additional
+CH9143 long-write problem under simultaneous telemetry. Desktop transmission
+now divides each newline-terminated JSON message into 20-byte UART writes with
+a 3 ms inter-chunk gap, then flushes only after the full line. The Teensy parser
+already accumulates until newline, so protocol content is unchanged while each
+radio bridge transfer remains modest.
+
+Paced desktop writes did not resolve the length-dependent loss: approximately
+58-byte zero/read commands consistently arrived, while 91-92 byte position
+commands disappeared during active telemetry. The Teensy Bluetooth UART was
+therefore given 2048 bytes of persistent additional receive storage before
+Serial1 starts. This prevents long newline-terminated JSON commands from
+overflowing the default hardware-serial RX buffer while the main loop is busy
+transmitting telemetry or definitions.
+
+The enlarged Bluetooth receive buffer uses the Teensy-specific
+HardwareSerialIMXRT interface because the generic Arduino HardwareSerial type
+does not expose addMemoryForRead. BluetoothConfig and BluetoothDebugWorkflow
+now preserve that concrete Serial1 type, while the Herkulex port remains a
+generic hardware serial reference. The corrected firmware builds successfully.
+It still needs to be uploaded through the Teensy programming USB connection
+before the receive-buffer correction can affect the running robot.
+
+Live testing after that upload confirmed that long Herkulex commands now reach
+the Teensy, but exposed a separate outbound bandwidth fault. Telemetry and 8x8
+TOF objects were being transmitted quickly enough to overrun the wireless
+bridge: captured lines contained missing sections or the start of a TOF object
+inside an unfinished telemetry object. RobotDebug now serialises each outbound
+object into a complete buffer, transmits it in paced 20-byte chunks, appends its
+newline only after the complete object, and flushes the completed line. The
+default telemetry and 8x8 frame intervals were changed to 500 ms. This retains
+all fields at two updates per second while leaving capacity for reliable
+bidirectional commands.
+
+The paced firmware was verified live through COM10 with the full Herkulex
+servo 4 sequence: enter debug mode, run, zero at the current position, read the
+angle, command -30 degrees, hold for 30 seconds, command +30 degrees, hold for
+30 seconds, then repeat both positions and perform a final angle read. Every
+zero, read, and movement command was acknowledged immediately. The desktop
+event loop completed 1201 heartbeat checks, telemetry stayed continuous with a
+worst observed age of approximately 0.51 seconds, the final telemetry age was
+approximately 0.21 seconds, and the complete 132-second test ended with zero
+protocol errors.
+
 ===============================================================================
 END OF STATUS
 ===============================================================================

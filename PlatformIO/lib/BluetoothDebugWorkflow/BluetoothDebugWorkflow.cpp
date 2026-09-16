@@ -4,7 +4,7 @@
 #include <debug_config.generated.h>
 
 BluetoothDebugWorkflow::BluetoothDebugWorkflow(
-    HardwareSerial& bluetoothPort,
+    HardwareSerialIMXRT& bluetoothPort,
     HardwareSerial& herkulexPort
 )
     : bluetoothPort_(bluetoothPort),
@@ -21,6 +21,11 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
 
 void BluetoothDebugWorkflow::begin()
 {
+    // Teensy's default hardware-serial RX storage is too small for the longer
+    // JSON motion commands when telemetry transmission temporarily delays the
+    // parser. Extra storage prevents complete newline-terminated commands from
+    // being truncated before link_.update() can consume them.
+    bluetoothPort_.addMemoryForRead(bluetoothRxBuffer_, sizeof(bluetoothRxBuffer_));
     bluetoothPort_.begin(BluetoothConfig::BAUD);
     servos_.begin();
     servos_.torqueOff(0xFE);
@@ -407,6 +412,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         if (selectC) hx12kC_.setAngle(angleC);
         if (selectD) hx12kD_.setAngle(angleD);
         link_.log("INFO", "Selected HX12K angles applied");
+        sendState();
     }
     else if (strcmp(action, "hx12k_disable") == 0)
     {
@@ -476,8 +482,6 @@ void BluetoothDebugWorkflow::sendDefinitions()
         outgoing.set(parameter);
         outgoing["type"] = "parameter_definition";
         link_.send(outgoing);
-        bluetoothPort_.flush();
-        delay(120);
     }
 
     for (JsonObject command : config_["commands"].as<JsonArray>())
@@ -488,8 +492,6 @@ void BluetoothDebugWorkflow::sendDefinitions()
         outgoing.remove("debug_mode_required");
         outgoing["type"] = "command_definition";
         link_.send(outgoing);
-        bluetoothPort_.flush();
-        delay(120);
     }
     lastDefinitionsMs_ = millis();
 }

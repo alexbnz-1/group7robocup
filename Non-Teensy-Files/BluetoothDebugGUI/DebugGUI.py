@@ -2840,10 +2840,7 @@ class RobotDebugGUI(QMainWindow):
             arguments,
         )
 
-        self.bluetooth.send_command(
-            name,
-            **arguments,
-        )
+        self.bluetooth.send_command(name, **arguments)
 
         if arguments:
             argument_text = ", ".join(
@@ -2866,6 +2863,7 @@ class RobotDebugGUI(QMainWindow):
             "TX",
             text,
         )
+
 
     # =================================================================
     # Logs / state / raw

@@ -28,11 +28,20 @@ void Hx12kServo::setAngle(float angleDeg)
 void Hx12kServo::setPulseMicroseconds(uint16_t pulseUs)
 {
     pulseUs = constrain(pulseUs, MIN_PULSE_US, MAX_PULSE_US);
-    ensureAttached();
     commandedPulseUs_ = pulseUs;
     commandedAngleDeg_ =
         (pulseUs - MIN_PULSE_US) * travelDeg_ /
         static_cast<float>(MAX_PULSE_US - MIN_PULSE_US);
+
+    // Program the channel before enabling it so the very first pulse is the
+    // requested target rather than Servo's default centre pulse. The explicit
+    // bounds also keep the library's internal conversion identical to ours.
+    if (!output_.attached())
+    {
+        output_.writeMicroseconds(commandedPulseUs_);
+        output_.attach(signalPin_, MIN_PULSE_US, MAX_PULSE_US);
+        enabled_ = output_.attached();
+    }
     output_.writeMicroseconds(commandedPulseUs_);
 }
 
@@ -73,6 +82,6 @@ float Hx12kServo::travelDegrees() const
 void Hx12kServo::ensureAttached()
 {
     if (!output_.attached())
-        output_.attach(signalPin_);
-    enabled_ = true;
+        output_.attach(signalPin_, MIN_PULSE_US, MAX_PULSE_US);
+    enabled_ = output_.attached();
 }

@@ -58,8 +58,28 @@ void RobotDebug::finishLine()
 
 void RobotDebug::send(JsonDocument& message)
 {
-    serializeJson(message, stream_);
+    const size_t required = measureJson(message);
+    if (required >= sizeof(txBuffer_))
+        return;
+
+    const size_t length = serializeJson(message, txBuffer_, sizeof(txBuffer_));
+    size_t offset = 0;
+    while (offset < length)
+    {
+        const size_t remaining = length - offset;
+        const size_t chunkLength = remaining < TX_CHUNK_SIZE
+            ? remaining
+            : TX_CHUNK_SIZE;
+        stream_.write(
+            reinterpret_cast<const uint8_t*>(txBuffer_ + offset),
+            chunkLength
+        );
+        offset += chunkLength;
+        if (offset < length)
+            delay(3);
+    }
     stream_.write('\n');
+    stream_.flush();
 }
 
 void RobotDebug::log(const char* level, const char* text)

@@ -17,10 +17,13 @@ public:
     void send(JsonDocument& message);
 
 private:
+    static constexpr size_t TX_BUFFER_SIZE = 2048;
+    static constexpr size_t TX_CHUNK_SIZE = 20;
     Stream& stream_;
     MessageHandler handler_;
     void* context_;
     char buffer_[768] = {};
+    char txBuffer_[TX_BUFFER_SIZE] = {};
     size_t length_ = 0;
     bool droppingLine_ = false;
 

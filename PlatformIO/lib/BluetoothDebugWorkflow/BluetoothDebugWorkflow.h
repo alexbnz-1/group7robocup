@@ -11,14 +11,15 @@
 
 class BluetoothDebugWorkflow {
 public:
-    BluetoothDebugWorkflow(HardwareSerial& bluetoothPort, HardwareSerial& herkulexPort);
+    BluetoothDebugWorkflow(HardwareSerialIMXRT& bluetoothPort, HardwareSerial& herkulexPort);
 
     void begin();
     void update();
 
 private:
     static constexpr uint8_t MAX_TOF_SENSORS = 8;
-    HardwareSerial& bluetoothPort_;
+    HardwareSerialIMXRT& bluetoothPort_;
+    uint8_t bluetoothRxBuffer_[2048] = {};
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
     Hx12kServo hx12kA_;
