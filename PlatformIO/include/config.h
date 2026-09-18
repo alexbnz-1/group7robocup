@@ -44,10 +44,12 @@ namespace Pins {
     constexpr uint8_t BLUETOOTH_RX = 0;
     constexpr uint8_t BLUETOOTH_TX = 1;
 
-    // 203_DCMotor controller plugged into the SERIAL7 connector. Its two wires
-    // are independent servo-style inputs, not UART data.
-    constexpr uint8_t DC_MOTOR_203_CHANNEL_A = 29; // TX7
-    constexpr uint8_t DC_MOTOR_203_CHANNEL_B = 28; // RX7
+    // Two 203_DCMotor controllers. Each channel takes a servo-style pulse,
+    // not UART data; the four outputs are independent digital pins.
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_A = 27;
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_B = 26;
+    constexpr uint8_t DC_MOTOR_203_SECOND_CHANNEL_A = 25;
+    constexpr uint8_t DC_MOTOR_203_SECOND_CHANNEL_B = 15;
 
     // Digital Raw 1 -> Digital Level Shift servo outputs. D30-to-D was
     // confirmed physically; the remaining channels follow the reverse order.
@@ -69,7 +71,7 @@ namespace Pins {
     constexpr uint8_t COLOUR_I2C_BUS = 1; // Wire1
 
     constexpr uint8_t IR_LEFT  = A0;
-    constexpr uint8_t IR_RIGHT = A1;
+    constexpr uint8_t IR_RIGHT = A1; // Also D15; unavailable while second motor driver uses D15.
 
     constexpr uint8_t ULTRASOUND_FRONT_TRIG = 9;
     constexpr uint8_t ULTRASOUND_FRONT_ECHO = 10;

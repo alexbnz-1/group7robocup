@@ -22,6 +22,7 @@ private:
     uint8_t bluetoothRxBuffer_[2048] = {};
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
+    DcMotor203 dcMotor203Second_;
     Hx12kServo hx12kA_;
     Hx12kServo hx12kB_;
     Hx12kServo hx12kC_;
@@ -50,6 +51,7 @@ private:
     bool continuousVelocityActive_ = false;
     int16_t commandedVelocity_ = 0;
     bool dcMotor203Active_ = false;
+    bool dcMotor203SecondActive_ = false;
     uint32_t telemetryIntervalMs_ = 200;
     uint32_t lastTelemetryMs_ = 0;
     uint32_t lastDefinitionsMs_ = 0;

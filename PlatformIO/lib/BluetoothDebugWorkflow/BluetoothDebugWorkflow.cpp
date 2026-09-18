@@ -10,6 +10,7 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
     : bluetoothPort_(bluetoothPort),
       servos_(herkulexPort, HerkulexConfig::BAUD),
       dcMotor203_(Pins::DC_MOTOR_203_CHANNEL_A, Pins::DC_MOTOR_203_CHANNEL_B),
+      dcMotor203Second_(Pins::DC_MOTOR_203_SECOND_CHANNEL_A, Pins::DC_MOTOR_203_SECOND_CHANNEL_B),
       hx12kA_(Pins::HX12K_OUTPUT_A),
       hx12kB_(Pins::HX12K_OUTPUT_B),
       hx12kC_(Pins::HX12K_OUTPUT_C),
@@ -30,6 +31,7 @@ void BluetoothDebugWorkflow::begin()
     servos_.begin();
     servos_.torqueOff(0xFE);
     dcMotor203_.begin();
+    dcMotor203Second_.begin();
     hx12kA_.begin();
     hx12kB_.begin();
     hx12kC_.begin();
@@ -122,6 +124,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             servos_.torqueOff(0xFE);
             dcMotor203_.stop();
             dcMotor203Active_ = false;
+            dcMotor203Second_.stop();
+            dcMotor203SecondActive_ = false;
             hx12kA_.disable();
             hx12kB_.disable();
             hx12kC_.disable();
@@ -158,6 +162,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         commandedVelocity_ = 0;
         dcMotor203_.stop();
         dcMotor203Active_ = false;
+        dcMotor203Second_.stop();
+        dcMotor203SecondActive_ = false;
         hx12kA_.disable();
         hx12kB_.disable();
         hx12kC_.disable();
@@ -375,6 +381,33 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         dcMotor203_.stop();
         dcMotor203Active_ = false;
         link_.log("INFO", "203 DC motor stopped at neutral pulse");
+    }
+    else if (strcmp(action, "dc_motor_203_second_speed") == 0)
+    {
+        if (stopped_)
+        {
+            link_.error("Robot is stopped; press Run Robot before driving motor");
+            return;
+        }
+
+        const int channelA = message["channel_a_percent"] | 0;
+        const int channelB = message["channel_b_percent"] | 0;
+        if (channelA < -100 || channelA > 100 || channelB < -100 || channelB > 100)
+        {
+            link_.error("Both second 203 DC motor speeds must be from -100 to 100 percent");
+            return;
+        }
+
+        dcMotor203Second_.setPercent(static_cast<int16_t>(channelA), static_cast<int16_t>(channelB));
+        dcMotor203SecondActive_ = channelA != 0 || channelB != 0;
+        link_.log(dcMotor203SecondActive_ ? "WARNING" : "INFO",
+                  dcMotor203SecondActive_ ? "Second 203 DC motor command applied" : "Second 203 DC motor stopped");
+    }
+    else if (strcmp(action, "dc_motor_203_second_stop") == 0)
+    {
+        dcMotor203Second_.stop();
+        dcMotor203SecondActive_ = false;
+        link_.log("INFO", "Second 203 DC motor stopped at neutral pulse");
     }
     else if (strcmp(action, "hx12k_angles") == 0)
     {
@@ -601,6 +634,11 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["dc_motor_203.channel_b_percent"] = dcMotor203_.channelBPercent();
     data["dc_motor_203.channel_a_pulse_us"] = dcMotor203_.channelAPulseUs();
     data["dc_motor_203.channel_b_pulse_us"] = dcMotor203_.channelBPulseUs();
+    data["dc_motor_203_second.active"] = dcMotor203SecondActive_;
+    data["dc_motor_203_second.channel_a_percent"] = dcMotor203Second_.channelAPercent();
+    data["dc_motor_203_second.channel_b_percent"] = dcMotor203Second_.channelBPercent();
+    data["dc_motor_203_second.channel_a_pulse_us"] = dcMotor203Second_.channelAPulseUs();
+    data["dc_motor_203_second.channel_b_pulse_us"] = dcMotor203Second_.channelBPulseUs();
     data["hx12k.a.enabled"] = hx12kA_.enabled();
     data["hx12k.a.angle_deg"] = hx12kA_.commandedAngle();
     data["hx12k.b.enabled"] = hx12kB_.enabled();

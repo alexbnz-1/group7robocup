@@ -9,7 +9,7 @@ DcMotor203::DcMotor203(uint8_t channelAPin, uint8_t channelBPin)
 void DcMotor203::begin()
 {
     // Match the supplied 203_DCMotor example: each controller channel is a
-    // normal Servo output. Serial3 is only the physical connector name here.
+    // normal Servo output. The digital connector is not a UART port.
     channelA_.attach(channelAPin_);
     channelB_.attach(channelBPin_);
     stop();

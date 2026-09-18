@@ -63,7 +63,7 @@ The optional `category` is displayed as a badge inside the command card, for
 example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
 
 - `ping`: responds with a log and state.
-- `stop`: disables all Herkulex torque, sends the 203 DC motor neutral, and
+- `stop`: disables all Herkulex torque, sends both 203 DC motor drivers neutral, and
   reports stopped state.
 - `run`: leaves stopped mode without commanding motion or enabling torque.
 - `herkulex_angle`: validates and sends a Herkulex angle command.
@@ -78,10 +78,16 @@ example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
 - `herkulex_stop_velocity`: commands zero velocity and disables that servo's
   torque. Use it before setting zero or returning to position control.
 - `dc_motor_203_speed`: applies independent signed -100% to +100% commands to
-  the two 203 DC motor channels on Serial7 TX7/pin 29 and RX7/pin 28. It
+  the first 203 DC motor driver's channels A/B on D27/D26. It
   requires Debug Mode and Run.
 - `dc_motor_203_stop`: immediately writes the 1500 us neutral pulse to both
-  channels.
+  channels of the first driver.
+- `dc_motor_203_second_speed`: applies the same independent channel control to
+  the second driver's channels A/B on D25/D15. It requires Debug Mode and Run.
+- `dc_motor_203_second_stop`: writes neutral to both second-driver channels.
+  Global Stop and leaving Debug Mode stop both drivers.
+  D15 is also Teensy A1, which is reserved as `IR_RIGHT` in the placeholder
+  sensor configuration; that IR input cannot be used at the same time.
 - `hx12k_angles`: accepts independent selection flags and 0-135 degree targets
   for level-shifter outputs A-D. Only selected outputs are changed. It requires
   Debug Mode and Run.

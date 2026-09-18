@@ -63,6 +63,7 @@ import pyqtgraph as pg
 
 from BluetoothSerial import BluetoothSerial
 from DataRecorder import DataRecorder
+from WiringGuide import WiringGuide
 
 
 class ValueEditor(QWidget):
@@ -904,6 +905,7 @@ class RobotDebugGUI(QMainWindow):
         self._build_plot_tab()
         self._build_parameter_tab()
         self._build_command_tab()
+        self._build_wiring_guide_tab()
         self._build_log_tab()
         self._build_raw_tab()
 
@@ -914,6 +916,11 @@ class RobotDebugGUI(QMainWindow):
     # =================================================================
     # Dashboard
     # =================================================================
+
+    def _build_wiring_guide_tab(self):
+        self.wiring_guide = WiringGuide(self.settings)
+        self.tabs.addTab(self.wiring_guide, "Wiring Guide")
+
 
     def _build_dashboard_tab(self):
         page = QWidget()

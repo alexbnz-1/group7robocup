@@ -102,7 +102,7 @@
     },
     {
       "name": "set_dc_motor_203_speed",
-      "label": "Set 203 DC motor speed",
+      "label": "Set first 203 motor speed (D27/D26)",
       "category": "203 DC Motor",
       "action": "dc_motor_203_speed",
       "debug_mode_required": true,
@@ -113,9 +113,27 @@
     },
     {
       "name": "stop_dc_motor_203",
-      "label": "Stop 203 DC motor",
+      "label": "Stop first 203 motor",
       "category": "203 DC Motor",
       "action": "dc_motor_203_stop",
+      "args": []
+    },
+    {
+      "name": "set_dc_motor_203_second_speed",
+      "label": "Set second 203 motor speed (D25/D15)",
+      "category": "203 DC Motor",
+      "action": "dc_motor_203_second_speed",
+      "debug_mode_required": true,
+      "args": [
+        {"name": "channel_a_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0},
+        {"name": "channel_b_percent", "type": "int", "min": -100, "max": 100, "step": 5, "default": 0}
+      ]
+    },
+    {
+      "name": "stop_dc_motor_203_second",
+      "label": "Stop second 203 motor",
+      "category": "203 DC Motor",
+      "action": "dc_motor_203_second_stop",
       "args": []
     },
     {

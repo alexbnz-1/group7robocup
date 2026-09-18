@@ -1345,5 +1345,49 @@ approximately 0.21 seconds, and the complete 132-second test ended with zero
 protocol errors.
 
 ===============================================================================
+23. TWO 203 DC MOTOR DRIVERS ON DIGITAL OUTPUTS
+===============================================================================
+
+The original 203 DC motor driver was moved from the Serial7-labelled connector
+to digital outputs D27 (channel A) and D26 (channel B). The 203 controller does
+not use a UART protocol; each channel expects a servo-style 1.05-1.95 ms pulse,
+with 1.5 ms neutral. Its existing GUI speed and stop commands retain their
+names and now identify the first driver explicitly.
+
+A second independent 203 driver was added on D25 (channel A) and D15 (channel
+B), reusing the same DcMotor203 pulse driver. The JSON debug configuration now
+advertises separate speed and stop commands for the second driver, with -100%
+to +100% speed control for both channels. Telemetry reports each driver's
+active state, commanded percentages, and pulse widths independently. Firmware
+startup initializes both controllers at neutral; global Stop and leaving Debug
+Mode also neutralize both. New motor commands still require Debug Mode and Run.
+
+D15 is also Teensy analogue input A1 and is reserved by the dormant IR_RIGHT
+placeholder in config.h. It cannot be wired to that IR sensor while used for
+the second motor driver. The firmware builds successfully, but the new pin
+assignment has not yet been uploaded or electrically tested.
+
+===============================================================================
+24. EDITABLE CPU WIRING GUIDE IN THE DEBUG CONSOLE
+===============================================================================
+
+The desktop debug console now has a Wiring Guide tab. Its upper panel draws a
+CPU-to-device diagram with one connector/pin card and one connected-device card
+per wiring entry; the lower panel contains an editable table with type, device,
+CPU connector, CPU pins, and notes. A short form adds sensors, motors, motor
+drivers, servos, communications modules, and other devices. The selected row
+can be removed. Direct table edits, additions, and removals redraw the diagram
+and immediately save the complete list to the application's local QSettings
+store. A new app instance restores that saved list, including deletions.
+
+Initial entries reflect the currently configured CPU-facing connections:
+Bluetooth on Serial1; Herkulex on Serial2; the two 203 drivers on D27/D26 and
+D25/D15; HX12K outputs on D33-D30; point TOF sensors via XSHUT1/XSHUT2; and
+the SEN0628 on raw I2C1 at address 0x33. These are editable documentation,
+not firmware configuration. Changing a diagram pin does not change Teensy code
+or physically move a cable. The full app tab and persistence round trip passed
+headless GUI tests.
+
+===============================================================================
 END OF STATUS
 ===============================================================================
