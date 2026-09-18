@@ -21,6 +21,7 @@ Required beside this file:
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 import subprocess
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,6 +39,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -61,6 +63,7 @@ import pyqtgraph as pg
 
 from BluetoothSerial import BluetoothSerial
 from DataRecorder import DataRecorder
+from WiringGuide import WiringGuide
 
 
 class ValueEditor(QWidget):
@@ -200,7 +203,14 @@ class ValueEditor(QWidget):
 
 
 class CommandWidget(QGroupBox):
-    def __init__(self, definition: dict, send_callback, parent=None):
+    def __init__(
+        self,
+        definition: dict,
+        send_callback,
+        favourite_callback=None,
+        is_favourite=False,
+        parent=None,
+    ):
         name = str(definition.get("name", "command"))
         label = str(definition.get("label", name))
 
@@ -211,6 +221,34 @@ class CommandWidget(QGroupBox):
         self.argument_editors = {}
 
         layout = QFormLayout(self)
+
+        category = str(definition.get("category", "General"))
+        category_label = QLabel(category)
+        category_label.setStyleSheet(
+            "QLabel {"
+            " background: #334155; color: white; border-radius: 7px;"
+            " padding: 3px 8px; font-weight: bold;"
+            "}"
+        )
+        category_label.setMaximumWidth(150)
+        layout.addRow(category_label)
+
+        self.favourite_button = QPushButton()
+        self.favourite_button.setCheckable(True)
+        self.favourite_button.setChecked(bool(is_favourite))
+        self.favourite_button.setMaximumWidth(42)
+        self.favourite_button.setToolTip(
+            "Show this command on the Dashboard"
+        )
+        self._update_favourite_icon(bool(is_favourite))
+        self.favourite_button.toggled.connect(
+            self._update_favourite_icon
+        )
+        if favourite_callback is not None:
+            self.favourite_button.toggled.connect(
+                lambda checked: favourite_callback(self.name, checked)
+            )
+        layout.addRow("Dashboard", self.favourite_button)
 
         description = definition.get("description")
 
@@ -259,6 +297,15 @@ class CommandWidget(QGroupBox):
 
         layout.addRow(run_button)
 
+    def _update_favourite_icon(self, favourite):
+        self.favourite_button.setText("★" if favourite else "☆")
+
+    def set_favourite(self, favourite):
+        self.favourite_button.blockSignals(True)
+        self.favourite_button.setChecked(bool(favourite))
+        self._update_favourite_icon(bool(favourite))
+        self.favourite_button.blockSignals(False)
+
     def _execute(self):
         arguments = {
             name: editor.value()
@@ -293,7 +340,15 @@ class RobotDebugGUI(QMainWindow):
         self.telemetry_history = {}
         self.parameter_editors = {}
         self.command_widgets = {}
+        self.command_definitions = {}
         self.dashboard_command_widgets = {}
+        try:
+            saved_favourites = json.loads(
+                str(self.settings.value("favourite_commands", "[]"))
+            )
+        except (TypeError, json.JSONDecodeError):
+            saved_favourites = []
+        self.favourite_commands = set(saved_favourites)
         self.plot_curves = {}
 
         # Recording metadata / parameter snapshot support.
@@ -310,6 +365,7 @@ class RobotDebugGUI(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self.load_local_debug_config()
 
         self.port_refresh_timer = QTimer(self)
         self.port_refresh_timer.timeout.connect(
@@ -336,6 +392,33 @@ class RobotDebugGUI(QMainWindow):
         self.health_timer.start(500)
 
         self.refresh_ports()
+
+    def load_local_debug_config(self):
+        """Populate controls even when wireless definition frames are lost."""
+        config_path = (
+            Path(__file__).resolve().parents[2]
+            / "PlatformIO"
+            / "debug_config.json"
+        )
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            self.add_log(
+                "WARNING",
+                f"Could not load local debug controls: {error}",
+            )
+            return
+
+        for parameter in config.get("parameters", []):
+            if isinstance(parameter, dict):
+                self.on_parameter_definition(dict(parameter))
+
+        for command in config.get("commands", []):
+            if isinstance(command, dict):
+                definition = dict(command)
+                definition.pop("action", None)
+                definition.pop("debug_mode_required", None)
+                self.on_command_definition(definition)
 
     # =================================================================
     # Recording
@@ -818,9 +901,11 @@ class RobotDebugGUI(QMainWindow):
         )
 
         self._build_dashboard_tab()
+        self._build_tof8x8_tab()
         self._build_plot_tab()
         self._build_parameter_tab()
         self._build_command_tab()
+        self._build_wiring_guide_tab()
         self._build_log_tab()
         self._build_raw_tab()
 
@@ -831,6 +916,11 @@ class RobotDebugGUI(QMainWindow):
     # =================================================================
     # Dashboard
     # =================================================================
+
+    def _build_wiring_guide_tab(self):
+        self.wiring_guide = WiringGuide(self.settings)
+        self.tabs.addTab(self.wiring_guide, "Wiring Guide")
+
 
     def _build_dashboard_tab(self):
         page = QWidget()
@@ -977,7 +1067,7 @@ class RobotDebugGUI(QMainWindow):
             "Emergency / General"
         )
 
-        stop_layout = QVBoxLayout(
+        stop_layout = QHBoxLayout(
             stop_group
         )
 
@@ -993,8 +1083,32 @@ class RobotDebugGUI(QMainWindow):
             False
         )
 
+        self.dashboard_stop_button.setStyleSheet(
+            "QPushButton { background: #b91c1c; color: white; font-weight: bold; }"
+        )
+
+        self.dashboard_run_button = QPushButton(
+            "RUN ROBOT"
+        )
+
+        self.dashboard_run_button.setMinimumHeight(
+            45
+        )
+
+        self.dashboard_run_button.setEnabled(
+            False
+        )
+
+        self.dashboard_run_button.setStyleSheet(
+            "QPushButton { background: #15803d; color: white; font-weight: bold; }"
+        )
+
         stop_layout.addWidget(
             self.dashboard_stop_button
+        )
+
+        stop_layout.addWidget(
+            self.dashboard_run_button
         )
 
         command_panel_layout.addWidget(
@@ -1051,6 +1165,327 @@ class RobotDebugGUI(QMainWindow):
             page,
             "Dashboard",
         )
+
+    # =================================================================
+    # 8x8 TOF heatmap
+    # =================================================================
+
+    def _build_tof8x8_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        controls = QHBoxLayout()
+        title = QLabel("SEN0628 8x8 TOF distance map")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        controls.addWidget(title)
+        controls.addStretch()
+
+        controls.addWidget(QLabel("View:"))
+        self.tof8x8_view_mode = QComboBox()
+        self.tof8x8_view_mode.addItems(
+            ["Raw grid", "Raw v2", "Smoothed image", "Stable detail", "Dark surface safe"]
+        )
+        self.tof8x8_view_mode.currentIndexChanged.connect(self._refresh_tof8x8_view)
+        controls.addWidget(self.tof8x8_view_mode)
+
+        self.tof8x8_auto_range = QCheckBox("Auto colour range")
+        controls.addWidget(self.tof8x8_auto_range)
+        controls.addWidget(QLabel("Maximum (mm):"))
+        self.tof8x8_max_distance = QSpinBox()
+        self.tof8x8_max_distance.setRange(100, 10000)
+        self.tof8x8_max_distance.setSingleStep(100)
+        self.tof8x8_max_distance.setValue(3500)
+        controls.addWidget(self.tof8x8_max_distance)
+        layout.addLayout(controls)
+
+        self.tof8x8_status = QLabel("Waiting for an 8x8 TOF frame")
+        self.tof8x8_latest_message = None
+        self.tof8x8_frame_history = deque(maxlen=5)
+        self.tof8x8_stable_values = None
+        self.tof8x8_filtered_frame_number = None
+        self.tof8x8_dark_safe_values = None
+        self.tof8x8_far_jump_counts = [0] * 64
+        layout.addWidget(self.tof8x8_status)
+
+        grid_group = QGroupBox("Distance by zone (mm) - X left to right, Y top to bottom")
+        grid = QGridLayout(grid_group)
+        grid.setSpacing(4)
+        self.tof8x8_cells = []
+
+        grid.addWidget(QLabel("Y \\ X"), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
+        for column in range(8):
+            label = QLabel(f"X{column}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, 0, column + 1)
+
+        for row in range(8):
+            label = QLabel(f"Y{row}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, row + 1, 0)
+            row_cells = []
+            for column in range(8):
+                cell = QLabel("-")
+                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setMinimumSize(62, 48)
+                cell.setStyleSheet(
+                    "QLabel { background: #374151; color: white; "
+                    "border: 1px solid #111827; font-weight: bold; }"
+                )
+                grid.addWidget(cell, row + 1, column + 1)
+                row_cells.append(cell)
+            self.tof8x8_cells.append(row_cells)
+
+        self.tof8x8_grid_group = grid_group
+        layout.addWidget(grid_group, 1)
+        self.tof8x8_image = QLabel()
+        self.tof8x8_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tof8x8_image.setMinimumSize(640, 480)
+        self.tof8x8_image.setStyleSheet("QLabel { background: #111827; border: 1px solid #374151; }")
+        self.tof8x8_image.hide()
+        layout.addWidget(self.tof8x8_image, 1)
+        legend = QLabel("Near  red    →    yellow/green    →    blue  far")
+        legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(legend)
+        self.tabs.addTab(page, "8x8 TOF")
+
+    def on_tof8x8_frame(self, message: dict):
+        self.tof8x8_latest_message = message
+        bus_name = str(message.get("bus", "I2C"))
+        available = bool(message.get("available", False))
+        valid = bool(message.get("valid", False))
+        frame_number = int(message.get("frame", 0))
+        values = message.get("data", [])
+
+        if not available:
+            all_addresses = message.get("i2c_addresses", [])
+            ack_mask = int(message.get("address_ack_mask", 0))
+            address_52_ack = bool(message.get("address_52_ack", False))
+            acknowledged = [
+                f"0x{0x30 + index:02X}"
+                for index in range(4)
+                if ack_mask & (1 << index)
+            ]
+            if address_52_ack:
+                acknowledged.append("0x52")
+            detail = (
+                "responding addresses: " + ", ".join(acknowledged)
+                if acknowledged
+                else "nothing responded at 0x30-0x33 or 0x52"
+            )
+            bus_detail = (
+                ", ".join(f"0x{int(address):02X}" for address in all_addresses)
+                if isinstance(all_addresses, list) and all_addresses
+                else "none"
+            )
+            self.tof8x8_status.setText(
+                f"SEN0628 unavailable on {bus_name} ({detail}); all bus devices: {bus_detail}"
+            )
+            return
+        if not valid or not isinstance(values, list) or len(values) != 64:
+            self.tof8x8_status.setText("SEN0628 connected, but the latest frame is invalid")
+            return
+
+        self._update_tof8x8_stable(values, frame_number)
+        self._update_tof8x8_dark_safe(values, frame_number)
+        view_mode = self.tof8x8_view_mode.currentText()
+        if view_mode == "Raw v2":
+            values = self._filter_tof8x8_isolated_pixels(values)
+        elif view_mode == "Stable detail":
+            values = self.tof8x8_stable_values
+        elif view_mode == "Dark surface safe":
+            values = self.tof8x8_dark_safe_values
+
+        numeric = [float(value) for value in values if isinstance(value, (int, float)) and value > 0]
+        if not numeric:
+            self.tof8x8_status.setText("Frame contains no valid distance values")
+            return
+
+        colour_max = (
+            max(numeric)
+            if self.tof8x8_auto_range.isChecked()
+            else float(self.tof8x8_max_distance.value())
+        )
+        colour_max = max(colour_max, 1.0)
+
+        smooth_view = view_mode in (
+            "Raw v2", "Smoothed image", "Stable detail", "Dark surface safe"
+        )
+        self.tof8x8_grid_group.setVisible(not smooth_view)
+        self.tof8x8_image.setVisible(smooth_view)
+        if smooth_view:
+            self._render_tof8x8_image(
+                values,
+                colour_max,
+                grey_below_200=(view_mode in ("Raw v2", "Dark surface safe")),
+            )
+
+        for index, raw_value in enumerate(values):
+            cell = self.tof8x8_cells[index // 8][index % 8]
+            if not isinstance(raw_value, (int, float)) or raw_value <= 0:
+                cell.setText("-")
+                cell.setStyleSheet(
+                    "QLabel { background: #374151; color: white; "
+                    "border: 1px solid #111827; font-weight: bold; }"
+                )
+                continue
+
+            ratio = min(max(float(raw_value) / colour_max, 0.0), 1.0)
+            colour = QColor.fromHsvF(0.66 * ratio, 0.82, 0.88)
+            text_colour = "black" if 0.12 < ratio < 0.62 else "white"
+            cell.setText(str(int(raw_value)))
+            cell.setStyleSheet(
+                f"QLabel {{ background: {colour.name()}; color: {text_colour}; "
+                "border: 1px solid #111827; font-weight: bold; }"
+            )
+
+        address = int(message.get("address", 0))
+        self.tof8x8_status.setText(
+            f"{self.tof8x8_view_mode.currentText()} | {bus_name} 0x{address:02X} | "
+            f"frame {frame_number} | min {int(min(numeric))} mm | "
+            f"max {int(max(numeric))} mm | updated {time.strftime('%H:%M:%S')}"
+        )
+
+    def _refresh_tof8x8_view(self):
+        if isinstance(self.tof8x8_latest_message, dict):
+            self.on_tof8x8_frame(self.tof8x8_latest_message)
+
+    def _render_tof8x8_image(self, values: list, colour_max: float, grey_below_200: bool = False):
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        for index, raw_value in enumerate(values):
+            if not isinstance(raw_value, (int, float)) or raw_value <= 0:
+                colour = QColor("#374151")
+            elif grey_below_200 and raw_value < 200:
+                colour = QColor("#808080")
+            else:
+                ratio = min(max(float(raw_value) / colour_max, 0.0), 1.0)
+                colour = QColor.fromHsvF(0.66 * ratio, 0.82, 0.88)
+            image.setPixelColor(index % 8, index // 8, colour)
+
+        target = self.tof8x8_image.size()
+        pixmap = QPixmap.fromImage(image).scaled(
+            max(target.width() - 8, 64),
+            max(target.height() - 8, 64),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.tof8x8_image.setPixmap(pixmap)
+
+    def _filter_tof8x8_isolated_pixels(self, values: list) -> list:
+        """Replace isolated spikes while retaining coherent objects and edges."""
+        filtered = list(values)
+        for index, current in enumerate(values):
+            if not isinstance(current, (int, float)) or current <= 0:
+                continue
+            row, column = divmod(index, 8)
+            neighbours = []
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    y, x = row + dy, column + dx
+                    if 0 <= y < 8 and 0 <= x < 8:
+                        value = values[y * 8 + x]
+                        if isinstance(value, (int, float)) and value > 0:
+                            neighbours.append(float(value))
+            if len(neighbours) < 4:
+                continue
+            neighbours.sort()
+            median = neighbours[len(neighbours) // 2]
+            agreeing = sum(abs(value - median) <= 250 for value in neighbours)
+            if agreeing >= 4 and abs(float(current) - median) > 600:
+                filtered[index] = int(round(median))
+        return filtered
+
+    def _update_tof8x8_stable(self, values: list, frame_number: int):
+        if self.tof8x8_filtered_frame_number == frame_number:
+            return
+        self.tof8x8_filtered_frame_number = frame_number
+        self.tof8x8_frame_history.append(list(values))
+
+        stable = []
+        previous = self.tof8x8_stable_values
+        for index, current in enumerate(values):
+            samples = sorted(
+                float(frame[index])
+                for frame in self.tof8x8_frame_history
+                if isinstance(frame[index], (int, float)) and frame[index] > 0
+            )
+            if not samples:
+                stable.append(0)
+                continue
+
+            median = samples[len(samples) // 2]
+            current_valid = isinstance(current, (int, float)) and current > 0
+            old = previous[index] if isinstance(previous, list) and len(previous) == 64 else None
+
+            # A substantially nearer reading may be a newly appearing obstacle;
+            # accept it immediately. Farther jumps remain filtered so one noisy
+            # sample cannot suddenly make an obstacle disappear.
+            if current_valid and old is not None and old > 0 and float(current) < float(old) - 250:
+                result = float(current)
+            elif old is not None and old > 0:
+                result = 0.65 * float(old) + 0.35 * median
+            else:
+                result = median
+            stable.append(int(round(result)))
+
+        self.tof8x8_stable_values = stable
+
+    def _update_tof8x8_dark_safe(self, values: list, frame_number: int):
+        if getattr(self, "tof8x8_dark_safe_frame_number", None) == frame_number:
+            return
+        self.tof8x8_dark_safe_frame_number = frame_number
+        previous = self.tof8x8_dark_safe_values
+        safe = list(values)
+
+        # Nearer changes are safety-relevant and pass immediately. A large
+        # farther jump must persist for three frames before replacing a known
+        # nearer surface; invalid samples are held for the same short interval.
+        for index, current in enumerate(values):
+            old = previous[index] if isinstance(previous, list) and len(previous) == 64 else None
+            current_valid = isinstance(current, (int, float)) and current > 0
+            suspicious_far = (
+                old is not None and old > 0 and
+                (not current_valid or float(current) > float(old) + 400)
+            )
+            if suspicious_far:
+                self.tof8x8_far_jump_counts[index] += 1
+                if self.tof8x8_far_jump_counts[index] < 3:
+                    safe[index] = old
+            else:
+                self.tof8x8_far_jump_counts[index] = 0
+
+        # Two conservative passes repair holes at the boundary of a coherent
+        # nearby surface. Iteration lets the correction reach a small cluster,
+        # but the neighbour agreement requirement protects genuine openings.
+        for _ in range(2):
+            source = list(safe)
+            for index, current in enumerate(source):
+                if not isinstance(current, (int, float)) or current <= 0:
+                    continue
+                row, column = divmod(index, 8)
+                neighbours = []
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        y, x = row + dy, column + dx
+                        if 0 <= y < 8 and 0 <= x < 8:
+                            value = source[y * 8 + x]
+                            if isinstance(value, (int, float)) and value > 0:
+                                neighbours.append(float(value))
+                if len(neighbours) < 3:
+                    continue
+                neighbours.sort()
+                median = neighbours[len(neighbours) // 2]
+                agreeing = sum(abs(value - median) <= 220 for value in neighbours)
+                if agreeing >= 3 and float(current) > median + 450:
+                    safe[index] = int(round(median))
+
+        self.tof8x8_dark_safe_values = safe
 
     # =================================================================
     # Plots
@@ -1334,7 +1769,7 @@ class RobotDebugGUI(QMainWindow):
         )
 
         info = QLabel(
-            "Commands advertised by the robot are generated here automatically."
+            "Commands are arranged in a grid. Star a command to show it on the Dashboard."
         )
 
         layout.addWidget(
@@ -1349,13 +1784,17 @@ class RobotDebugGUI(QMainWindow):
 
         self.command_container = QWidget()
 
-        self.command_layout = QVBoxLayout(
+        self.command_layout = QGridLayout(
             self.command_container
         )
 
         self.command_layout.setAlignment(
             Qt.AlignmentFlag.AlignTop
         )
+        self.command_layout.setHorizontalSpacing(12)
+        self.command_layout.setVerticalSpacing(12)
+        for column in range(3):
+            self.command_layout.setColumnStretch(column, 1)
 
         self.command_scroll.setWidget(
             self.command_container
@@ -1539,6 +1978,13 @@ class RobotDebugGUI(QMainWindow):
             )
         )
 
+        self.dashboard_run_button.clicked.connect(
+            lambda: self.execute_command(
+                "run",
+                {},
+            )
+        )
+
         self.refresh_definitions_button.clicked.connect(
             self.bluetooth.request_definitions
         )
@@ -1573,6 +2019,10 @@ class RobotDebugGUI(QMainWindow):
 
         self.bluetooth.telemetry_received.connect(
             self.on_telemetry
+        )
+
+        self.bluetooth.tof_8x8_received.connect(
+            self.on_tof8x8_frame
         )
 
         self.bluetooth.parameter_definition_received.connect(
@@ -1803,6 +2253,10 @@ class RobotDebugGUI(QMainWindow):
                 True
             )
 
+            self.dashboard_run_button.setEnabled(
+                True
+            )
+
             self.record_button.setEnabled(
                 True
             )
@@ -1858,6 +2312,10 @@ class RobotDebugGUI(QMainWindow):
             )
 
             self.dashboard_stop_button.setEnabled(
+                False
+            )
+
+            self.dashboard_run_button.setEnabled(
                 False
             )
 
@@ -2318,36 +2776,66 @@ class RobotDebugGUI(QMainWindow):
         if not name:
             return
 
+        self.command_definitions[name] = dict(definition)
+
         if name not in self.command_widgets:
             command_widget = CommandWidget(
                 definition,
                 self.execute_command,
+                self.set_command_favourite,
+                name in self.favourite_commands,
             )
 
             self.command_widgets[
                 name
             ] = command_widget
 
-            self.command_layout.addWidget(
-                command_widget
-            )
+            index = len(self.command_widgets) - 1
+            self.command_layout.addWidget(command_widget, index // 3, index % 3)
 
-        if (
-            name
-            not in self.dashboard_command_widgets
-        ):
-            dashboard_widget = CommandWidget(
-                definition,
-                self.execute_command,
-            )
+        if name in self.favourite_commands:
+            self.add_dashboard_command(name)
 
-            self.dashboard_command_widgets[
-                name
-            ] = dashboard_widget
+    def add_dashboard_command(self, name):
+        if name in self.dashboard_command_widgets:
+            return
+        definition = self.command_definitions.get(name)
+        if definition is None:
+            return
 
-            self.dashboard_command_layout.addWidget(
-                dashboard_widget
-            )
+        dashboard_widget = CommandWidget(
+            definition,
+            self.execute_command,
+            self.set_command_favourite,
+            True,
+        )
+
+        self.dashboard_command_widgets[name] = dashboard_widget
+        self.dashboard_command_layout.addWidget(dashboard_widget)
+
+    def set_command_favourite(self, name, favourite):
+        if favourite:
+            self.favourite_commands.add(name)
+        else:
+            self.favourite_commands.discard(name)
+
+        self.settings.setValue(
+            "favourite_commands",
+            json.dumps(sorted(self.favourite_commands)),
+        )
+
+        command_widget = self.command_widgets.get(name)
+        if command_widget is not None:
+            command_widget.set_favourite(favourite)
+
+        if favourite:
+            self.add_dashboard_command(name)
+        else:
+            dashboard_widget = self.dashboard_command_widgets.pop(name, None)
+            if dashboard_widget is not None:
+                self.dashboard_command_layout.removeWidget(dashboard_widget)
+                dashboard_widget.setParent(None)
+                dashboard_widget.deleteLater()
 
     def execute_command(
         self,
@@ -2359,10 +2847,7 @@ class RobotDebugGUI(QMainWindow):
             arguments,
         )
 
-        self.bluetooth.send_command(
-            name,
-            **arguments,
-        )
+        self.bluetooth.send_command(name, **arguments)
 
         if arguments:
             argument_text = ", ".join(
@@ -2385,6 +2870,7 @@ class RobotDebugGUI(QMainWindow):
             "TX",
             text,
         )
+
 
     # =================================================================
     # Logs / state / raw

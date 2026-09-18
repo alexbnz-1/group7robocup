@@ -13,6 +13,8 @@ namespace Pins {
     // Tracked chassis, PPM-controlled DC motor driver (DFR0513)
     // --------------------------------------------------------
 
+    // Historical placeholders only: D2-D5 are now reserved for the encoder
+    // board on Digital Raw 2 and must not also be enabled as motor outputs.
     constexpr uint8_t DRIVE_LEFT  = 2;
     constexpr uint8_t DRIVE_RIGHT = 3;
 
@@ -24,6 +26,13 @@ namespace Pins {
 
     constexpr uint8_t REEL_LEFT  = 4;
     constexpr uint8_t REEL_RIGHT = 5;
+
+    // Digital Raw 2 signal order on the CPU board is D5, D4, D3, D2.
+    // The supplied 112_Encoder example pairs these as D2/D3 and D4/D5.
+    constexpr uint8_t ENCODER_1_A = 2;
+    constexpr uint8_t ENCODER_1_B = 3;
+    constexpr uint8_t ENCODER_2_A = 4;
+    constexpr uint8_t ENCODER_2_B = 5;
 
 
     // --------------------------------------------------------
@@ -44,6 +53,20 @@ namespace Pins {
     constexpr uint8_t BLUETOOTH_RX = 0;
     constexpr uint8_t BLUETOOTH_TX = 1;
 
+    // Two 203_DCMotor controllers. Each channel takes a servo-style pulse,
+    // not UART data; the four outputs are independent digital pins.
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_A = 27;
+    constexpr uint8_t DC_MOTOR_203_CHANNEL_B = 26;
+    constexpr uint8_t DC_MOTOR_203_SECOND_CHANNEL_A = 25;
+    constexpr uint8_t DC_MOTOR_203_SECOND_CHANNEL_B = 15;
+
+    // Digital Raw 1 -> Digital Level Shift servo outputs. D30-to-D was
+    // confirmed physically; the remaining channels follow the reverse order.
+    constexpr uint8_t HX12K_OUTPUT_A = 33;
+    constexpr uint8_t HX12K_OUTPUT_B = 32;
+    constexpr uint8_t HX12K_OUTPUT_C = 31;
+    constexpr uint8_t HX12K_OUTPUT_D = 30;
+
 
     // --------------------------------------------------------
     // Sensors
@@ -57,7 +80,7 @@ namespace Pins {
     constexpr uint8_t COLOUR_I2C_BUS = 1; // Wire1
 
     constexpr uint8_t IR_LEFT  = A0;
-    constexpr uint8_t IR_RIGHT = A1;
+    constexpr uint8_t IR_RIGHT = A1; // Also D15; unavailable while second motor driver uses D15.
 
     constexpr uint8_t ULTRASOUND_FRONT_TRIG = 9;
     constexpr uint8_t ULTRASOUND_FRONT_ECHO = 10;
@@ -156,9 +179,9 @@ namespace HerkulexConfig {
 
 namespace BluetoothConfig {
 
-    inline HardwareSerial& PORT = Serial1;
+    inline HardwareSerialIMXRT& PORT = Serial1;
     constexpr uint32_t BAUD = 115200;
-    constexpr uint32_t TELEMETRY_INTERVAL_MS = 200;
+    constexpr uint32_t TELEMETRY_INTERVAL_MS = 500;
 
 } // namespace BluetoothConfig
 
@@ -170,43 +193,24 @@ namespace BluetoothConfig {
 // TOF sensor XSHUT pins are controlled using the onboard
 // SX1509 IO expander rather than raw Teensy GPIO.
 //
-// Placeholder counts / expander pins.
-// Confirm against the final sensor layout.
+// Current fitted layout: one VL53L1X long-range sensor on XSHUT1.
 // ============================================================
 
 namespace TofConfig {
 
     constexpr uint8_t EXPANDER_I2C_ADDRESS = 0x3F;
-
-    // New addresses assigned to sensors after startup.
-    constexpr uint8_t VL53L0X_ADDRESS_START = 0x30; // short-range
-    constexpr uint8_t VL53L1X_ADDRESS_START = 0x35; // long-range
-
-
-    // --------------------------------------------------------
-    // Short-range TOF sensors
-    // --------------------------------------------------------
-
-    constexpr uint8_t SHORT_COUNT = 2;
-
-    constexpr uint8_t SHORT_XSHUT_PINS[SHORT_COUNT] = {
-        0,
-        1
-    };
-
-
-    // --------------------------------------------------------
-    // Long-range TOF sensors
-    // --------------------------------------------------------
-
-    constexpr uint8_t LONG_COUNT = 2;
-
-    constexpr uint8_t LONG_XSHUT_PINS[LONG_COUNT] = {
-        2,
-        3
-    };
+    constexpr uint8_t MAX_SENSOR_COUNT = 8;
+    // 0x33 is reserved by the SEN0628 8x8 sensor.
+    constexpr uint8_t FIRST_ASSIGNED_ADDRESS = 0x40;
 
 } // namespace TofConfig
+
+namespace Tof8x8Config {
+
+    constexpr uint8_t I2C_ADDRESS = 0x33;
+    constexpr uint32_t FRAME_INTERVAL_MS = 500;
+
+} // namespace Tof8x8Config
 
 
 // ============================================================

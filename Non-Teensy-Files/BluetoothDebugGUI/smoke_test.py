@@ -31,18 +31,26 @@ def main() -> int:
             link.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
 
         deadline = time.monotonic() + args.seconds
+        receive_buffer = bytearray()
         while time.monotonic() < deadline:
-            line = link.readline().decode("utf-8", errors="replace").strip()
-            if not line:
+            chunk = link.read(link.in_waiting or 1)
+            if not chunk:
                 continue
-            try:
-                message = json.loads(line)
-                if isinstance(message, dict):
-                    valid_messages.append(message)
-                else:
+            receive_buffer.extend(chunk)
+            while b"\n" in receive_buffer:
+                raw_line, _, remainder = receive_buffer.partition(b"\n")
+                receive_buffer = bytearray(remainder)
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                    if isinstance(message, dict):
+                        valid_messages.append(message)
+                    else:
+                        invalid_lines.append(line)
+                except json.JSONDecodeError:
                     invalid_lines.append(line)
-            except json.JSONDecodeError:
-                invalid_lines.append(line)
 
     message_types = {message.get("type") for message in valid_messages}
     for message in valid_messages[:10]:

@@ -36,6 +36,15 @@ public:
         Led led = LED_OFF
     );
 
+    // DRS-series continuous-turn control. Speed is signed -1023..1023;
+    // negative and positive values select opposite directions.
+    void moveVelocity(
+        uint8_t id,
+        int16_t speed,
+        uint16_t playTimeMs = 0,
+        Led led = LED_OFF
+    );
+
     void initializeServo(uint8_t id, bool rebootFirst = true);
     void initializeAll();
 

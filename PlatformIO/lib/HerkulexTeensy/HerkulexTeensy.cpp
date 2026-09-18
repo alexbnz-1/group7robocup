@@ -223,6 +223,43 @@ void HerkulexTeensy::moveAngle(
     );
 }
 
+void HerkulexTeensy::moveVelocity(
+    uint8_t id,
+    int16_t speed,
+    uint16_t playTimeMs,
+    Led led
+)
+{
+    if (speed > 1023)
+        speed = 1023;
+    if (speed < -1023)
+        speed = -1023;
+    if (playTimeMs > 2856)
+        playTimeMs = 2856;
+
+    uint16_t jog = static_cast<uint16_t>(speed < 0 ? -speed : speed);
+    if (speed < 0)
+        jog |= 0x4000; // DRS-0101 infinite-turn negative-direction flag.
+
+    uint8_t setValue = 0x02; // MODE=1: turn/velocity control.
+    if (led & LED_GREEN)
+        setValue |= 0x04;
+    if (led & LED_BLUE)
+        setValue |= 0x08;
+    if (led & LED_RED)
+        setValue |= 0x10;
+
+    uint8_t packet[12] = {
+        0xFF, 0xFF, 0x0C, id, CMD_S_JOG, 0x00, 0x00,
+        static_cast<uint8_t>(playTimeMs / 11.2f),
+        static_cast<uint8_t>(jog & 0xFF),
+        static_cast<uint8_t>((jog >> 8) & 0xFF),
+        setValue,
+        id
+    };
+    sendPacket(packet, sizeof(packet));
+}
+
 void HerkulexTeensy::initializeServo(
     uint8_t id,
     bool rebootFirst

@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from typing import Any
 
 import serial
@@ -95,6 +96,7 @@ class SerialWorker(QThread):
         self._stop_event = threading.Event()
 
         self._tx_queue: queue.Queue[str] = queue.Queue()
+        self._rx_buffer = bytearray()
 
     # -----------------------------------------------------------------
 
@@ -148,7 +150,22 @@ class SerialWorker(QThread):
                 return
 
             try:
-                self._serial.write(text.encode("utf-8"))
+                payload = text.encode("utf-8")
+                offset = 0
+                while offset < len(payload):
+                    # The CH9143 BLE bridge is markedly more reliable when a
+                    # line longer than one radio payload is paced into modest
+                    # UART chunks, especially while telemetry is arriving.
+                    chunk = payload[offset:offset + 20]
+                    written = self._serial.write(chunk)
+                    if written is None or written <= 0:
+                        raise serial.SerialTimeoutException(
+                            "Serial write made no progress"
+                        )
+                    offset += written
+                    if offset < len(payload):
+                        time.sleep(0.003)
+                self._serial.flush()
             except Exception as exc:
                 self.error.emit(f"Transmit error: {exc}")
 
@@ -162,31 +179,30 @@ class SerialWorker(QThread):
             if self._serial.in_waiting <= 0:
                 return
 
-            raw = self._serial.readline()
-
-            if not raw:
+            chunk = self._serial.read(self._serial.in_waiting)
+            if not chunk:
                 return
+            self._rx_buffer.extend(chunk)
 
-            text = raw.decode(
-                "utf-8",
-                errors="replace",
-            ).strip()
+            while b"\n" in self._rx_buffer:
+                raw, _, remainder = self._rx_buffer.partition(b"\n")
+                self._rx_buffer = bytearray(remainder)
+                text = raw.decode("utf-8", errors="replace").strip("\r ")
+                if not text:
+                    continue
+                self.raw_received.emit(text)
+                try:
+                    message = json.loads(text)
+                    if isinstance(message, dict):
+                        self.message_received.emit(message)
+                except json.JSONDecodeError:
+                    # Complete non-JSON lines remain visible in Raw Serial.
+                    pass
 
-            if not text:
-                return
-
-            self.raw_received.emit(text)
-
-            try:
-                message = json.loads(text)
-
-                if isinstance(message, dict):
-                    self.message_received.emit(message)
-
-            except json.JSONDecodeError:
-                # Raw/non-JSON messages are still displayed in the
-                # raw serial console.
-                pass
+            # Prevent an unplugged/corrupt sender from growing memory forever.
+            if len(self._rx_buffer) > 65536:
+                self.error.emit("Incoming serial line exceeded 65536 bytes")
+                self._rx_buffer.clear()
 
         except serial.SerialException as exc:
             self.error.emit(str(exc))
@@ -222,6 +238,7 @@ class BluetoothSerial(QObject):
     connection_changed = pyqtSignal(bool, str)
 
     telemetry_received = pyqtSignal(str, object, object)
+    tof_8x8_received = pyqtSignal(dict)
 
     parameter_definition_received = pyqtSignal(dict)
     parameter_value_received = pyqtSignal(str, object)
@@ -352,9 +369,9 @@ class BluetoothSerial(QObject):
             }
         )
 
-        # Ask the robot to advertise all telemetry parameters
-        # and commands.
-        self.request_definitions()
+        # The hello handler already returns all definitions. Sending a second
+        # request here made the Teensy perform the entire definition broadcast
+        # twice while incoming motion commands accumulated in its UART buffer.
 
     # -----------------------------------------------------------------
 
@@ -501,6 +518,9 @@ class BluetoothSerial(QObject):
                     message.get("value"),
                     timestamp,
                 )
+
+        elif message_type == "tof_8x8":
+            self.tof_8x8_received.emit(message)
 
         # --------------------------------------------------------------
         # Parameter definition

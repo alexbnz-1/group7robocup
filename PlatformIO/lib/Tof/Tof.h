@@ -4,15 +4,27 @@
 
 namespace Tof {
 
-// Brings up the SX1509 expander and all configured short/long TOF sensors.
-void begin();
+enum class SensorType : uint8_t {
+    Short,
+    Long
+};
 
-// Latest range reading in mm for short/long sensor `index`.
-int16_t readShort(uint8_t index);
-int16_t readLong(uint8_t index);
+struct SensorDefinition {
+    SensorType type;
+    uint8_t xshutPin;
+    uint8_t address;
+};
+
+// Brings up the SX1509 expander and all configured short/long TOF sensors.
+// Returns true when every configured sensor was found. A failed sensor is
+// marked unavailable rather than halting the rest of the robot firmware.
+bool begin(const SensorDefinition* definitions, uint8_t count);
+
+uint8_t count();
+int16_t read(uint8_t index);
+bool available(uint8_t index);
 
 // True if the last read on that sensor timed out (treat the reading as stale).
-bool shortTimedOut(uint8_t index);
-bool longTimedOut(uint8_t index);
+bool timedOut(uint8_t index);
 
 } // namespace Tof
