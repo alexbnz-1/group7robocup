@@ -88,6 +88,10 @@ example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
   Global Stop and leaving Debug Mode stop both drivers.
   D15 is also Teensy A1, which is reserved as `IR_RIGHT` in the placeholder
   sensor configuration; that IR input cannot be used at the same time.
+- `encoder_zero`: resets both Digital Raw 2 quadrature counts without moving
+  anything. The automatic telemetry fields are `encoder.1.count`,
+  `encoder.1.delta`, `encoder.1.counts_per_s` and the matching `encoder.2.*`
+  fields. See `ENCODER_WIRING.md` for D2-D5 wiring and voltage precautions.
 - `hx12k_angles`: accepts independent selection flags and 0-135 degree targets
   for level-shifter outputs A-D. Only selected outputs are changed. It requires
   Debug Mode and Run.

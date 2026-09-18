@@ -137,6 +137,13 @@
       "args": []
     },
     {
+      "name": "zero_encoder_counts",
+      "label": "Zero both encoder counts",
+      "category": "Encoder",
+      "action": "encoder_zero",
+      "args": []
+    },
+    {
       "name": "set_hx12k_angles",
       "label": "Set HX12K servo angles",
       "category": "HX12K",

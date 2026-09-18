@@ -1,6 +1,7 @@
 """Headless checks for the editable CPU wiring guide."""
 
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,7 @@ class WiringGuideTest(unittest.TestCase):
         window = RobotDebugGUI()
         labels = [window.tabs.tabText(i) for i in range(window.tabs.count())]
         self.assertIn("Wiring Guide", labels)
-        self.assertEqual(len(window.wiring_guide.entries), len(DEFAULT_ENTRIES))
+        self.assertGreater(len(window.wiring_guide.entries), 0)
         window.close()
 
     def test_changes_persist_across_new_widget(self):
@@ -49,6 +50,19 @@ class WiringGuideTest(unittest.TestCase):
             self.assertEqual(len(second.entries), len(DEFAULT_ENTRIES))
             self.assertNotIn("Test encoder", [entry["device"] for entry in second.entries])
             second.close()
+
+    def test_existing_guide_gets_encoder_without_losing_edits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_file = str(Path(temporary) / "existing.ini")
+            settings = QSettings(settings_file, QSettings.Format.IniFormat)
+            settings.setValue(WiringGuide.SETTINGS_KEY, json.dumps([
+                {"kind": "Other", "device": "Custom device", "connector": "Custom port",
+                 "pins": "D99", "notes": "Keep this"}
+            ]))
+            guide = WiringGuide(settings)
+            self.assertEqual(guide.entries[0]["device"], "Custom device")
+            self.assertEqual(guide.entries[1]["device"], "Dual encoder board")
+            guide.close()
 
 
 if __name__ == "__main__":

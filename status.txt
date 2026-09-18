@@ -1389,5 +1389,31 @@ or physically move a cable. The full app tab and persistence round trip passed
 headless GUI tests.
 
 ===============================================================================
+25. DIGITAL RAW 2 DUAL QUADRATURE ENCODERS
+===============================================================================
+
+The CPU pinout on page 31 of the supplied parts summary shows Digital Raw 2
+carrying D5, D4, D3, and D2. The course's 112_Encoder.ino pairs D2/D3 for
+encoder 1 and D4/D5 for encoder 2. These assignments are now explicit in
+config.h. The older D2-D5 drivetrain and reel constants remain inactive
+placeholders and cannot be used concurrently with the encoder board.
+
+The new DualEncoder library wraps Teensy's interrupt-driven Encoder library
+and decodes changes on both A and B for each channel. It keeps signed 32-bit
+counts, per-sample count differences, and signed counts per second. The
+Bluetooth debug workflow starts the pair automatically and publishes all six
+values with normal telemetry. A JSON-advertised Zero both encoder counts
+command clears both positions and velocity estimates without moving motors.
+main.cpp remains unchanged. RPM is deliberately not calculated until the
+installed sensor's x4 counts per revolution and shaft location are known.
+
+ENCODER_WIRING.md documents the CPU connector, ground and voltage precautions,
+direction convention, and D2-D5 conflict. The Wiring Guide gains a Digital
+Raw 2 encoder entry, including a one-time migration that preserves existing
+user edits. The Teensy firmware built successfully and three headless Wiring
+Guide tests passed. No encoder hardware measurement or firmware upload has
+been performed yet.
+
+===============================================================================
 END OF STATUS
 ===============================================================================

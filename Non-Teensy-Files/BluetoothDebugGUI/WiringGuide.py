@@ -36,6 +36,7 @@ DEFAULT_ENTRIES = [
     {"kind": "Servo", "device": "HX12K B", "connector": "Digital Raw 1 / level shift", "pins": "D32", "notes": "Level-shifted servo output"},
     {"kind": "Servo", "device": "HX12K C", "connector": "Digital Raw 1 / level shift", "pins": "D31", "notes": "Level-shifted servo output"},
     {"kind": "Servo", "device": "HX12K D", "connector": "Digital Raw 1 / level shift", "pins": "D30", "notes": "Level-shifted servo output"},
+    {"kind": "Sensor", "device": "Dual encoder board", "connector": "Digital Raw 2", "pins": "E1 A:D2 B:D3 / E2 A:D4 B:D5", "notes": "Quadrature; 3.3 V signals only"},
     {"kind": "Sensor", "device": "Front long-range TOF", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "Left short-range TOF", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "SEN0628 8×8 TOF", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x33"},
@@ -127,10 +128,21 @@ class WiringGuide(QWidget):
             entries = json.loads(str(raw))
             if not isinstance(entries, list):
                 raise ValueError("Not a list")
-            return [
+            cleaned = [
                 {field: str(entry.get(field, "")) for field in FIELDS}
                 for entry in entries if isinstance(entry, dict)
             ]
+            # Existing installations already have a saved guide; add the newly
+            # confirmed encoder connection once, without replacing user edits.
+            if not self.settings.value("wiring_guide/encoder_raw2_migrated", False, type=bool):
+                if not any("Digital Raw 2" in entry["connector"] or
+                           "encoder" in entry["device"].lower() for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Dual encoder board"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/encoder_raw2_migrated", True)
+                self.settings.sync()
+            return cleaned
         except (TypeError, ValueError):
             return [entry.copy() for entry in DEFAULT_ENTRIES]
 

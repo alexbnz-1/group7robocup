@@ -11,6 +11,7 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
       servos_(herkulexPort, HerkulexConfig::BAUD),
       dcMotor203_(Pins::DC_MOTOR_203_CHANNEL_A, Pins::DC_MOTOR_203_CHANNEL_B),
       dcMotor203Second_(Pins::DC_MOTOR_203_SECOND_CHANNEL_A, Pins::DC_MOTOR_203_SECOND_CHANNEL_B),
+      encoders_(Pins::ENCODER_1_A, Pins::ENCODER_1_B, Pins::ENCODER_2_A, Pins::ENCODER_2_B),
       hx12kA_(Pins::HX12K_OUTPUT_A),
       hx12kB_(Pins::HX12K_OUTPUT_B),
       hx12kC_(Pins::HX12K_OUTPUT_C),
@@ -32,6 +33,7 @@ void BluetoothDebugWorkflow::begin()
     servos_.torqueOff(0xFE);
     dcMotor203_.begin();
     dcMotor203Second_.begin();
+    encoders_.begin();
     hx12kA_.begin();
     hx12kB_.begin();
     hx12kC_.begin();
@@ -409,6 +411,11 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         dcMotor203SecondActive_ = false;
         link_.log("INFO", "Second 203 DC motor stopped at neutral pulse");
     }
+    else if (strcmp(action, "encoder_zero") == 0)
+    {
+        encoders_.zero();
+        link_.log("INFO", "Both encoder counts zeroed");
+    }
     else if (strcmp(action, "hx12k_angles") == 0)
     {
         if (stopped_)
@@ -612,6 +619,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     lastTelemetryMs_ = now;
 
     readTofSensors();
+    encoders_.sample(now);
 
     JsonDocument message;
     message["type"] = "telemetry";
@@ -639,6 +647,12 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["dc_motor_203_second.channel_b_percent"] = dcMotor203Second_.channelBPercent();
     data["dc_motor_203_second.channel_a_pulse_us"] = dcMotor203Second_.channelAPulseUs();
     data["dc_motor_203_second.channel_b_pulse_us"] = dcMotor203Second_.channelBPulseUs();
+    data["encoder.1.count"] = encoders_.firstCount();
+    data["encoder.1.delta"] = encoders_.firstDelta();
+    data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
+    data["encoder.2.count"] = encoders_.secondCount();
+    data["encoder.2.delta"] = encoders_.secondDelta();
+    data["encoder.2.counts_per_s"] = encoders_.secondCountsPerSecond();
     data["hx12k.a.enabled"] = hx12kA_.enabled();
     data["hx12k.a.angle_deg"] = hx12kA_.commandedAngle();
     data["hx12k.b.enabled"] = hx12kB_.enabled();

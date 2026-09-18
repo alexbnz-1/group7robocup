@@ -13,6 +13,8 @@ namespace Pins {
     // Tracked chassis, PPM-controlled DC motor driver (DFR0513)
     // --------------------------------------------------------
 
+    // Historical placeholders only: D2-D5 are now reserved for the encoder
+    // board on Digital Raw 2 and must not also be enabled as motor outputs.
     constexpr uint8_t DRIVE_LEFT  = 2;
     constexpr uint8_t DRIVE_RIGHT = 3;
 
@@ -24,6 +26,13 @@ namespace Pins {
 
     constexpr uint8_t REEL_LEFT  = 4;
     constexpr uint8_t REEL_RIGHT = 5;
+
+    // Digital Raw 2 signal order on the CPU board is D5, D4, D3, D2.
+    // The supplied 112_Encoder example pairs these as D2/D3 and D4/D5.
+    constexpr uint8_t ENCODER_1_A = 2;
+    constexpr uint8_t ENCODER_1_B = 3;
+    constexpr uint8_t ENCODER_2_A = 4;
+    constexpr uint8_t ENCODER_2_B = 5;
 
 
     // --------------------------------------------------------

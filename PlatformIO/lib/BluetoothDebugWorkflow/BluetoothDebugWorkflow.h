@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DcMotor203.h>
+#include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
 #include <RobotDebug.h>
@@ -23,6 +24,7 @@ private:
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
     DcMotor203 dcMotor203Second_;
+    DualEncoder encoders_;
     Hx12kServo hx12kA_;
     Hx12kServo hx12kB_;
     Hx12kServo hx12kC_;
