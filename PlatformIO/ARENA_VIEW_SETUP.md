@@ -56,7 +56,8 @@ independent short median filter. A range jump greater than 150 mm or 35% must
 be repeated consistently before it is added to the persistent map. Raw sensor
 telemetry and the separate 8x8 view remain unfiltered. Point-sensor zero and
 8191 sentinel returns, along with any other values outside the configured
-200–3500 mm mapping range, are rejected before this temporal filter.
+10–3500 mm mapping range, are rejected before this temporal filter. The 10 mm
+lower bound keeps a zero sentinel invalid while retaining close measurements.
 
 The current Wiring Guide names five point sensors: XSHUT1 and XSHUT2 are long
 range; XSHUT5, XSHUT0, and XSHUT3 are short range. These same five ports are

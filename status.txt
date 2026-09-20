@@ -2,7 +2,7 @@ GROUP 7 ROBOCUP PROJECT STATUS
 Last updated: 2026-09-20 (Pacific/Auckland)
 Repository: C:\Users\alex\Desktop\group7robocup
 Current branch: testing
-Current committed revision: 280dde1 - Not sure what's changed but committing anyways
+Current committed revision before the bumper edit: 9803c52 - changed lower bound for tof
 
 ===============================================================================
 0. READ THIS FIRST — AUTHORITATIVE RESUME SNAPSHOT
@@ -17,9 +17,9 @@ numbered section rather than an older historical statement.
 Repository state at this handoff:
 
 - Branch: testing.
-- Revision: 280dde1.
-- Working tree before this handoff edit was clean. The only expected local
-  modification afterward is status.txt itself.
+- Revision before the current bumper edit: 9803c52.
+- Current local changes add the paired bumper-servo command and its generated
+  definition, tests and documentation.
 - Desktop platform used for testing: Windows.
 - Firmware target: Teensy 4.0 using Arduino through PlatformIO.
 - Arena dimensions: 2400 mm wide, 4900 mm long, 400 mm walls.
@@ -58,9 +58,9 @@ Most recent live verification:
 - The 8x8 sensor was valid at 0x33 and delivered 23 frames in that sample.
 - All five point sensors reported available, although bottom_mid_left returned
   zero throughout and bottom_mid_right occasionally returned 8191. Zero, 8191
-  and all other values outside 200–3500 mm are shown raw but rejected by the
+  and all other values outside 10–3500 mm are shown raw but rejected by the
   arena mapper.
-- The offline desktop suite passes all 28 tests.
+- The offline desktop suite passes all 29 tests.
 
 Newest desktop behavior:
 
@@ -86,7 +86,7 @@ Newest desktop behavior:
 
 Resume procedure:
 
-1. Read this section, then sections 33–38.
+1. Read this section, then sections 33–39.
 2. Start the GUI with
    Non-Teensy-Files\BluetoothDebugGUI\run_gui.ps1.
 3. Restart any already-running GUI after code changes; an old process can both
@@ -1884,7 +1884,7 @@ It does not alter the raw telemetry or the dedicated 8x8 display.
 
 A later live sample showed one point sensor alternating through 8191 mm and
 another returning zero. These are invalid/sentinel readings rather than arena
-distances. Point readings outside the configured 200–3500 mm mapping range are
+distances. Point readings outside the configured 10–3500 mm mapping range are
 now discarded before the temporal filter, so they cannot poison its baseline,
 create a ray, or participate in the purple weight comparison.
 
@@ -1922,7 +1922,7 @@ arena trail remains coherent while turning.
 Arena View now has a permanently visible Raw TOF readings section directly
 below the map. Its point-sensor side lists every configured sensor using its
 Wiring Guide label and XSHUT port. It shows the actual incoming millimetres,
-OFFLINE, TIMEOUT, or an invalid marker for a value outside the 200–3500 mm map
+OFFLINE, TIMEOUT, or an invalid marker for a value outside the 10–3500 mm map
 range. Its matrix side shows all 64 raw X0–X7/Y0–Y7 readings together with the
 frame number, I2C bus and responding address. This panel deliberately displays
 data before spike rejection, median filtering, or occupancy processing.
@@ -2348,7 +2348,7 @@ Offline recordings/analysis:
 
 Documentation/reference priority:
 
-1. This status file, especially sections 0 and 33–38.
+1. This status file, especially sections 0 and 33–39.
 2. Active source/configuration files.
 3. ARENA_VIEW_SETUP.md, DEBUG_GUI_CONFIG.md, ENCODER_WIRING.md,
    HX12K_WIRING.md, TOF8X8_WIRING.md and BLUETOOTH_SETUP.md.
@@ -2369,7 +2369,7 @@ mm while the configured mapping minimum was 200 mm, so most of the visible
 long-range evidence could not describe the current scene.
 
 The matrix mapper now works column-by-column. It filters every raw value to the
-200–3500 mm range, requires at least three valid Y pixels in an X column, uses
+10–3500 mm range, requires at least three valid Y pixels in an X column, uses
 their median distance, and requires that median to agree across two frames
 before mapping it. A valid X column paints its entire one-eighth share of the
 configured horizontal FOV as a filled sector: green free cells up to the
@@ -2377,14 +2377,40 @@ measurement and a red arc at the measured distance. Eight sectors form a
 continuous cone. Current-ray overlays are limited to the two sector boundaries
 and centreline rather than 64 invented bearings.
 
-This also means the screenshot's almost-entirely sub-200 mm frame produces no
-arena evidence, as requested by the grey-below-200 rule. Restarting the GUI or
-pressing Reset local map removes the already-stored starburst. This correction
-is desktop-only and needs no Teensy upload. All 28 tests pass afterward.
+The later user-requested lower bound is 10 mm, not 200 mm. This keeps a zero
+sentinel invalid while allowing the screenshot's 160–214 mm readings to paint
+a short, filled cone. Restarting the GUI or pressing Reset local map removes
+the already-stored starburst. This correction is desktop-only and needs no
+Teensy upload. All 28 tests passed at that stage.
 
-User added: Changed the lower limit for the tof from 200mm to 0mm in the arena view python
-script. Needs to be checked that it was implemented the correct way, but this is wanted
-by the user.
+The lower-limit edit was checked. ArenaView.py uses 10 mm rather than literal
+zero so an invalid zero return cannot paint the map; legitimate close returns
+from 10 mm upward are retained. This is the intended current behavior.
+
+===============================================================================
+39. PAIRED HX12K BUMPER SERVO COMMAND
+===============================================================================
+
+The Commands page now receives one Bumper servos card in the HX12K category.
+It contains two fixed-action buttons in the same block and can also be starred
+onto the Dashboard as one card:
+
+- BUMPERS ON commands level-shifter output C / D31 to 0 degrees and output D /
+  D30 to 130 degrees.
+- BUMPERS OFF commands C / D31 to 130 degrees and D / D30 to 0 degrees.
+
+Both buttons send the same `set_bumper_servos` command with a Boolean enabled
+argument. The firmware action is `hx12k_bumpers`. It requires Debug Mode and
+Run state and rejects missing/non-Boolean arguments. STOP or leaving Debug Mode
+still detaches all HX12K outputs. The generic command-card renderer now supports
+a `buttons` array so multiple fixed-argument buttons can share one card.
+
+The complete desktop suite passes all 29 tests, including a check that both
+buttons appear in one widget and send the correct arguments. PlatformIO builds
+the Teensy 4.0 firmware successfully; code uses 127704 bytes of flash code and
+29824 bytes of RAM1 variables. The warnings are in the Teensy framework and
+supplied MatrixLidar driver, not the new bumper handler. This firmware change
+must be uploaded before the buttons can operate the real servos.
 
 ===============================================================================
 END OF STATUS

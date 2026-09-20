@@ -187,6 +187,19 @@
       "args": []
     },
     {
+      "name": "set_bumper_servos",
+      "label": "Bumper servos",
+      "category": "HX12K",
+      "description": "Moves the paired bumper servos on level-shifter outputs C and D together.",
+      "action": "hx12k_bumpers",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "BUMPERS ON", "arguments": {"enabled": true}},
+        {"label": "BUMPERS OFF", "arguments": {"enabled": false}}
+      ]
+    },
+    {
       "name": "read_all_tof",
       "label": "Read all TOF sensors now",
       "category": "TOF",

@@ -515,6 +515,26 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kD_.disable();
         link_.log("INFO", "All HX12K pulse outputs disabled");
     }
+    else if (strcmp(action, "hx12k_bumpers") == 0)
+    {
+        if (stopped_)
+        {
+            link_.error("Robot is stopped; press Run Robot before moving bumper servos");
+            return;
+        }
+        if (!message["enabled"].is<bool>())
+        {
+            link_.error("Bumper servo command requires enabled=true or false");
+            return;
+        }
+
+        const bool enabled = message["enabled"].as<bool>();
+        hx12kC_.setAngle(enabled ? 0.0f : 130.0f);
+        hx12kD_.setAngle(enabled ? 130.0f : 0.0f);
+        link_.log("INFO", enabled ? "Bumper servos ON: C=0, D=130" :
+                                  "Bumper servos OFF: C=130, D=0");
+        sendState();
+    }
     else if (strcmp(action, "tof_read_all") == 0)
     {
         lastTelemetryMs_ = millis() - telemetryIntervalMs_;

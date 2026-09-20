@@ -293,10 +293,36 @@ class CommandWidget(QGroupBox):
                 editor,
             )
 
-        run_button = QPushButton(f"Run {label}")
-        run_button.clicked.connect(self._execute)
-
-        layout.addRow(run_button)
+        buttons = definition.get("buttons")
+        if isinstance(buttons, list) and buttons:
+            button_row = QWidget()
+            button_layout = QHBoxLayout(button_row)
+            button_layout.setContentsMargins(0, 0, 0, 0)
+            for button_definition in buttons:
+                if not isinstance(button_definition, dict):
+                    continue
+                button = QPushButton(str(button_definition.get("label", "Run")))
+                fixed_arguments = button_definition.get("arguments", {})
+                if not isinstance(fixed_arguments, dict):
+                    fixed_arguments = {}
+                fixed_arguments = dict(fixed_arguments)
+                button.clicked.connect(
+                    lambda _checked=False, args=fixed_arguments: self._execute(args)
+                )
+                if fixed_arguments.get("enabled") is True:
+                    button.setStyleSheet(
+                        "QPushButton { background: #15803d; color: white; font-weight: bold; }"
+                    )
+                elif fixed_arguments.get("enabled") is False:
+                    button.setStyleSheet(
+                        "QPushButton { background: #b91c1c; color: white; font-weight: bold; }"
+                    )
+                button_layout.addWidget(button)
+            layout.addRow(button_row)
+        else:
+            run_button = QPushButton(f"Run {label}")
+            run_button.clicked.connect(self._execute)
+            layout.addRow(run_button)
 
     def _update_favourite_icon(self, favourite):
         self.favourite_button.setText("★" if favourite else "☆")
@@ -307,11 +333,13 @@ class CommandWidget(QGroupBox):
         self._update_favourite_icon(bool(favourite))
         self.favourite_button.blockSignals(False)
 
-    def _execute(self):
+    def _execute(self, fixed_arguments=None):
         arguments = {
             name: editor.value()
             for name, editor in self.argument_editors.items()
         }
+        if isinstance(fixed_arguments, dict):
+            arguments.update(fixed_arguments)
 
         self.send_callback(
             self.name,

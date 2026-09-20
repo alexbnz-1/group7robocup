@@ -9,10 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PyQt6.QtCore import QPointF, QSettings, Qt
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 from ArenaView import ArenaModel, ArenaView
-from DebugGUI import RobotDebugGUI
+from DebugGUI import CommandWidget, RobotDebugGUI
 
 
 class ArenaModelTests(unittest.TestCase):
@@ -396,6 +396,26 @@ class ConnectionStatusTests(unittest.TestCase):
             self.assertEqual(sent[-1], {"type": "drive", "a": 0, "b": 0})
         finally:
             window.close()
+
+    def test_bumper_command_card_has_on_and_off_in_one_block(self):
+        config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
+        commands = json.loads(config_path.read_text(encoding="utf-8"))["commands"]
+        definition = next(item for item in commands if item["name"] == "set_bumper_servos")
+        sent = []
+        widget = CommandWidget(definition, lambda name, arguments: sent.append((name, arguments)))
+        buttons = {button.text(): button for button in widget.findChildren(QPushButton)}
+        buttons["BUMPERS ON"].click()
+        buttons["BUMPERS OFF"].click()
+        self.assertEqual(sent, [
+            ("set_bumper_servos", {"enabled": True}),
+            ("set_bumper_servos", {"enabled": False}),
+        ])
+        firmware = (Path(__file__).resolve().parents[2] / "PlatformIO" / "lib" /
+                    "BluetoothDebugWorkflow" / "BluetoothDebugWorkflow.cpp").read_text(encoding="utf-8")
+        self.assertIn('strcmp(action, "hx12k_bumpers")', firmware)
+        self.assertIn('enabled ? 0.0f : 130.0f', firmware)
+        self.assertIn('enabled ? 130.0f : 0.0f', firmware)
+        widget.close()
 
 
 if __name__ == "__main__":

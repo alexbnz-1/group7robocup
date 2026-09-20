@@ -97,6 +97,9 @@ example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
   Debug Mode and Run.
 - `hx12k_disable`: detaches the PWM output. Global STOP and leaving Debug Mode
   also detach all four outputs.
+- `hx12k_bumpers`: moves the paired bumper outputs together. `enabled=true`
+  commands C=0 degrees and D=130 degrees; `enabled=false` commands C=130
+  degrees and D=0 degrees. It requires Debug Mode and Run state.
 - `tof_read_all`: immediately reads every configured TOF sensor. All sensors
   are also read automatically with normal telemetry packets.
 
@@ -112,6 +115,25 @@ Example:
     {"name": "id", "type": "int", "min": 1, "max": 253, "default": 1},
     {"name": "angle_deg", "type": "float", "min": -160, "max": 160, "step": 1, "default": 0},
     {"name": "move_time_ms", "type": "int", "min": 50, "max": 2850, "step": 50, "default": 500}
+  ]
+}
+```
+
+A command can replace the single Run button with multiple fixed-argument
+buttons inside the same card. Each item in `buttons` supplies its label and
+arguments; the GUI merges those fixed values with any ordinary argument
+editors before sending the command:
+
+```json
+{
+  "name": "set_bumper_servos",
+  "label": "Bumper servos",
+  "action": "hx12k_bumpers",
+  "debug_mode_required": true,
+  "args": [],
+  "buttons": [
+    {"label": "BUMPERS ON", "arguments": {"enabled": true}},
+    {"label": "BUMPERS OFF", "arguments": {"enabled": false}}
   ]
 }
 ```
