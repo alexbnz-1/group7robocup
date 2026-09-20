@@ -17,7 +17,9 @@ public:
     void send(JsonDocument& message);
 
 private:
-    static constexpr size_t TX_BUFFER_SIZE = 2048;
+    // Includes the combined encoder, TOF, motor and IMU telemetry frame.
+    // Leave headroom so a valid JSON line is never silently dropped at 2 KB.
+    static constexpr size_t TX_BUFFER_SIZE = 3072;
     static constexpr size_t TX_CHUNK_SIZE = 20;
     Stream& stream_;
     MessageHandler handler_;

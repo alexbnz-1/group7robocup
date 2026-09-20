@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -37,9 +37,13 @@ DEFAULT_ENTRIES = [
     {"kind": "Servo", "device": "HX12K C", "connector": "Digital Raw 1 / level shift", "pins": "D31", "notes": "Level-shifted servo output"},
     {"kind": "Servo", "device": "HX12K D", "connector": "Digital Raw 1 / level shift", "pins": "D30", "notes": "Level-shifted servo output"},
     {"kind": "Sensor", "device": "Dual encoder board", "connector": "Digital Raw 2", "pins": "E1 A:D2 B:D3 / E2 A:D4 B:D5", "notes": "Quadrature; 3.3 V signals only"},
-    {"kind": "Sensor", "device": "Front long-range TOF", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
-    {"kind": "Sensor", "device": "Left short-range TOF", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Long Top Mid Left", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Long Top Mid Right", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Mid Left", "connector": "XSHUT5", "pins": "I2C0 / XSHUT5", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Mid Right", "connector": "XSHUT0", "pins": "I2C0 / XSHUT0", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Right Right", "connector": "XSHUT3", "pins": "I2C0 / XSHUT3", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "SEN0628 8×8 TOF", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x33"},
+    {"kind": "Sensor", "device": "BNO055 IMU", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x28/0x29"},
 ]
 
 COLUMNS = ("Type", "Device", "CPU connector", "CPU pin(s)", "Notes")
@@ -55,6 +59,7 @@ COLORS = {
 
 class WiringGuide(QWidget):
     SETTINGS_KEY = "wiring_guide/entries_v1"
+    entries_changed = pyqtSignal()
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -149,6 +154,7 @@ class WiringGuide(QWidget):
     def _save(self):
         self.settings.setValue(self.SETTINGS_KEY, json.dumps(self.entries, ensure_ascii=False))
         self.settings.sync()
+        self.entries_changed.emit()
 
     def _refresh(self):
         self._populating = True

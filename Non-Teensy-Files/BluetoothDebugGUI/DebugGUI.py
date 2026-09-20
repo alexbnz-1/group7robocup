@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, QSettings, QTimer
+from PyQt6.QtCore import QEvent, Qt, QSettings, QTimer
 from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -64,6 +64,7 @@ import pyqtgraph as pg
 from BluetoothSerial import BluetoothSerial
 from DataRecorder import DataRecorder
 from WiringGuide import WiringGuide
+from ArenaView import ArenaView
 
 
 class ValueEditor(QWidget):
@@ -359,12 +360,19 @@ class RobotDebugGUI(QMainWindow):
         self.raw_line_times = deque(maxlen=5000)
         self.telemetry_event_times = deque(maxlen=10000)
         self.last_telemetry_monotonic = None
+        self.connection_started_monotonic = None
+        self.session_signal_names = set()
         self.protocol_error_count = 0
+        self.robot_debug_mode = False
+        self.robot_stopped = True
+        self.keyboard_drive_keys = set()
+        self.keyboard_drive_last_output = (0, 0)
 
         self.start_time = time.monotonic()
 
         self._build_ui()
         self._connect_signals()
+        QApplication.instance().installEventFilter(self)
         self.load_local_debug_config()
 
         self.port_refresh_timer = QTimer(self)
@@ -390,6 +398,12 @@ class RobotDebugGUI(QMainWindow):
             self.update_link_health
         )
         self.health_timer.start(500)
+
+        self.keyboard_drive_timer = QTimer(self)
+        self.keyboard_drive_timer.timeout.connect(
+            self._keyboard_drive_heartbeat
+        )
+        self.keyboard_drive_timer.start(150)
 
         self.refresh_ports()
 
@@ -893,6 +907,14 @@ class RobotDebugGUI(QMainWindow):
         health_row.addStretch()
         main_layout.addLayout(health_row)
 
+        self.firmware_warning_label = QLabel()
+        self.firmware_warning_label.setWordWrap(True)
+        self.firmware_warning_label.setStyleSheet(
+            "QLabel { color: #fbbf24; background: #423315; padding: 6px; }"
+        )
+        self.firmware_warning_label.hide()
+        main_layout.addWidget(self.firmware_warning_label)
+
         self.tabs = QTabWidget()
 
         main_layout.addWidget(
@@ -902,6 +924,7 @@ class RobotDebugGUI(QMainWindow):
 
         self._build_dashboard_tab()
         self._build_tof8x8_tab()
+        self._build_arena_tab()
         self._build_plot_tab()
         self._build_parameter_tab()
         self._build_command_tab()
@@ -919,7 +942,12 @@ class RobotDebugGUI(QMainWindow):
 
     def _build_wiring_guide_tab(self):
         self.wiring_guide = WiringGuide(self.settings)
+        self.wiring_guide.entries_changed.connect(self.arena_view.reload_sensor_layout)
         self.tabs.addTab(self.wiring_guide, "Wiring Guide")
+
+    def _build_arena_tab(self):
+        self.arena_view = ArenaView(self.settings)
+        self.tabs.addTab(self.arena_view, "Arena View")
 
 
     def _build_dashboard_tab(self):
@@ -1115,6 +1143,30 @@ class RobotDebugGUI(QMainWindow):
             stop_group
         )
 
+        keyboard_group = QGroupBox("Keyboard Drive — motor bank 2")
+        keyboard_layout = QGridLayout(keyboard_group)
+        self.keyboard_drive_enabled = QCheckBox("Enable arrow-key driving")
+        self.keyboard_drive_enabled.setEnabled(False)
+        keyboard_layout.addWidget(self.keyboard_drive_enabled, 0, 0, 1, 2)
+        keyboard_layout.addWidget(QLabel("Drive power"), 1, 0)
+        self.keyboard_drive_speed = QSpinBox()
+        self.keyboard_drive_speed.setRange(5, 100)
+        self.keyboard_drive_speed.setSingleStep(5)
+        self.keyboard_drive_speed.setSuffix(" %")
+        try:
+            self.keyboard_drive_speed.setValue(int(
+                self.settings.value("keyboard_drive/speed_percent", 30)))
+        except (TypeError, ValueError):
+            self.keyboard_drive_speed.setValue(30)
+        keyboard_layout.addWidget(self.keyboard_drive_speed, 1, 1)
+        self.keyboard_drive_status = QLabel(
+            "Disabled. Enable, enter Debug Mode, then press Run Robot.\n"
+            "↑ forward · ↓ reverse · ←/→ turn · release stops"
+        )
+        self.keyboard_drive_status.setWordWrap(True)
+        keyboard_layout.addWidget(self.keyboard_drive_status, 2, 0, 1, 2)
+        command_panel_layout.addWidget(keyboard_group)
+
         self.dashboard_command_scroll = QScrollArea()
 
         self.dashboard_command_scroll.setWidgetResizable(
@@ -1191,6 +1243,13 @@ class RobotDebugGUI(QMainWindow):
         self.tof8x8_view_mode.currentIndexChanged.connect(self._refresh_tof8x8_view)
         controls.addWidget(self.tof8x8_view_mode)
 
+        self.tof8x8_mirror = QCheckBox("Flip left/right for robot POV")
+        self.tof8x8_mirror.setChecked(
+            str(self.settings.value("sensor/mirror_8x8", "true")).lower() == "true"
+        )
+        self.tof8x8_mirror.toggled.connect(self._set_tof8x8_mirror)
+        controls.addWidget(self.tof8x8_mirror)
+
         self.tof8x8_auto_range = QCheckBox("Auto colour range")
         controls.addWidget(self.tof8x8_auto_range)
         controls.addWidget(QLabel("Maximum (mm):"))
@@ -1210,16 +1269,26 @@ class RobotDebugGUI(QMainWindow):
         self.tof8x8_far_jump_counts = [0] * 64
         layout.addWidget(self.tof8x8_status)
 
-        grid_group = QGroupBox("Distance by zone (mm) - X left to right, Y top to bottom")
+        grid_group = QGroupBox("Distance by zone (mm) - robot POV: left ← 8x8 → right")
         grid = QGridLayout(grid_group)
         grid.setSpacing(4)
         self.tof8x8_cells = []
 
+        sides = QHBoxLayout()
+        sides.addWidget(QLabel("ROBOT LEFT"))
+        sides.addStretch()
+        sides.addWidget(QLabel("ROBOT RIGHT"))
+        layout.addLayout(sides)
+
         grid.addWidget(QLabel("Y \\ X"), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
         for column in range(8):
-            label = QLabel(f"X{column}")
+            raw_column = 7 - column if self.tof8x8_mirror.isChecked() else column
+            label = QLabel(f"X{raw_column}")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             grid.addWidget(label, 0, column + 1)
+            if not hasattr(self, "tof8x8_column_labels"):
+                self.tof8x8_column_labels = []
+            self.tof8x8_column_labels.append(label)
 
         for row in range(8):
             label = QLabel(f"Y{row}")
@@ -1252,6 +1321,7 @@ class RobotDebugGUI(QMainWindow):
         self.tabs.addTab(page, "8x8 TOF")
 
     def on_tof8x8_frame(self, message: dict):
+        self.arena_view.receive_matrix(message)
         self.tof8x8_latest_message = message
         bus_name = str(message.get("bus", "I2C"))
         available = bool(message.get("available", False))
@@ -1323,7 +1393,8 @@ class RobotDebugGUI(QMainWindow):
             )
 
         for index, raw_value in enumerate(values):
-            cell = self.tof8x8_cells[index // 8][index % 8]
+            display_col = 7 - index % 8 if self.tof8x8_mirror.isChecked() else index % 8
+            cell = self.tof8x8_cells[index // 8][display_col]
             if not isinstance(raw_value, (int, float)) or raw_value <= 0:
                 cell.setText("-")
                 cell.setStyleSheet(
@@ -1352,6 +1423,13 @@ class RobotDebugGUI(QMainWindow):
         if isinstance(self.tof8x8_latest_message, dict):
             self.on_tof8x8_frame(self.tof8x8_latest_message)
 
+    def _set_tof8x8_mirror(self, mirrored):
+        self.settings.setValue("sensor/mirror_8x8", mirrored)
+        for column, label in enumerate(self.tof8x8_column_labels):
+            label.setText(f"X{7 - column if mirrored else column}")
+        self.arena_view.set_matrix_mirrored(mirrored)
+        self._refresh_tof8x8_view()
+
     def _render_tof8x8_image(self, values: list, colour_max: float, grey_below_200: bool = False):
         image = QImage(8, 8, QImage.Format.Format_RGB32)
         for index, raw_value in enumerate(values):
@@ -1362,7 +1440,8 @@ class RobotDebugGUI(QMainWindow):
             else:
                 ratio = min(max(float(raw_value) / colour_max, 0.0), 1.0)
                 colour = QColor.fromHsvF(0.66 * ratio, 0.82, 0.88)
-            image.setPixelColor(index % 8, index // 8, colour)
+            display_col = 7 - index % 8 if self.tof8x8_mirror.isChecked() else index % 8
+            image.setPixelColor(display_col, index // 8, colour)
 
         target = self.tof8x8_image.size()
         pixmap = QPixmap.fromImage(image).scaled(
@@ -1985,6 +2064,14 @@ class RobotDebugGUI(QMainWindow):
             )
         )
 
+        self.keyboard_drive_enabled.toggled.connect(
+            self.set_keyboard_drive_enabled
+        )
+        self.keyboard_drive_speed.valueChanged.connect(
+            lambda value: self.settings.setValue(
+                "keyboard_drive/speed_percent", value)
+        )
+
         self.refresh_definitions_button.clicked.connect(
             self.bluetooth.request_definitions
         )
@@ -2073,11 +2160,24 @@ class RobotDebugGUI(QMainWindow):
                 f"{now - self.last_telemetry_monotonic:.2f} s"
             )
 
+        alert = ""
+        if self.bluetooth.is_connected():
+            if self.last_telemetry_monotonic is None and self.connection_started_monotonic is not None:
+                if now - self.connection_started_monotonic > 3:
+                    alert = " | Port open, no telemetry; check CH9143 link and robot power"
+                    self.connection_status.setText(
+                        f"● PORT OPEN — NO ROBOT DATA — {self.bluetooth.port or ''}"
+                    )
+            elif self.last_telemetry_monotonic is not None and now - self.last_telemetry_monotonic > 3:
+                alert = " | Telemetry stalled; check Raw Serial"
+                self.connection_status.setText(
+                    f"● PORT OPEN — ROBOT SILENT — {self.bluetooth.port or ''}"
+                )
         self.link_health_label.setText(
             f"Frames/s: {len(self.raw_line_times)} | "
             f"Signals/s: {len(self.telemetry_event_times)} | "
             f"Last telemetry: {age_text} | "
-            f"Protocol errors: {self.protocol_error_count}"
+            f"Protocol errors: {self.protocol_error_count}{alert}"
         )
 
     # =================================================================
@@ -2212,6 +2312,12 @@ class RobotDebugGUI(QMainWindow):
         connected: bool,
         port: str,
     ):
+        self.connection_started_monotonic = time.monotonic() if connected else None
+        self.last_telemetry_monotonic = None
+        self.raw_line_times.clear()
+        self.telemetry_event_times.clear()
+        self.session_signal_names.clear()
+        self.firmware_warning_label.hide()
         self.connect_button.setEnabled(
             True
         )
@@ -2222,7 +2328,7 @@ class RobotDebugGUI(QMainWindow):
             )
 
             self.connection_status.setText(
-                f"● CONNECTED — {port}"
+                f"● PORT OPEN — WAITING FOR ROBOT — {port}"
             )
 
             self.port_combo.setEnabled(
@@ -2261,21 +2367,28 @@ class RobotDebugGUI(QMainWindow):
                 True
             )
 
+            self.keyboard_drive_enabled.setEnabled(True)
+
             # Still disabled until the user starts recording.
             self.log_fault_button.setEnabled(
                 False
             )
 
             self.statusBar().showMessage(
-                f"Connected to {port}"
+                f"Serial port open on {port}; waiting for robot telemetry"
             )
 
             self.add_log(
                 "SYSTEM",
-                f"Connected to {port}",
+                f"Serial port open on {port}; waiting for robot telemetry",
             )
 
         else:
+            self.set_keyboard_drive_enabled(False)
+            self.keyboard_drive_enabled.blockSignals(True)
+            self.keyboard_drive_enabled.setChecked(False)
+            self.keyboard_drive_enabled.blockSignals(False)
+            self.keyboard_drive_enabled.setEnabled(False)
             if self.recorder.is_recording:
                 self.stop_recording()
 
@@ -2346,7 +2459,22 @@ class RobotDebugGUI(QMainWindow):
         value: Any,
         robot_timestamp: Any,
     ):
+        self.arena_view.receive_telemetry(name, value, robot_timestamp)
         now = time.monotonic()
+        self.session_signal_names.add(name)
+        if self.bluetooth.is_connected() and not self.connection_status.text().startswith("● CONNECTED"):
+            self.connection_status.setText(f"● CONNECTED — {self.bluetooth.port or ''}")
+        if name == "imu.available":
+            self.firmware_warning_label.hide()
+        elif (name == "tof.left.available" and
+              "tof.front.available" in self.session_signal_names and
+              "imu.available" not in self.session_signal_names):
+            self.firmware_warning_label.setText(
+                "Robot telemetry is live, but the Teensy is running the older "
+                "front/left TOF firmware. Upload the current PlatformIO build "
+                "to enable the IMU and five-sensor Arena View."
+            )
+            self.firmware_warning_label.show()
         self.telemetry_event_times.append(now)
         self.last_telemetry_monotonic = now
 
@@ -2871,6 +2999,106 @@ class RobotDebugGUI(QMainWindow):
             text,
         )
 
+    # =================================================================
+    # Keyboard drive (second 203 motor bank)
+    # =================================================================
+
+    def set_keyboard_drive_enabled(self, enabled: bool):
+        if not enabled:
+            self.keyboard_drive_keys.clear()
+            self._send_keyboard_drive_output(0, 0, force=True)
+            self.keyboard_drive_status.setText(
+                "Disabled. Enable, enter Debug Mode, then press Run Robot.\n"
+                "↑ forward · ↓ reverse · ←/→ turn · release stops"
+            )
+            return
+        self.keyboard_drive_status.setText(
+            "Armed. Waiting for arrow key.\n"
+            "↑ forward · ↓ reverse · ←/→ turn · release stops"
+        )
+
+    def _keyboard_drive_ready(self):
+        return (
+            self.bluetooth.is_connected()
+            and self.robot_debug_mode is True
+            and self.robot_stopped is False
+        )
+
+    def _keyboard_drive_values(self):
+        speed = self.keyboard_drive_speed.value()
+        forward = (-speed if Qt.Key.Key_Up in self.keyboard_drive_keys else 0)
+        forward += speed if Qt.Key.Key_Down in self.keyboard_drive_keys else 0
+        turn = speed if Qt.Key.Key_Left in self.keyboard_drive_keys else 0
+        turn -= speed if Qt.Key.Key_Right in self.keyboard_drive_keys else 0
+        channel_a = max(-speed, min(speed, forward + turn))
+        channel_b = max(-speed, min(speed, forward - turn))
+        return channel_a, channel_b
+
+    def _send_keyboard_drive_output(self, channel_a, channel_b, force=False, quiet=False):
+        output = (int(channel_a), int(channel_b))
+        if output == self.keyboard_drive_last_output and not force:
+            return
+        self.keyboard_drive_last_output = output
+        if not self.bluetooth.is_connected():
+            return
+        packet = {"type": "drive", "a": output[0], "b": output[1]}
+        if quiet:
+            self.bluetooth.send_message(packet)
+        else:
+            self.recorder.record_command("keyboard_drive", {
+                "channel_a_percent": output[0],
+                "channel_b_percent": output[1],
+            })
+            self.bluetooth.send_message(packet)
+            self.add_log(
+                "TX", f"keyboard_drive(a={output[0]}, b={output[1]})")
+        self.keyboard_drive_status.setText(
+            f"Bank 2 output: left A {output[0]:+d}% · right B {output[1]:+d}%\n"
+            "Release all arrows to stop"
+        )
+
+    def _update_keyboard_drive(self):
+        if not self._keyboard_drive_ready():
+            self.keyboard_drive_keys.clear()
+            self._send_keyboard_drive_output(0, 0)
+            self.keyboard_drive_status.setText(
+                "Not ready: connect, enter Debug Mode, then press Run Robot."
+            )
+            return
+        self._send_keyboard_drive_output(*self._keyboard_drive_values())
+
+    def _keyboard_drive_heartbeat(self):
+        if (self.keyboard_drive_enabled.isChecked()
+                and self.keyboard_drive_keys
+                and self._keyboard_drive_ready()):
+            self._send_keyboard_drive_output(
+                *self._keyboard_drive_values(), force=True, quiet=True)
+
+    def eventFilter(self, watched, event):
+        if hasattr(self, "keyboard_drive_enabled"):
+            if event.type() in (
+                QEvent.Type.ApplicationDeactivate,
+                QEvent.Type.WindowDeactivate,
+            ):
+                if self.keyboard_drive_enabled.isChecked():
+                    self.keyboard_drive_keys.clear()
+                    self._send_keyboard_drive_output(0, 0)
+            elif (self.keyboard_drive_enabled.isChecked()
+                  and event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                  and event.key() in (
+                      Qt.Key.Key_Up, Qt.Key.Key_Down,
+                      Qt.Key.Key_Left, Qt.Key.Key_Right,
+                  )):
+                if event.isAutoRepeat():
+                    return True
+                if event.type() == QEvent.Type.KeyPress:
+                    self.keyboard_drive_keys.add(event.key())
+                else:
+                    self.keyboard_drive_keys.discard(event.key())
+                self._update_keyboard_drive()
+                return True
+        return super().eventFilter(watched, event)
+
 
     # =================================================================
     # Logs / state / raw
@@ -2937,6 +3165,18 @@ class RobotDebugGUI(QMainWindow):
         debug_enabled = state.get(
             "debug_mode"
         )
+        stopped = state.get("stopped")
+        if debug_enabled is not None:
+            self.robot_debug_mode = bool(debug_enabled)
+        if stopped is not None:
+            self.robot_stopped = bool(stopped)
+        if (self.robot_debug_mode is not True or self.robot_stopped is True):
+            self.keyboard_drive_keys.clear()
+            self._send_keyboard_drive_output(0, 0)
+            if self.keyboard_drive_enabled.isChecked():
+                self.keyboard_drive_status.setText(
+                    "Not ready: enter Debug Mode, then press Run Robot."
+                )
 
         if debug_enabled is True:
             self.statusBar().showMessage(
@@ -2974,6 +3214,7 @@ class RobotDebugGUI(QMainWindow):
         if self.recorder.is_recording:
             self.stop_recording()
 
+        self.set_keyboard_drive_enabled(False)
         self.bluetooth.disconnect_port()
 
         event.accept()

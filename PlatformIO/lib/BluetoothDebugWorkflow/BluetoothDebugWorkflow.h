@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Bno055Imu.h>
 #include <DcMotor203.h>
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
@@ -25,6 +26,7 @@ private:
     DcMotor203 dcMotor203_;
     DcMotor203 dcMotor203Second_;
     DualEncoder encoders_;
+    Bno055Imu imu_;
     Hx12kServo hx12kA_;
     Hx12kServo hx12kB_;
     Hx12kServo hx12kC_;
@@ -54,6 +56,9 @@ private:
     int16_t commandedVelocity_ = 0;
     bool dcMotor203Active_ = false;
     bool dcMotor203SecondActive_ = false;
+    bool dcMotor203SecondDeadman_ = false;
+    uint32_t lastDcMotor203SecondCommandMs_ = 0;
+    static constexpr uint32_t KEYBOARD_DRIVE_TIMEOUT_MS = 500;
     uint32_t telemetryIntervalMs_ = 200;
     uint32_t lastTelemetryMs_ = 0;
     uint32_t lastDefinitionsMs_ = 0;

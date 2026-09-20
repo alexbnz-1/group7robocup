@@ -47,6 +47,7 @@ void BluetoothDebugWorkflow::begin()
 
     initialiseTofSensors();
     const bool tof8x8Ready = tof8x8_.begin();
+    const bool imuReady = imu_.begin();
 
     JsonObject interval = findParameter("debug.telemetry_interval_ms");
     if (!interval.isNull())
@@ -56,12 +57,22 @@ void BluetoothDebugWorkflow::begin()
     link_.log("INFO", "Teensy Bluetooth workflow ready");
     link_.log(tof8x8Ready ? "INFO" : "WARNING",
               tof8x8Ready ? "SEN0628 8x8 TOF ready" : "SEN0628 8x8 TOF not detected");
+    link_.log(imuReady ? "INFO" : "WARNING",
+              imuReady ? "BNO055 IMU ready" : "BNO055 IMU not detected on I2C0/I2C1");
     sendState();
 }
 
 void BluetoothDebugWorkflow::update()
 {
     link_.update();
+    if (dcMotor203SecondDeadman_ && dcMotor203SecondActive_ &&
+        millis() - lastDcMotor203SecondCommandMs_ > KEYBOARD_DRIVE_TIMEOUT_MS)
+    {
+        dcMotor203Second_.stop();
+        dcMotor203SecondActive_ = false;
+        dcMotor203SecondDeadman_ = false;
+        link_.log("WARNING", "Keyboard drive heartbeat lost; motor bank 2 stopped");
+    }
     updateAutomaticServoRead();
     updateTof8x8();
     sendTelemetry();
@@ -91,6 +102,40 @@ void BluetoothDebugWorkflow::handleMessage(JsonDocument& message)
     else if (strcmp(type, "command") == 0)
     {
         handleCommand(message);
+    }
+    else if (strcmp(type, "drive") == 0)
+    {
+        // Compact, heartbeat-driven packet used by desktop arrow-key drive.
+        // Keeping this packet short makes it much less vulnerable to losses
+        // on the half-duplex CH9143 Bluetooth bridge than a full command JSON.
+        if (!debugMode_ || stopped_)
+        {
+            link_.error("Keyboard drive requires Debug Mode and Run state");
+            return;
+        }
+        if (!message["a"].is<int>() || !message["b"].is<int>())
+        {
+            link_.error("Keyboard drive requires integer a and b fields");
+            return;
+        }
+        const int channelA = message["a"].as<int>();
+        const int channelB = message["b"].as<int>();
+        if (channelA < -100 || channelA > 100 ||
+            channelB < -100 || channelB > 100)
+        {
+            link_.error("Keyboard drive values must be from -100 to 100");
+            return;
+        }
+        const bool changed = channelA != dcMotor203Second_.channelAPercent() ||
+                             channelB != dcMotor203Second_.channelBPercent();
+        dcMotor203Second_.setPercent(channelA, channelB);
+        dcMotor203SecondActive_ = channelA != 0 || channelB != 0;
+        dcMotor203SecondDeadman_ = true;
+        lastDcMotor203SecondCommandMs_ = millis();
+        if (changed)
+            link_.log(dcMotor203SecondActive_ ? "WARNING" : "INFO",
+                      dcMotor203SecondActive_ ? "Keyboard drive applied" :
+                                                "Keyboard drive stopped");
     }
     else if (strcmp(type, "parameter") == 0)
     {
@@ -128,6 +173,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             dcMotor203Active_ = false;
             dcMotor203Second_.stop();
             dcMotor203SecondActive_ = false;
+            dcMotor203SecondDeadman_ = false;
             hx12kA_.disable();
             hx12kB_.disable();
             hx12kC_.disable();
@@ -166,6 +212,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         dcMotor203Active_ = false;
         dcMotor203Second_.stop();
         dcMotor203SecondActive_ = false;
+        dcMotor203SecondDeadman_ = false;
         hx12kA_.disable();
         hx12kB_.disable();
         hx12kC_.disable();
@@ -400,15 +447,21 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             return;
         }
 
+        const bool changed = channelA != dcMotor203Second_.channelAPercent() ||
+                             channelB != dcMotor203Second_.channelBPercent();
         dcMotor203Second_.setPercent(static_cast<int16_t>(channelA), static_cast<int16_t>(channelB));
         dcMotor203SecondActive_ = channelA != 0 || channelB != 0;
-        link_.log(dcMotor203SecondActive_ ? "WARNING" : "INFO",
-                  dcMotor203SecondActive_ ? "Second 203 DC motor command applied" : "Second 203 DC motor stopped");
+        dcMotor203SecondDeadman_ = message["deadman"] | false;
+        lastDcMotor203SecondCommandMs_ = millis();
+        if (changed)
+            link_.log(dcMotor203SecondActive_ ? "WARNING" : "INFO",
+                      dcMotor203SecondActive_ ? "Second 203 DC motor command applied" : "Second 203 DC motor stopped");
     }
     else if (strcmp(action, "dc_motor_203_second_stop") == 0)
     {
         dcMotor203Second_.stop();
         dcMotor203SecondActive_ = false;
+        dcMotor203SecondDeadman_ = false;
         link_.log("INFO", "Second 203 DC motor stopped at neutral pulse");
     }
     else if (strcmp(action, "encoder_zero") == 0)
@@ -620,6 +673,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
 
     readTofSensors();
     encoders_.sample(now);
+    const bool imuSampleValid = imu_.update();
 
     JsonDocument message;
     message["type"] = "telemetry";
@@ -653,6 +707,39 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["encoder.2.count"] = encoders_.secondCount();
     data["encoder.2.delta"] = encoders_.secondDelta();
     data["encoder.2.counts_per_s"] = encoders_.secondCountsPerSecond();
+    data["imu.available"] = imu_.available();
+    data["imu.valid"] = imuSampleValid;
+    if (imu_.available()) {
+        data["imu.bus"] = imu_.bus();
+        data["imu.address"] = imu_.address();
+        data["imu.calibration.system"] = imu_.systemCalibration();
+        data["imu.calibration.gyro"] = imu_.gyroCalibration();
+        data["imu.calibration.accel"] = imu_.accelCalibration();
+        data["imu.calibration.mag"] = imu_.magCalibration();
+        data["imu.system_status"] = imu_.systemStatus();
+        data["imu.system_error"] = imu_.systemError();
+        data["imu.system_error_active"] = imu_.systemErrorActive();
+        data["imu.operation_mode"] = imu_.operationMode();
+        data["imu.fusion_running"] = imu_.fusionRunning();
+        data["imu.self_test_result"] = imu_.selfTestResult();
+        data["imu.self_test_passed"] = imu_.selfTestPassed();
+        if (imuSampleValid) {
+            data["imu.heading_deg"] = imu_.headingDeg();
+            data["imu.roll_deg"] = imu_.rollDeg();
+            data["imu.pitch_deg"] = imu_.pitchDeg();
+            data["imu.quaternion.w"] = imu_.quaternionW();
+            data["imu.quaternion.x"] = imu_.quaternionX();
+            data["imu.quaternion.y"] = imu_.quaternionY();
+            data["imu.quaternion.z"] = imu_.quaternionZ();
+            data["imu.linear_accel.x_mps2"] = imu_.linearAccelX();
+            data["imu.linear_accel.y_mps2"] = imu_.linearAccelY();
+            data["imu.linear_accel.z_mps2"] = imu_.linearAccelZ();
+            data["imu.gravity.x_mps2"] = imu_.gravityX();
+            data["imu.gravity.y_mps2"] = imu_.gravityY();
+            data["imu.gravity.z_mps2"] = imu_.gravityZ();
+            data["imu.temperature_c"] = imu_.temperatureC();
+        }
+    }
     data["hx12k.a.enabled"] = hx12kA_.enabled();
     data["hx12k.a.angle_deg"] = hx12kA_.commandedAngle();
     data["hx12k.b.enabled"] = hx12kB_.enabled();

@@ -1415,5 +1415,440 @@ Guide tests passed. No encoder hardware measurement or firmware upload has
 been performed yet.
 
 ===============================================================================
+26. BNO055 IMU TELEMETRY AND LOCAL ARENA VIEW
+===============================================================================
+
+The first operational visualisation now builds a live local-frame top-down map
+inside a new Arena View tab of the Bluetooth Debug GUI. Its arena outline uses
+the supplied 2400 by 4900 mm dimensions; the physical walls are 400 mm high,
+though a top-down view does not display their height. There was no arena brief
+file in the project, so these dimensions came directly from the team. The
+robot's initial screen position is an arbitrary local origin at the outline's
+centre, not an absolute surveyed arena coordinate. The view shows the current
+robot orientation, a blue motion trail, current point-TOF/matrix rays, and a
+bounded history of surface returns. It is an observation map, not a verified
+wall map or autonomous collision-avoidance system.
+
+A new Bno055Imu library checks the provided BNO055 chip identity before use,
+looking first on I2C1 at 0x28/0x29 (the stated socket shared with the SEN0628)
+and then on I2C0 as a fallback. It configures NDOF fusion and reads heading,
+roll, pitch, and system/gyro/accelerometer/magnetometer calibration levels.
+The Bluetooth workflow includes these in its ordinary 500 ms telemetry frame,
+plus presence and sample-validity flags. A disconnected IMU is retried every
+five seconds; three failed reads mark it unavailable. The new code does not
+drive any actuator and main.cpp remains only setup/update calls. Firmware was
+compiled successfully for Teensy 4.0; IMU hardware response remains to be
+verified after upload. The outgoing JSON buffer was expanded from 2048 to
+3072 bytes to preserve headroom for the added fields without dropping a long
+telemetry frame.
+
+The arena model integrates both signed encoder counts for translation and the
+BNO055 heading for rotation. It handles heading wrap at 0/360 and can use
+differential encoder turns if a valid wheel-track distance is supplied. It
+rejects out-of-range TOF readings and projects only the two centre matrix rows
+as a horizontal slice, rather than misrepresenting all 64 depth pixels as
+independent ground-plane points. The editable arena dimensions, wheel scale,
+wheel track, encoder polarities, point-sensor angles, and estimated matrix FOV
+persist through QSettings. Changing mapping geometry resets the local map.
+The wheel scale defaults to an explicitly approximate 80 mm circumference /
+(663 pulse/revolution times four quadrature edges), about 0.0948 mm/count.
+This requires measured-distance verification. The reported wheel-track value
+of 40 mm was not used as a default because it appears inconsistent with two
+80 mm drive wheels; encoder-only heading fallback stays disabled until a
+centre-to-centre track measurement is confirmed.
+
+The GUI's 8x8 tab now has a persistent robot-perspective horizontal flip,
+enabled by default. The raw grid column labels and smoothed image mirror
+together; Arena View uses the same setting for ray projection. This corrects
+the left/right reversal when the robot is viewed from in front. The raw
+telemetry keys and physical sensor wiring are not silently renamed, because
+the front photo alone does not identify which XSHUT connector belongs to each
+visible sensor. PlatformIO build succeeded. Five synthetic arena-model tests,
+three existing Wiring Guide tests, an offscreen GUI startup check, and the
+orientation-toggle check passed. Physical pose, direction, distance scale,
+TOF mounting angles, and visual left/right alignment still need a bench test.
+ARENA_VIEW_SETUP.md documents that first-run procedure and limitations.
+
+===============================================================================
+27. FIVE-SENSOR WIRING SYNC AND SQUARE FREE/OBSTACLE GRID
+===============================================================================
+
+The persisted Wiring Guide was inspected directly. Its current point TOF
+entries are long-range top-middle-left on XSHUT1, long-range top-middle-right
+on XSHUT2, short-range bottom-middle-left on XSHUT5, short-range bottom-middle-
+right on XSHUT0, and short-range bottom-far-right on XSHUT3. The previous
+firmware JSON only enabled two sensors and classified XSHUT2 as short-range.
+debug_config.json now enables all five ports with the types stated in the
+Wiring Guide. After rebuilding and uploading, firmware telemetry names will
+be tof.top_mid_left, tof.top_mid_right, tof.bottom_mid_left,
+tof.bottom_mid_right, and tof.bottom_right_right. Each has availability,
+timeout, and distance fields. The BNO055 on I2C1, the SEN0628 on I2C1, and
+both Digital Raw 2 encoders continue supplying heading, depth and motion.
+
+Arena View now joins each configured point sensor to the saved Wiring Guide
+entry by XSHUT port. It has individual editable robot-right position, forward
+position, and beam angle for each sensor, with persisted settings. The initial
+mounting offsets are rough guesses from the guide labels, not measurements;
+all five angles initially point forward pending physical alignment. Wiring
+Guide edits refresh these GUI descriptions. A newly entered guide port cannot
+generate firmware data until debug_config.json also lists it and the Teensy is
+rebuilt and uploaded; the map reports such unmatched ports.
+
+The previous endpoint dots have been replaced with a square evidence grid,
+initially 100 mm per cell and editable in the GUI. A valid range beam decreases free-space evidence along the measured
+path (green) and increases obstacle evidence at the endpoint (red). Unobserved
+or balanced cells remain grey. Readings that are unavailable, timed out,
+invalid, or outside the accepted range do not colour cells. The 8x8 sensor
+contributes its central horizontal slice; the IMU and encoders register these
+observations as the robot moves. Colour is only accumulated sensor evidence,
+not a certified safe/blocked map. Moving surfaces, dark angled surfaces,
+incorrect pose calibration, and uncertain beam mounting can make it wrong.
+
+The Teensy firmware builds successfully with all five point sensors. Twelve
+headless GUI/model tests pass, including a synthetic all-five-sensor case,
+invalid-sensor rejection, red endpoint / green path, and an offscreen drawing
+check. Physical response from the three newly enabled ports and grid alignment
+remain unverified until the updated firmware is uploaded and the robot is
+tested in front of a known obstacle.
+
+===============================================================================
+28. CENTIMETRE MAP, VISUAL SENSOR PLACEMENT, HEIGHT-AWARE CANDIDATES
+===============================================================================
+
+Arena View's default occupancy cell size is now 10 mm rather than 100 mm.
+The 2400 by 4900 mm outline therefore contains about 117,600 map pixels.
+The GUI caches the grey/green/red/purple grid in an image and updates changed
+cells instead of drawing every individual square on every frame. Mouse-wheel
+zoom, drag-to-pan, and a zoom/pan reset button make 1 cm cells inspectable;
+the full-arena overview cannot visually distinguish every cell on a normal
+display. A one-time settings migration changes installations still using the
+old 100 mm default to 10 mm, preserving other explicitly chosen sizes.
+
+A graphical robot-perspective sensor layout editor was added to Arena View.
+It displays all five point TOFs plus the 8x8 module on a schematic body.
+Dragging a marker changes its right/left and forward/backward position;
+dragging its arrow tip changes beam direction. The matching numeric controls
+and a per-sensor top/bottom height-layer selector provide precise edits. The
+diagram marks upper sensors with cyan circles and lower sensors with orange
+squares. All settings persist in the GUI's local settings store, reset the
+current observation map when changed, and are read back on restart. The
+diagram body and starting mount coordinates are not measured physical
+dimensions. Vertical top/bottom labels no longer imply a different forward
+offset; initial top and bottom point beams have the same approximate forward
+offset until the user places them correctly. The matrix module's position and
+direction now affect how its rays are projected into the arena grid.
+
+Purple cells represent a possible low object or weight candidate. The model
+compares a bottom point return with a nearby, similarly aimed top point
+return, or a recent matching central-row 8x8 ray when no top point reading
+exists. The bottom return must be at least 150 mm nearer than the upper
+return on two observations before a cell turns purple. The 150 mm comparison
+threshold is editable in the GUI. Missing, timed-out,
+stale, or unaligned top readings do not create purple cells. Agreement between
+upper and lower readings removes the candidate vote for that endpoint.
+This is deliberately a candidate label: different fields of view, reflective
+or dark surfaces, occlusion, vibration, and placement errors can produce the
+same difference. It must not trigger autonomous intake without field tests.
+
+The 1 cm grid, top/bottom comparison, graphical direction drag, layout
+persistence and existing wiring/GUI behaviours passed 18 headless tests.
+An offscreen draw benchmark with a 2 m observation took approximately 10 ms
+for the first image build and under 1 ms for a cached redraw on this machine.
+These are software checks only; the sensor pairing and purple classification
+have not yet been validated against real weights or arena walls.
+
+===============================================================================
+29. BLUETOOTH RECONNECT DIAGNOSTICS AND TELEMETRY STATE
+===============================================================================
+
+The desktop debug GUI uses the computer-side CH9143 USB serial Bluetooth
+adapter as a COM port (COM10 during the latest lab test, which may change).
+Opening that COM port and receiving actual robot JSON are separate events.
+The previous GUI displayed CONNECTED as soon as the port opened, even if no
+bytes arrived from the Teensy. This made a dead wireless link look like an
+application parser or GUI failure.
+
+During the latest lab-side investigation, direct serial reads from COM10
+initially received valid JSON telemetry and 8x8 TOF frames. A reconnect test
+also received frames. A later repeated connect test reproduced the user's
+failure: the port opened but both GUI attempts had zero frames, and an
+independent serial read received zero bytes for several seconds after the GUI
+closed. This rules out the GUI parser as the sole explanation for that
+specific silent-port episode. It does not identify whether the wireless
+pairing, radio power, robot power, or Teensy firmware stopped the data.
+The hardware is no longer available for further tests at the time of this
+entry, so the underlying physical/link cause remains unconfirmed.
+
+The GUI now distinguishes PORT OPEN — WAITING FOR ROBOT from CONNECTED. If
+the COM port is open for more than three seconds without any telemetry, it
+shows PORT OPEN — NO ROBOT DATA with a link/power hint. If telemetry was
+previously arriving but stops for more than three seconds, it shows PORT
+OPEN — ROBOT SILENT. CONNECTED is only shown after valid telemetry arrives.
+The status bar and system log likewise say the serial port is open and
+waiting, not that the robot is already connected. The Raw Serial tab and
+protocol error count remain available to distinguish absent bytes from
+malformed or unsupported messages.
+
+The lab-side JSON also exposed an old firmware image: it still emitted only
+tof.front and tof.left point sensors and did not emit imu.available or the
+new five point-sensor names. A visible GUI warning now identifies this old
+front/left telemetry pattern and instructs a current PlatformIO upload.
+The warning clears when imu.available is received. Thus a live Bluetooth
+connection cannot be mistaken for confirmation that the newer Arena View
+firmware has been flashed.
+
+diagnose_live_connection.py is a manual, read-only connection/reconnection
+check. It opens the selected COM port, sends only the normal hello handshake,
+and prints frame and status snapshots before and after reconnecting; it does
+not send motor or servo movement commands. Do not run it while the main GUI
+owns the same port. The GUI regression suite now contains an offline test
+for waiting, no-data, live, old-firmware warning, and stalled states. All
+20 GUI/model tests pass headlessly in the project virtual environment.
+No Bluetooth or Teensy connection was attempted after leaving the lab.
+
+On 20 September 2026 the computer-side CH9143 and Teensy were available
+again. Before uploading, COM10 passed one reconnect cycle but exposed the old
+front/left sensor schema, confirming that the warning correctly identified
+the firmware mismatch. COM12 opened but carried no debug JSON, which is
+expected because this project sends debug traffic through the configured
+Bluetooth UART rather than USB Serial.
+
+The current Teensy 4.0 firmware then compiled and uploaded successfully.
+Startup was checked in the source before upload: both 203 motor drivers begin
+at their 1500 microsecond neutral signal and all HX12K outputs begin disabled.
+The uploaded image used 124248 bytes of code flash, 18808 bytes of initialised
+flash data, 28768 bytes of RAM1 variables, and 12416 bytes of RAM2 variables.
+
+After upload, COM10 delivered the current 62-signal telemetry frame without
+protocol errors. A ten-second sample observed 18 complete telemetry samples.
+All five configured point TOFs were available and not timed out. The SEN0628
+delivered 19 valid 64-zone frames in the same sample and reported address
+0x33. The BNO055 was available and valid on I2C1 at 0x28. Both encoder counts
+and rates remained zero while the robot was stationary; this confirms their
+telemetry path, but not their polarity, count scale, or electrical response
+to wheel movement.
+
+The BNO055 produced plausible live Euler angles and reported gyro, accel and
+mag calibration at 3/3, but system calibration remained 0/3 during a later
+twenty-second sample. The calibration-register bit decoding agrees with the
+provided 101_IMU example/library convention, so this is currently treated as
+the sensor's reported state rather than a desktop parsing error. Arena View
+therefore uses the designed encoder-only heading fallback and reports that
+IMU-based turn mapping is paused until system calibration reaches at least
+1/3. The robot must be physically moved through the BNO055 calibration
+motions before this can be evaluated further.
+
+The full GUI was also run offscreen against live COM10 data. Arena View
+created 366 green free-space cells and 21 red obstacle cells during the first
+connection, then continued to 385 free and 23 obstacle cells after reconnect.
+No purple possible-weight cell was present in that static scene. Some live
+point readings were below the configured 200 mm minimum or returned 8190 mm;
+the map correctly rejected these rather than painting them as obstacles.
+
+Safe command-path tests passed for Ping, Read All TOF, setting and reading
+back the 500 ms telemetry interval, and emergency Stop. Stop returned the
+expected torque-off log. There were no protocol or malformed-JSON errors.
+Five rapid Bluetooth disconnect/reconnect cycles each received 22 messages
+and produced no errors. The prior silent reconnect condition did not recur.
+The offline GUI/model suite still passes all 20 tests. Remaining physical
+tests are encoder direction and scale, measured sensor placement and pointing,
+IMU calibration while moving, and actuator motion; none can be proven by a
+stationary remote session.
+
+===============================================================================
+30. BNO055 FULL FUSION TELEMETRY AND LOCAL DISPLACEMENT
+===============================================================================
+
+The BNO055 driver now reads and publishes fused Euler heading/roll/pitch,
+quaternion W/X/Y/Z, gravity, linear acceleration, temperature, operation mode,
+fusion status, system status/error, built-in self-test result and the four
+calibration fields. Live testing found the device at 0x28 on I2C1 in NDOF mode
+12. It reported system status 5 (fusion running), self-test result 15 (all four
+self-tests passed), stable gravity near 9.8 m/s2, sensible quaternion and Euler
+values, and no active system error. The raw SYS_ERR register contained 9, but
+the BNO055 defines that register as an active fault only when SYS_STATUS is 1;
+with SYS_STATUS 5 it is retained diagnostic data, not a current error. Firmware
+now reports both the raw code and imu.system_error_active to prevent ambiguity.
+
+The separate overall calibration field remained 0/3 while gyro, accelerometer
+and magnetometer each reported 3/3. Arena View no longer rejects a good heading
+solely for that value. It uses the heading whenever the sensor reports that its
+fusion engine is running, and falls back to encoder differential heading only
+when fusion is unavailable. A live hand-rotation test produced a smooth 69.1
+degree heading span and 63.5 degree net change with fusion and self-test healthy.
+
+The BNO055 is not used to double-integrate translational acceleration because
+small bias and chassis vibration would create rapidly growing position error.
+Local displacement instead combines encoder distance with fused IMU heading.
+Arena View now displays local X/Y pose, cumulative wheel travel, encoder-derived
+linear speed and fusion health. A later handling test changed encoder 1 by -544
+counts and encoder 2 by +645 counts while the IMU measured a 51 degree turn,
+showing that both encoder telemetry and heading respond dynamically. The robot's
+gearboxes cannot be back-driven for a straight hand-push calibration, so exact
+mm/count still requires a controlled powered test. The supplied 40 mm wheel
+track is retained as an editable starting value, but it appears unusually small
+and should not be treated as measured truth. All 21 navigation/GUI tests passed.
+
+===============================================================================
+31. ARROW-KEY DRIVE FOR MOTOR BANK 2
+===============================================================================
+
+The Dashboard now contains a Keyboard Drive — motor bank 2 panel with an
+adjustable 5–100 percent drive level and an explicit enable checkbox. It only
+accepts arrows while connected, in Debug Mode, and in Run state. Up sends
+channel A negative and channel B negative, matching left-forward and
+right-forward on the fitted drive motor bank. Down sends both positive. Left
+sends A positive/B negative and Right sends A negative/B positive. Combined
+forward-turn keys stop the inner track and retain the selected power on the
+outer track rather than doubling it. Releasing all arrows sends 0/0.
+
+The control disarms and sends neutral when disabled, disconnected, stopped,
+leaving Debug Mode, losing application focus, or closing the GUI. While a key
+is held, the GUI sends a deadman heartbeat every 150 ms. The matching firmware
+stops motor bank 2 if no heartbeat arrives for 500 ms, covering a lost key-up
+packet, GUI freeze, cable loss or Bluetooth dropout. Ordinary non-keyboard motor
+commands are not given this timeout. The firmware suppresses repeated heartbeat
+logs while still accepting the refreshed command.
+
+The direction mapping, diagonal limit and release-to-neutral path pass the
+offline suite; all 22 tests pass. The firmware builds successfully. However,
+the attempted upload after this change did not reach the Teensy: PlatformIO
+printed "No Teensy boards were found" and the USB programming port was absent
+from the serial-port list, even though the tool returned a success exit code.
+Only COM10 and the Windows Bluetooth ports were present. Therefore the GUI
+keyboard controls must not be used until the Teensy programming USB is
+reconnected, the firmware is uploaded, and the 500 ms watchdog is verified
+with the drive wheels safely raised. The running GUI must also be restarted to
+load the new panel.
+
+The programming USB was subsequently reconnected. PlatformIO rebuilt and
+uploaded the current firmware without the previous missing-board message, and
+the Teensy re-enumerated as USB Serial Device COM12 afterward. The BNO055
+changes and keyboard-drive deadman are therefore now installed. The desktop
+GUI still needs to be restarted to load its new Keyboard Drive panel. The
+first powered arrow-key test should be performed with the chassis securely
+supported and both drive wheels clear of the floor so direction and the
+500 ms heartbeat timeout can be confirmed before ground driving.
+
+===============================================================================
+32. POWERED ENCODER DISTANCE CALIBRATION
+===============================================================================
+
+Three consecutive straight-run measurements were supplied as cumulative
+encoder counts. The starting reading was encoder 1 -27409 and encoder 2 11242.
+After 390 mm the readings were -31712 and 15270, giving deltas -4303/+4028.
+After a further 385 mm they were -35931 and 19322, giving -4219/+4052. After
+a claimed further 340 mm they were -40097 and 23382, giving -4166/+4060.
+
+The first two runs agree closely in counts per millimetre. The third produced
+almost the same count change for 340 mm as the others produced for 385–390 mm,
+an approximately 12 percent discrepancy. It is excluded from the primary
+scale as a likely distance, stopping-position or wheel-slip outlier. The two
+consistent runs combine to 775 mm over 8522 encoder-1 counts and 8080
+encoder-2 counts. Arena View now uses separate calibrated scales:
+
+    Encoder 1: 0.09094 mm/count, inverted for forward-positive
+    Encoder 2: 0.09592 mm/count, not inverted
+
+Separate scales prevent the roughly 5.5 percent left/right count difference
+from appearing as false translation or speed imbalance. The model converts
+each wheel delta to millimetres before averaging translation or calculating
+encoder-only rotation. Local X/Y displacement, cumulative travel and speed
+therefore use the individual calibrations. A one-time settings migration
+installs both values and the measured polarities while retaining editable
+controls for later refinement. A new asymmetric-scale/polarity regression
+test passes; the complete offline suite now passes all 23 tests.
+
+The exact scale should be checked again with a longer taped distance because
+the rejected third trial shows meaningful experimental scatter. Wheel track
+also remains independently editable and still needs a reliable centre-to-
+centre or controlled-turn calibration. The BNO055 remains the preferred turn
+heading whenever its fusion engine is running.
+
+===============================================================================
+33. LIVE ARENA-MAP AND BLUETOOTH PROTOCOL DIAGNOSIS
+===============================================================================
+
+A stationary wall-facing live test exposed two independent causes of the
+strange Arena View trails. First, the BNO055 heading moved by 8.75 degrees in
+12 seconds while both encoder counts remained exactly unchanged. Applying
+that apparent rotation to every range sample painted a fan even though the
+chassis had not moved. Arena View now refreshes the IMU baseline but holds the
+mapped heading whenever the combined encoder change is below four counts. The
+status line explicitly reports when this stationary encoder lock is active.
+Real turns continue to use fused BNO055 heading once the encoders show motion.
+
+Second, isolated point-TOF or 8x8-column range spikes were being stored as
+permanent free-space rays. Every mapping source now has an independent range
+filter. Normal changes pass immediately and accepted values use a short
+three-sample median. A jump larger than 150 mm or 35 percent must be repeated
+consistently before it is admitted. This rejects a lone long return while
+still allowing a genuine newly visible surface after two supporting frames.
+It does not alter the raw telemetry or the dedicated 8x8 display.
+
+A later live sample showed one point sensor alternating through 8191 mm and
+another returning zero. These are invalid/sentinel readings rather than arena
+distances. Point readings outside the configured 200–3500 mm mapping range are
+now discarded before the temporal filter, so they cannot poison its baseline,
+create a ray, or participate in the purple weight comparison.
+
+Before these changes the stationary evidence occupied columns -74 through 36
+and rows 24 through 155, including a long diagonal green scar. With the same
+robot stationary after the changes, the occupied bounds reduced to columns
+-29 through 34 and rows 24 through 93. The remaining short fan agrees with
+the deliberately outward-pointing sensor geometry stored in the layout
+editor. Regression tests cover stationary heading suppression and rejection
+of a single large range jump.
+
+The protocol-error investigation also found that keyboard driving previously
+sent the full generic motor-command JSON approximately every 150 ms. That is
+unnecessarily large on the half-duplex Bluetooth serial link while telemetry
+and 8x8 frames are being transmitted. The GUI and firmware now use the compact
+packet `{\"type\":\"drive\",\"a\":-30,\"b\":-30}` for keyboard heartbeats.
+The firmware accepts it only in Debug Mode and Run state, validates both
+channels, refreshes the existing 500 ms motor deadman, and avoids repeated log
+traffic when the output has not changed. Key release and all GUI safety paths
+still send 0/0.
+
+The compact-drive firmware was built and uploaded successfully after the
+programming USB reappeared. A six-second COM10 verification then received
+continuous telemetry with zero framing or JSON errors: 80 signals, live data
+from all five point TOFs, ten valid 8x8 samples at address 0x33, and a running
+BNO055 fusion engine with passing self-test. The desktop application must be
+restarted to load the map filters and compact keyboard packets. The next
+powered driving check should watch the protocol-error counter and confirm the
+arena trail remains coherent while turning.
+
+===============================================================================
+34. RAW TOF PANEL AND FULL 8X8 ARENA CONE
+===============================================================================
+
+Arena View now has a permanently visible Raw TOF readings section directly
+below the map. Its point-sensor side lists every configured sensor using its
+Wiring Guide label and XSHUT port. It shows the actual incoming millimetres,
+OFFLINE, TIMEOUT, or an invalid marker for a value outside the 200–3500 mm map
+range. Its matrix side shows all 64 raw X0–X7/Y0–Y7 readings together with the
+frame number, I2C bus and responding address. This panel deliberately displays
+data before spike rejection, median filtering, or occupancy processing.
+
+The arena projection previously averaged only rows Y3 and Y4 into eight
+horizontal readings. It now validates and filters every one of the 64 zones
+independently. Each horizontal column owns one eighth of the configured field
+of view, and its eight vertical zones are distributed through that angular
+sector so the top-down evidence appears as a dense cone rather than a small
+set of overlapping lines. Every valid zone can therefore contribute its own
+free-space ray and obstacle endpoint.
+
+This distribution is intentionally a 2D projection. A floor plan has no axis
+on which to draw the matrix's vertical field of view, so spreading the rows
+within their correct horizontal sector makes the coverage visible without
+discarding 48 of the 64 measurements. Exact zone values and their true row/
+column identities remain available in the raw table and dedicated 8x8 tab.
+Invalid zero/8191/out-of-range zones remain visible in raw data but cannot
+paint the arena. The expanded suite passes all 28 tests, including full
+64-zone projection, cone width, raw point display, raw matrix display, and the
+previous mapping and drive-safety checks.
+
+===============================================================================
 END OF STATUS
 ===============================================================================

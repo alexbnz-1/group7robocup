@@ -1,16 +1,34 @@
 {
   "tof_sensors": [
     {
-      "name": "front",
-      "label": "Front long-range TOF",
+      "name": "top_mid_left",
+      "label": "Top middle left long-range TOF",
       "type": "long",
       "port": "XSHUT1"
     },
     {
-      "name": "left",
-      "label": "Left short-range TOF",
-      "type": "short",
+      "name": "top_mid_right",
+      "label": "Top middle right long-range TOF",
+      "type": "long",
       "port": "XSHUT2"
+    },
+    {
+      "name": "bottom_mid_left",
+      "label": "Bottom middle left short-range TOF",
+      "type": "short",
+      "port": "XSHUT5"
+    },
+    {
+      "name": "bottom_mid_right",
+      "label": "Bottom middle right short-range TOF",
+      "type": "short",
+      "port": "XSHUT0"
+    },
+    {
+      "name": "bottom_right_right",
+      "label": "Bottom far-right short-range TOF",
+      "type": "short",
+      "port": "XSHUT3"
     }
 
   ],
