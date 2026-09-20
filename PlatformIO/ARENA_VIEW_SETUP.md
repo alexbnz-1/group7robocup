@@ -80,14 +80,13 @@ each point sensor by Wiring Guide label/port and the complete raw X0–X7,
 Y0–Y7 matrix with frame, bus and address. Values marked invalid are displayed
 but never mapped. These readouts precede the temporal mapping filters.
 
-All 64 matrix zones now contribute separately to the floor plan instead of
-using only the two centre rows. A top-down map cannot represent the matrix's
-vertical field of view directly, so the eight vertical zones in each
-horizontal column are distributed within that column's angular sector. This
-creates a dense cone footprint across the configured horizontal FOV while
-preserving every zone's independent distance and filter history. The spread
-is a 2D visual projection, not a claim that vertical rows have different
-physical horizontal bearings; use the raw matrix for literal zone data.
+All 64 matrix zones now contribute to the floor plan instead of using only the
+two centre rows. A top-down map cannot represent the matrix's vertical field
+of view as extra horizontal bearings. The mapper therefore takes the median
+of the valid Y0–Y7 ranges in each real X column, requires at least three valid
+pixels, waits for two consistent frames, and paints that column's complete
+horizontal angular sector as a filled wedge. The eight wedges form the cone.
+The raw table remains the literal source for all individual zone values.
 
 The map now defaults to **10 mm (1 cm) cells**. The map is zoomable with the
 mouse wheel and pannable by dragging; use Reset map zoom / pan to return to the

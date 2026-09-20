@@ -52,7 +52,7 @@ class ArenaModel:
                             "angle": 0.0, "x": 0.0, "y": 150.0, "layer": "top"}
         self.cell_size_mm = 10.0
         self.weight_gap_mm = 150.0
-        self.min_range_mm = 200.0
+        self.min_range_mm = 10
         self.max_range_mm = 3500.0
         self.reset()
 
@@ -87,13 +87,23 @@ class ArenaModel:
         self.linear_speed_mm_s = 0.0
         self.range_filter_state = {}
 
-    def _filtered_distance(self, name, distance):
+    def _filtered_distance(self, name, distance, confirm_initial=False):
         """Reject one-frame range jumps, then lightly median-filter accepted data."""
         state = self.range_filter_state.setdefault(name, {
             "accepted": None, "candidate": None, "candidate_count": 0,
             "recent": deque(maxlen=3),
         })
         accepted = state["accepted"]
+        if accepted is None and confirm_initial:
+            candidate = state["candidate"]
+            candidate_limit = max(100.0, abs(distance) * 0.20)
+            if candidate is not None and abs(distance - candidate) <= candidate_limit:
+                state["candidate_count"] += 1
+            else:
+                state["candidate"] = distance
+                state["candidate_count"] = 1
+            if state["candidate_count"] < 2:
+                return None
         if accepted is not None:
             jump_limit = max(150.0, abs(accepted) * 0.35)
             if abs(distance - accepted) > jump_limit:
@@ -166,7 +176,7 @@ class ArenaModel:
                           abs(item["y"] - bottom["y"]))
                 top_distance = valid_distances[top["name"]]
             elif (self.matrix_spec.get("layer") == "top" and
-                  abs(self.matrix_spec["x"] - bottom["x"]) <= 200 and
+                  abs(self.matrix_spec["x"] - bottom["x"]) <= 0 and
                   self.matrix_top_samples and
                   _number(self._frame_time) is not None and
                   _number(self.matrix_sample_time) is not None and
@@ -304,6 +314,50 @@ class ArenaModel:
                 self.cells[cell] = max(-8, self.cells.get(cell, 0) - 1)
             self.cells[endpoint] = min(8, self.cells.get(endpoint, 0) + 3)
 
+    def _add_wedge_observation(self, distance_mm, centre_angle_deg, width_deg,
+                               source, lateral_mm=0.0, forward_mm=0.0):
+        """Paint one matrix column as a filled top-down angular sector."""
+        if not self.min_range_mm <= distance_mm <= self.max_range_mm:
+            return
+        origin_x = self.x + forward_mm * math.cos(self.theta) + lateral_mm * math.sin(self.theta)
+        origin_y = self.y + forward_mm * math.sin(self.theta) - lateral_mm * math.cos(self.theta)
+        half_width = width_deg * 0.5
+        for offset in (-half_width, 0.0, half_width):
+            target = self._endpoint(distance_mm, centre_angle_deg + offset,
+                                    lateral_mm, forward_mm)
+            self.current_rays.append((origin_x, origin_y, *target, source))
+        if self.mm_per_count <= 0:
+            return
+
+        centre_target = self._endpoint(distance_mm, centre_angle_deg,
+                                       lateral_mm, forward_mm)
+        self.points.append((*centre_target, source))
+        width_rad = math.radians(width_deg)
+        base_angle = self.theta + math.radians(centre_angle_deg)
+        free_limit = max(0.0, distance_mm - self.cell_size_mm * 1.5)
+        free_cells = set()
+        radius = self.cell_size_mm * 0.5
+        while radius <= free_limit:
+            samples = max(1, math.ceil(radius * width_rad / self.cell_size_mm))
+            for index in range(samples + 1):
+                fraction = index / samples
+                angle = base_angle - width_rad * 0.5 + width_rad * fraction
+                free_cells.add(self._cell(origin_x + radius * math.cos(angle),
+                                          origin_y + radius * math.sin(angle)))
+            radius += self.cell_size_mm
+        for cell in free_cells:
+            self.cells[cell] = max(-8, self.cells.get(cell, 0) - 1)
+
+        endpoint_samples = max(
+            2, math.ceil(distance_mm * width_rad / self.cell_size_mm)
+        )
+        for index in range(endpoint_samples + 1):
+            fraction = index / endpoint_samples
+            angle = base_angle - width_rad * 0.5 + width_rad * fraction
+            cell = self._cell(origin_x + distance_mm * math.cos(angle),
+                              origin_y + distance_mm * math.sin(angle))
+            self.cells[cell] = min(8, self.cells.get(cell, 0) + 3)
+
     def receive_matrix(self, message):
         self.last_matrix_available = bool(message.get("available"))
         self.last_matrix_valid = bool(message.get("valid"))
@@ -319,27 +373,34 @@ class ArenaModel:
         self.last_matrix_frame = frame_id
         self.matrix_sample_time = message.get("time")
         self.matrix_top_samples = []
-        # A floor plan cannot directly show the sensor's vertical field of
-        # view. Preserve all 64 independent ranges and distribute the eight
-        # vertical zones across their column's horizontal angular sector.
-        # This produces a dense cone footprint without treating the matrix as
-        # one rangefinder or inventing eight separate horizontal columns.
+        # A floor plan has no vertical axis. Use all eight vertical samples in
+        # each real horizontal column to obtain a robust column distance, then
+        # paint that column's full angular sector. This preserves the useful
+        # 8x8 information without inventing horizontal bearings for Y rows.
         side = -1 if self.matrix_mirrored else 1
         sector_width = self.matrix_fov_deg / 8.0
-        for row in range(8):
-            for col in range(8):
-                distance = _number(values[row * 8 + col])
-                if distance is None or not self.min_range_mm <= distance <= self.max_range_mm:
-                    continue
-                distance = self._filtered_distance(f"matrix.{row}.{col}", distance)
-                if distance is None:
-                    continue
-                column_centre = side * ((3.5 - col) / 8.0) * self.matrix_fov_deg
-                within_sector = side * ((row - 3.5) / 8.0) * sector_width
-                angle = self.matrix_spec["angle"] + column_centre + within_sector
-                self.matrix_top_samples.append((angle, distance))
-                self._add_observation(distance, angle, "8x8",
-                                      self.matrix_spec["x"], self.matrix_spec["y"])
+        for col in range(8):
+            valid = sorted(
+                distance for row in range(8)
+                if (distance := _number(values[row * 8 + col])) is not None
+                and self.min_range_mm <= distance <= self.max_range_mm
+            )
+            # Do not let one or two stray pixels define an entire sector.
+            if len(valid) < 3:
+                continue
+            distance = valid[len(valid) // 2]
+            distance = self._filtered_distance(
+                f"matrix.column.{col}", distance, confirm_initial=True
+            )
+            if distance is None:
+                continue
+            angle = (self.matrix_spec["angle"] +
+                     side * ((3.5 - col) / 8.0) * self.matrix_fov_deg)
+            self.matrix_top_samples.append((angle, distance))
+            self._add_wedge_observation(
+                distance, angle, sector_width, "8x8",
+                self.matrix_spec["x"], self.matrix_spec["y"]
+            )
 
 
 class ArenaCanvas(QWidget):

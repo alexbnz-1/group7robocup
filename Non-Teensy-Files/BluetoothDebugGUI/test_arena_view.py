@@ -112,20 +112,26 @@ class ArenaModelTests(unittest.TestCase):
                                  "frame": 1, "data": [0] * 64})
         self.assertEqual(len(self.map.points), 0)
         values = [0] * 64
-        values[3 * 8 + 3] = 800
+        values[2 * 8 + 3] = 800
+        values[3 * 8 + 3] = 810
         values[4 * 8 + 3] = 820
-        self.map.receive_matrix({"available": True, "valid": True,
-                                 "frame": 2, "data": values})
-        self.assertEqual(len(self.map.points), 2)
-        self.assertEqual(len(self.map.current_rays), 2)
+        for frame in (2, 3):
+            self.map.receive_matrix({"available": True, "valid": True,
+                                     "frame": frame, "data": values})
+        self.assertEqual(len(self.map.points), 1)
+        self.assertEqual(len(self.map.current_rays), 3)
 
     def test_full_matrix_projects_all_64_zones_as_a_cone(self):
-        self.map.receive_matrix({"available": True, "valid": True,
-                                 "frame": 1, "data": [1000] * 64})
-        self.assertEqual(len(self.map.points), 64)
-        self.assertEqual(len(self.map.current_rays), 64)
+        for frame in (1, 2):
+            self.map.receive_matrix({"available": True, "valid": True,
+                                     "frame": frame, "data": [1000] * 64})
+        self.assertEqual(len(self.map.points), 8)
+        self.assertEqual(len(self.map.current_rays), 24)
         horizontal = [point[0] for point in self.map.points]
         self.assertGreater(max(horizontal) - min(horizontal), 800)
+        self.assertGreater(len(self.map.cells), 3000)
+        self.assertLess(self.map.cells.get(self.map._cell(0, 700), 0), 0)
+        self.assertNotIn(self.map._cell(800, 700), self.map.cells)
 
     def test_uncalibrated_heading_uses_encoder_fallback(self):
         self.feed(0, 0, 0)
@@ -135,9 +141,11 @@ class ArenaModelTests(unittest.TestCase):
 
     def test_default_matrix_orientation_is_robot_perspective(self):
         values = [0] * 64
-        values[3 * 8] = 500  # raw column zero appears on robot-right
-        self.map.receive_matrix({"available": True, "valid": True,
-                                 "frame": 1, "data": values})
+        for row in (2, 3, 4):
+            values[row * 8] = 500  # raw column zero appears on robot-right
+        for frame in (1, 2):
+            self.map.receive_matrix({"available": True, "valid": True,
+                                     "frame": frame, "data": values})
         x, _y, source = self.map.points[-1]
         self.assertEqual(source, "8x8")
         self.assertGreater(x, 0)
@@ -230,9 +238,10 @@ class ArenaModelTests(unittest.TestCase):
             {"name": "lower", "angle": angle, "x": 0, "y": 150, "layer": "bottom"},
         ]
         values = [0] * 64
+        values[2 * 8 + 3] = 1000
         values[3 * 8 + 3] = 1000
         values[4 * 8 + 3] = 1000
-        for frame_number in (1, 2):
+        for frame_number in (1, 2, 3):
             self.map.receive_matrix({"available": True, "valid": True,
                                      "frame": frame_number, "time": frame_number * 200,
                                      "data": values})

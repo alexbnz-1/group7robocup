@@ -76,16 +76,17 @@ Newest desktop behavior:
 - The raw panel below Arena View shows all point readings and all 64 matrix
   zones before mapping filters.
 - All 64 matrix zones now contribute to a dense horizontal cone projection.
-  Because a floor plan has no vertical axis, the eight vertical samples in a
-  column are distributed inside that column's horizontal sector. Literal row/
-  column data remains visible in the raw table and dedicated 8x8 tab.
+  Because a floor plan has no vertical axis, the mapper robustly combines the
+  eight vertical samples within each of the eight real horizontal columns and
+  paints that column's angular sector as a filled wedge. Literal row/column
+  data remains visible in the raw table and dedicated 8x8 tab.
 - Dashboard arrow keys drive motor bank 2 only after Connect, Debug Mode, Run,
   and explicit Keyboard Drive enable. The GUI sends compact drive heartbeats;
   firmware stops the bank after 500 ms without a heartbeat.
 
 Resume procedure:
 
-1. Read this section, then sections 33–37.
+1. Read this section, then sections 33–38.
 2. Start the GUI with
    Non-Teensy-Files\BluetoothDebugGUI\run_gui.ps1.
 3. Restart any already-running GUI after code changes; an old process can both
@@ -1926,23 +1927,20 @@ range. Its matrix side shows all 64 raw X0–X7/Y0–Y7 readings together with t
 frame number, I2C bus and responding address. This panel deliberately displays
 data before spike rejection, median filtering, or occupancy processing.
 
-The arena projection previously averaged only rows Y3 and Y4 into eight
-horizontal readings. It now validates and filters every one of the 64 zones
-independently. Each horizontal column owns one eighth of the configured field
-of view, and its eight vertical zones are distributed through that angular
-sector so the top-down evidence appears as a dense cone rather than a small
-set of overlapping lines. Every valid zone can therefore contribute its own
-free-space ray and obstacle endpoint.
+The arena projection originally averaged only rows Y3 and Y4 into eight
+horizontal readings. Its next version incorrectly distributed Y rows as extra
+horizontal bearings, producing a starburst. The corrected projection uses all
+eight Y readings to calculate a robust median for each real X column. It needs
+at least three valid pixels in a column and two consistent frames before that
+column can paint. Each of the eight X columns then paints its complete angular
+sector as a filled green wedge with a red endpoint arc. Adjacent wedges form a
+continuous cone without inventing bearings for vertical pixels.
 
-This distribution is intentionally a 2D projection. A floor plan has no axis
-on which to draw the matrix's vertical field of view, so spreading the rows
-within their correct horizontal sector makes the coverage visible without
-discarding 48 of the 64 measurements. Exact zone values and their true row/
-column identities remain available in the raw table and dedicated 8x8 tab.
-Invalid zero/8191/out-of-range zones remain visible in raw data but cannot
-paint the arena. The expanded suite passes all 28 tests, including full
-64-zone projection, cone width, raw point display, raw matrix display, and the
-previous mapping and drive-safety checks.
+Exact values and row/column identities remain available in the raw table and
+dedicated 8x8 tab. Invalid zero/8191/out-of-range zones remain visible in raw
+data but cannot paint the arena. The suite passes all 28 tests, including
+column aggregation, cone width, startup confirmation, raw point display, raw
+matrix display and the previous mapping/drive-safety checks.
 
 ===============================================================================
 35. CURRENT BUILD, RUN, TEST AND RECOVERY COMMANDS
@@ -2333,8 +2331,8 @@ Diagnostics/tests:
   it before use whenever hardware can move.
 - smoke_test.py performs basic application/module checks.
 - test_arena_view.py covers mapping, calibration, stationary yaw lock, spike/
-  sentinel rejection, 64-zone cone, raw panel, sensor editing, connection state
-  and keyboard direction mapping.
+  sentinel rejection, robust 8x8 column sectors, raw panel, sensor editing,
+  connection state and keyboard direction mapping.
 - test_wiring_guide.py covers tab creation, persistence and schema migration.
 
 Offline recordings/analysis:
@@ -2350,13 +2348,43 @@ Offline recordings/analysis:
 
 Documentation/reference priority:
 
-1. This status file, especially sections 0 and 33–37.
+1. This status file, especially sections 0 and 33–38.
 2. Active source/configuration files.
 3. ARENA_VIEW_SETUP.md, DEBUG_GUI_CONFIG.md, ENCODER_WIRING.md,
    HX12K_WIRING.md, TOF8X8_WIRING.md and BLUETOOTH_SETUP.md.
 4. Supplied example sketches for hardware-specific comparison.
 5. The generic repository README is still the original GitLab template and is
    not an accurate technical handoff.
+
+===============================================================================
+38. MATRIX STARBURST CORRECTION
+===============================================================================
+
+A live screenshot exposed that treating all 64 matrix zones as independent
+horizontal rays was geometrically wrong. Y0–Y7 represent vertical field of
+view, not eight sub-bearings inside an X sector. It created many long narrow
+green rays, scattered red dots and nearly 8,000 persistent cells from a
+stationary robot. The raw frame in that screenshot was approximately 160–214
+mm while the configured mapping minimum was 200 mm, so most of the visible
+long-range evidence could not describe the current scene.
+
+The matrix mapper now works column-by-column. It filters every raw value to the
+200–3500 mm range, requires at least three valid Y pixels in an X column, uses
+their median distance, and requires that median to agree across two frames
+before mapping it. A valid X column paints its entire one-eighth share of the
+configured horizontal FOV as a filled sector: green free cells up to the
+measurement and a red arc at the measured distance. Eight sectors form a
+continuous cone. Current-ray overlays are limited to the two sector boundaries
+and centreline rather than 64 invented bearings.
+
+This also means the screenshot's almost-entirely sub-200 mm frame produces no
+arena evidence, as requested by the grey-below-200 rule. Restarting the GUI or
+pressing Reset local map removes the already-stored starburst. This correction
+is desktop-only and needs no Teensy upload. All 28 tests pass afterward.
+
+User added: Changed the lower limit for the tof from 200mm to 0mm in the arena view python
+script. Needs to be checked that it was implemented the correct way, but this is wanted
+by the user.
 
 ===============================================================================
 END OF STATUS
