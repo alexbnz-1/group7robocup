@@ -1,8 +1,103 @@
 GROUP 7 ROBOCUP PROJECT STATUS
-Last updated: 2026-09-14 (Pacific/Auckland)
+Last updated: 2026-09-20 (Pacific/Auckland)
 Repository: C:\Users\alex\Desktop\group7robocup
 Current branch: testing
-Current committed revision: 5b5daed - Added code for teensy to communicate with app
+Current committed revision: 280dde1 - Not sure what's changed but committing anyways
+
+===============================================================================
+0. READ THIS FIRST — AUTHORITATIVE RESUME SNAPSHOT
+===============================================================================
+
+This section is the current handoff point. Sections 1–34 retain the detailed
+development history and evidence, so some early sections mention assignments
+that were later replaced. When two statements conflict, use this section,
+PlatformIO/include/config.h, PlatformIO/debug_config.json, and the newest
+numbered section rather than an older historical statement.
+
+Repository state at this handoff:
+
+- Branch: testing.
+- Revision: 280dde1.
+- Working tree before this handoff edit was clean. The only expected local
+  modification afterward is status.txt itself.
+- Desktop platform used for testing: Windows.
+- Firmware target: Teensy 4.0 using Arduino through PlatformIO.
+- Arena dimensions: 2400 mm wide, 4900 mm long, 400 mm walls.
+- The complete current file inventory is in section 36.
+- The quickest component/file guide is in section 37.
+
+Current hardware assignments:
+
+- CH9143 Bluetooth serial: carrier SERIAL1 / Teensy Serial1, 115200 baud.
+- Herkulex DRS-0101 bus: carrier SERIAL2 / Teensy Serial2, 115200 baud.
+- First 203 DC motor driver: channel A D27, channel B D26.
+- Second 203 DC motor driver / tracked drive bank: channel A D25, channel B
+  D15. Negative 100 percent is forward on both fitted drive channels.
+- HX12K level-shift outputs: A D33, B D32, C D31, D D30.
+- Dual quadrature encoders on Digital Raw 2: encoder 1 D2/D3 and encoder 2
+  D4/D5. These pins must not also be enabled as motor outputs.
+- Encoder calibration: encoder 1 is inverted at 0.09094 mm/count; encoder 2 is
+  not inverted at 0.09592 mm/count. The 40 mm wheel track is still a supplied
+  value that should be physically confirmed.
+- Five point TOFs are selected through the SX1509 XSHUT expander: XSHUT1 and
+  XSHUT2 long range; XSHUT5, XSHUT0 and XSHUT3 short range. Their assigned
+  I2C addresses start at 0x40. Configuration names live in debug_config.json.
+- SEN0628 8x8 TOF: raw I2C1 / Wire1, detected at 0x33.
+- BNO055 IMU: I2C1 / Wire1 at 0x28. The driver probes I2C1 first and I2C0 as a
+  fallback. It exposes Euler angles, quaternion, linear acceleration, gravity,
+  temperature, calibration, system status/error, operating mode and self-test.
+
+Most recent live verification:
+
+- Bluetooth receiver was COM10; direct Teensy programming USB was COM12.
+  Windows can renumber both, so identify the port by device description.
+- A 12-second read-only COM10 run received 79 telemetry signals evenly and no
+  serial, framing or JSON errors.
+- BNO055 was available on bus 1, fusion status was running, self-test passed,
+  gyro/magnetometer calibration were 3/3, and no active system error existed.
+- The 8x8 sensor was valid at 0x33 and delivered 23 frames in that sample.
+- All five point sensors reported available, although bottom_mid_left returned
+  zero throughout and bottom_mid_right occasionally returned 8191. Zero, 8191
+  and all other values outside 200–3500 mm are shown raw but rejected by the
+  arena mapper.
+- The offline desktop suite passes all 28 tests.
+
+Newest desktop behavior:
+
+- Arena View uses encoder distance and fused BNO055 heading for local dead
+  reckoning. It does not claim absolute localisation.
+- Stationary encoder lock suppresses BNO yaw drift while both wheels are still.
+- Range spikes must repeat before becoming persistent map evidence.
+- Grey means unknown, green measured free, red obstacle endpoint, and purple a
+  repeated possible-weight candidate seen by a bottom sensor but not a paired
+  upper sensor.
+- Grid cells default to 10 mm. Sensor position, angle and top/bottom layer are
+  editable graphically and persist in local settings.
+- The raw panel below Arena View shows all point readings and all 64 matrix
+  zones before mapping filters.
+- All 64 matrix zones now contribute to a dense horizontal cone projection.
+  Because a floor plan has no vertical axis, the eight vertical samples in a
+  column are distributed inside that column's horizontal sector. Literal row/
+  column data remains visible in the raw table and dedicated 8x8 tab.
+- Dashboard arrow keys drive motor bank 2 only after Connect, Debug Mode, Run,
+  and explicit Keyboard Drive enable. The GUI sends compact drive heartbeats;
+  firmware stops the bank after 500 ms without a heartbeat.
+
+Resume procedure:
+
+1. Read this section, then sections 33–37.
+2. Start the GUI with
+   Non-Teensy-Files\BluetoothDebugGUI\run_gui.ps1.
+3. Restart any already-running GUI after code changes; an old process can both
+   hide changes and hold COM10 open.
+4. Connect to the CH9143 port at 115200. Confirm the protocol-error counter
+   remains zero before enabling motion.
+5. Raise the drive tracks clear before the first powered keyboard test.
+6. The latest raw-panel/cone changes are desktop-only and require no firmware
+   upload. Upload firmware only after changing PlatformIO sources/configuration.
+7. The next useful validation is a driven arena run: verify encoder direction,
+   map trail direction, turn behavior, 64-zone cone stability and the 500 ms
+   keyboard deadman. Record the run for offline comparison.
 
 ===============================================================================
 1. PURPOSE OF THIS FILE
@@ -1848,6 +1943,420 @@ Invalid zero/8191/out-of-range zones remain visible in raw data but cannot
 paint the arena. The expanded suite passes all 28 tests, including full
 64-zone projection, cone width, raw point display, raw matrix display, and the
 previous mapping and drive-safety checks.
+
+===============================================================================
+35. CURRENT BUILD, RUN, TEST AND RECOVERY COMMANDS
+===============================================================================
+
+Desktop setup, from the repository root in PowerShell:
+
+    py -3 .\setup_env.py
+
+The GUI also has its own setup helper:
+
+    cd Non-Teensy-Files\BluetoothDebugGUI
+    .\setup.ps1
+
+Run the desktop application:
+
+    cd Non-Teensy-Files\BluetoothDebugGUI
+    .\run_gui.ps1
+
+Run the complete offline GUI/mapping suite from the repository root:
+
+    $env:QT_QPA_PLATFORM='offscreen'
+    .\.venv\Scripts\python.exe -m unittest discover `
+      -s Non-Teensy-Files\BluetoothDebugGUI -p 'test_*.py' -v
+
+Build firmware:
+
+    cd PlatformIO
+    C:\Users\alex\.platformio\penv\Scripts\platformio.exe run
+
+Upload firmware with the Teensy programming USB attached:
+
+    C:\Users\alex\.platformio\penv\Scripts\platformio.exe run `
+      --target upload --upload-port COM12
+
+COM12 is only the most recently observed programming port. If the Teensy
+loader reports that no board was found, check Windows ports and the programming
+USB cable instead of trusting an old number. PlatformIO can also trigger the
+Teensy loader without a fixed port when the board enumerates normally.
+
+Read-only live diagnostics, from the repository root:
+
+    .\.venv\Scripts\python.exe `
+      Non-Teensy-Files\BluetoothDebugGUI\diagnose_live_connection.py COM10
+
+    .\.venv\Scripts\python.exe `
+      Non-Teensy-Files\BluetoothDebugGUI\diagnose_sensor_telemetry.py COM10 12000
+
+    .\.venv\Scripts\python.exe `
+      Non-Teensy-Files\BluetoothDebugGUI\diagnose_arena_live.py `
+      COM10 10000 tmp\arena_live.png
+
+Only one process can own COM10. Disconnect or close the GUI before running a
+diagnostic. If a Python process survives without a visible window, inspect it
+before starting another console; do not assume Bluetooth has failed merely
+because a second process cannot open the port.
+
+Persistent GUI state:
+
+- Favorites, Wiring Guide entries, sensor placement, sensor pointing angles,
+  height layers, encoder calibration, grid size, 8x8 mirroring and other view
+  options are stored using Qt settings on the Windows user account.
+- They do not live entirely in debug_config.json and do not automatically move
+  to another computer with the repository.
+- Firmware-visible commands, parameters and point-TOF ports do live in
+  PlatformIO/debug_config.json. The pre-build script validates and embeds that
+  file into PlatformIO/include/debug_config.generated.h.
+- Changing debug_config.json therefore requires a firmware rebuild/upload.
+- Changing only Python GUI code requires an application restart, not an upload.
+
+Safety/recovery rules:
+
+- STOP, leaving Debug Mode, disconnecting, closing the GUI, disabling keyboard
+  drive, or losing the application focus sends/stores safe motor outputs.
+- Keyboard motor bank 2 additionally has a 500 ms firmware deadman.
+- Always test direction with tracks/wheels clear of the ground.
+- HX12K and Herkulex mechanisms can jam mechanically; begin with small moves.
+- Arena View is diagnostic dead reckoning, not yet safe autonomous navigation.
+- IMU linear acceleration is shown but deliberately not double-integrated into
+  position because bias and vibration would cause rapid displacement drift.
+
+===============================================================================
+36. COMPLETE PROJECT FILE STRUCTURE AT HANDOFF
+===============================================================================
+
+This is the complete project-owned source, configuration, documentation,
+recording and supplied-reference tree at 2026-09-20. Directory internals for
+.git, Python virtual environments, PlatformIO build output and __pycache__ are
+excluded because they are generated machine state rather than project content.
+The disposable tmp tree is listed separately after the primary tree.
+
+group7robocup\
+|-- .gitignore
+|-- .vscode\
+|   |-- c_cpp_properties.json
+|   |-- extensions.json
+|   `-- launch.json
+|-- BLUETOOTH_SETUP.md
+|-- group7robocup.code-workspace
+|-- README.md
+|-- requirements.txt
+|-- setup_env.py
+|-- status.txt
+|-- Non-Teensy-Files\
+|   |-- ROBOT_DEBUG_TOOLKIT_GUIDE.md
+|   |-- BluetoothDebugGUI\
+|   |   |-- ArenaView.py
+|   |   |-- BluetoothSerial.py
+|   |   |-- communicationProtocol.md
+|   |   |-- DataRecorder.py
+|   |   |-- DebugGUI.py
+|   |   |-- WiringGuide.py
+|   |   |-- diagnose_arena_live.py
+|   |   |-- diagnose_live_connection.py
+|   |   |-- diagnose_reconnect_stress.py
+|   |   |-- diagnose_safe_commands.py
+|   |   |-- diagnose_sensor_telemetry.py
+|   |   |-- requirements.txt
+|   |   |-- run_gui.ps1
+|   |   |-- setup.ps1
+|   |   |-- smoke_test.py
+|   |   |-- test_arena_view.py
+|   |   `-- test_wiring_guide.py
+|   `-- DataVisualisationAfter\
+|       |-- DataAnalysisCLI.py
+|       |-- DataVisualiser.py
+|       |-- latest_analysis.md
+|       |-- ROBOT_DATA_WORKFLOW.md
+|       `-- Data\
+|           |-- RobotRun_2026-09-05_23-11-40.rdbg
+|           |-- RobotRun_2026-09-05_23-28-05.rdbg
+|           |-- RobotRun_2026-09-05_23-49-27.rdbg
+|           |-- RobotRun_2026-09-06_12-08-13.rdbg
+|           |-- RobotRun_2026-09-06_12-09-41.rdbg
+|           |-- RobotRun_2026-09-14_09-14-21.rdbg
+|           |-- RobotRun_2026-09-14_11-03-00.rdbg
+|           |-- RobotRun_2026-09-14_12-27-25.rdbg
+|           |-- RobotRun_2026-09-14_20-35-50.rdbg
+|           |-- RobotRun_2026-09-14_20-36-51.rdbg
+|           |-- RobotRun_2026-09-14_20-51-27.rdbg
+|           |-- RobotRun_2026-09-14_21-55-20.rdbg
+|           |-- Weight8x8.rdbg
+|           |-- Weight8x8.rdbg-shm
+|           |-- Weight8x8.rdbg-wal
+|           `-- WeightWallTubeWall.rdbg
+|-- PlatformIO\
+|   |-- .gitignore
+|   |-- .vscode\
+|   |   |-- c_cpp_properties.json
+|   |   |-- extensions.json
+|   |   `-- launch.json
+|   |-- ARENA_VIEW_SETUP.md
+|   |-- DEBUG_GUI_CONFIG.md
+|   |-- ENCODER_WIRING.md
+|   |-- HX12K_WIRING.md
+|   |-- TOF8X8_WIRING.md
+|   |-- debug_config.json
+|   |-- platformio.ini
+|   |-- include\
+|   |   |-- README
+|   |   |-- config.h
+|   |   `-- debug_config.generated.h
+|   |-- scripts\
+|   |   `-- embed_debug_config.py
+|   |-- src\
+|   |   `-- main.cpp
+|   |-- test\
+|   |   `-- README
+|   `-- lib\
+|       |-- README
+|       |-- BluetoothDebugWorkflow\
+|       |   |-- BluetoothDebugWorkflow.cpp
+|       |   `-- BluetoothDebugWorkflow.h
+|       |-- Bno055Imu\
+|       |   |-- Bno055Imu.cpp
+|       |   `-- Bno055Imu.h
+|       |-- DcMotor203\
+|       |   |-- DcMotor203.cpp
+|       |   `-- DcMotor203.h
+|       |-- DualEncoder\
+|       |   |-- DualEncoder.cpp
+|       |   `-- DualEncoder.h
+|       |-- HerkulexTeensy\
+|       |   |-- HerkulexTeensy.cpp
+|       |   |-- HerkulexTeensy.h
+|       |   `-- library.json
+|       |-- Hx12kServo\
+|       |   |-- Hx12kServo.cpp
+|       |   `-- Hx12kServo.h
+|       |-- Ir\
+|       |   |-- Ir.cpp
+|       |   `-- Ir.h
+|       |-- RobotDebug\
+|       |   |-- RobotDebug.cpp
+|       |   `-- RobotDebug.h
+|       |-- Tof\
+|       |   |-- Tof.cpp
+|       |   `-- Tof.h
+|       |-- Tof8x8\
+|       |   |-- Tof8x8.cpp
+|       |   `-- Tof8x8.h
+|       `-- DFRobot_MatrixLidar\
+|           |-- DFRobot_MatrixLidar.cpp
+|           |-- DFRobot_MatrixLidar.h
+|           |-- LICENCE
+|           |-- README.md
+|           |-- README_CN.md
+|           |-- keywords.txt
+|           |-- library.properties
+|           |-- examples\
+|           |   |-- I2C\
+|           |   |   |-- get4_4Data\get4_4Data.ino
+|           |   |   |-- get8_8Data\get8_8Data.ino
+|           |   |   `-- getFixedPoint\getFixedPoint.ino
+|           |   `-- UART\
+|           |       |-- get4_4Data\get4_4Data.ino
+|           |       |-- get8_8Data\get8_8Data.ino
+|           |       `-- getFixedPoint\getFixedPoint.ino
+|           `-- python\raspberry\
+|               |-- DFRobot_matrixLidar.py
+|               |-- README.md
+|               |-- README_CN.md
+|               `-- examples\
+|                   |-- get_all_data.py
+|                   `-- get_fixed_point.py
+`-- PROVIDED EXAMPLE CODE\
+    |-- 101_IMU\101_IMU.ino
+    |-- 102_Color\102_Color.ino
+    |-- 103_IR_XYPosition\103_IR_XYPosition.ino
+    |-- 104__105_TOF\
+    |   |-- ContinuousMultipleSensors1_L0\ContinuousMultipleSensors1_L0.ino
+    |   |-- ContinuousMultipleSensors1_L1\ContinuousMultipleSensors1_L1.ino
+    |   |-- ContinuousMultipleSensors1_L0_L1\ContinuousMultipleSensors1_L0_L1.ino
+    |   |-- ContinuousMultipleSensors2_L0\ContinuousMultipleSensors2_L0.ino
+    |   |-- ContinuousMultipleSensors2_L1\ContinuousMultipleSensors2_L1.ino
+    |   |-- ContinuousMultipleSensors4_L0_L1\ContinuousMultipleSensors4_L0_L1.ino
+    |   |-- ContinuousMultipleSensors8_L0\ContinuousMultipleSensors8_L0.ino
+    |   `-- ContinuousMultipleSensors8_L1\ContinuousMultipleSensors8.ino
+    |-- 106_TOF_SerialMini\106_TOF_SerialMini.ino
+    |-- 106_TOF_X8\
+    |   |-- 106_TOF_X8.ino
+    |   `-- DFRobot_MatrixLidar.zip
+    |-- 108_IR_Distance\108_IR_Distance.ino
+    |-- 110_UltrasoundDigital\110_UltrasoundDigital.ino
+    |-- 111_LoadCell\111_LoadCell.ino
+    |-- 112_Encoder\112_Encoder.ino
+    |-- 114_LimitSwitch\114_LimitSwitch.ino
+    |-- 118_RFIDX\RFIDExample.zip
+    |-- 122_OpticalFlow_Sensor\
+    |   |-- 122_OpticalFlow_Sensor.ino
+    |   `-- ReadMe.txt
+    |-- 201_SmartServo\
+    |   |-- 201_SmartServo.ino
+    |   |-- Blink\Blink.ino
+    |   |-- BusScanner\BusScanner.ino
+    |   `-- CoordinatedMove\CoordinatedMove.ino
+    |-- 202_StepperMotor\202_StepperMotor.ino
+    |-- 203_DCMotor\203_DCMotor.ino
+    |-- 204_Servo\ServoMove.ino
+    `-- 302_SmartLEDStrip\FastLEDCylon.ino
+
+Generated/local directories intentionally excluded from the primary tree:
+
+- .git\ — repository object database and worktree metadata.
+- .venv\ — root Python virtual environment.
+- Non-Teensy-Files\BluetoothDebugGUI\.venv\ — GUI-local Python environment.
+- PlatformIO\.pio\ — downloaded packages and firmware build products.
+- __pycache__\ directories — compiled Python bytecode.
+
+Disposable diagnostic/reference extraction tree currently present:
+
+tmp\
+|-- analyse_tof8x8.py
+|-- arena_live.png
+|-- arena_raw_cone.png
+|-- arena_wall.png
+|-- arena_wall_working.png
+|-- arena_wall_filtered.png
+|-- herkulex_gui_repro.py
+|-- herkulex_live_repro.py
+|-- herkulex_live_repro.log
+|-- pdfs\
+|   |-- page13.png
+|   |-- page31.png
+|   |-- page31-31.png
+|   |-- page31-i2cmotor.png
+|   |-- page42-42.png
+|   |-- page43-43.png
+|   |-- page49.png
+|   |-- page66-66.png
+|   |-- page66-board-detail.png
+|   |-- page66-levelshift-crop.png
+|   |-- page67-67.png
+|   `-- page68-68.png
+`-- provided_matrixlidar\DFRobot_MatrixLidar-master\
+    |-- DFRobot_MatrixLidar.cpp
+    |-- DFRobot_MatrixLidar.h
+    |-- LICENCE
+    |-- README.md
+    |-- README_CN.md
+    |-- keywords.txt
+    |-- library.properties
+    |-- examples\I2C\get4_4Data\get4_4Data.ino
+    |-- examples\I2C\get8_8Data\get8_8Data.ino
+    |-- examples\I2C\getFixedPoint\getFixedPoint.ino
+    |-- examples\UART\get4_4Data\get4_4Data.ino
+    |-- examples\UART\get8_8Data\get8_8Data.ino
+    |-- examples\UART\getFixedPoint\getFixedPoint.ino
+    |-- python\raspberry\DFRobot_matrixLidar.py
+    |-- python\raspberry\README.md
+    |-- python\raspberry\README_CN.md
+    |-- python\raspberry\examples\get_all_data.py
+    `-- python\raspberry\examples\get_fixed_point.py
+
+===============================================================================
+37. FILE RESPONSIBILITY AND DEPENDENCY GUIDE
+===============================================================================
+
+Firmware entry/configuration:
+
+- PlatformIO/src/main.cpp intentionally only constructs BluetoothDebugWorkflow,
+  calls begin() in setup(), and update() in loop(). Keep it uncluttered.
+- PlatformIO/include/config.h is the authoritative compile-time pin/UART/I2C
+  assignment file.
+- PlatformIO/debug_config.json is the human-edited list of GUI commands,
+  parameters and point-TOF definitions.
+- PlatformIO/scripts/embed_debug_config.py validates/compacts that JSON before
+  every build and writes PlatformIO/include/debug_config.generated.h.
+- PlatformIO/platformio.ini selects Teensy 4.0, dependencies and the pre-build
+  embedding step.
+
+Firmware orchestration/protocol:
+
+- BluetoothDebugWorkflow owns all devices, parses actions, enforces Debug/Run/
+  STOP rules, publishes telemetry, sends 8x8 frames and services the compact
+  keyboard-drive heartbeat.
+- RobotDebug provides newline-delimited JSON receive/send primitives.
+- Bluetooth serial uses a 2048-byte added receive buffer to prevent long JSON
+  commands being truncated while telemetry is transmitted.
+
+Firmware device libraries:
+
+- Bno055Imu probes Wire1 then Wire and publishes full fusion/diagnostic state.
+- DcMotor203 generates the 1.05–1.95 ms servo-style motor-driver pulses with
+  1.50 ms neutral and supports forward/reverse percentages.
+- DualEncoder wraps Encoder.h for two x4 quadrature channels and reports count,
+  delta and counts/second.
+- HerkulexTeensy implements packet protocol, angle read/write, zero-relative
+  behavior, torque control and continuous-velocity commands.
+- Hx12kServo outputs standard pulse control on level-shift pins A–D.
+- Tof manages VL53L0X/VL53L1X point sensors using SX1509-controlled XSHUT and
+  unique runtime addresses.
+- Tof8x8 wraps the supplied DFRobot MatrixLidar library, uses Wire1, scans the
+  supported addresses and returns complete row-major 64-zone frames.
+- DFRobot_MatrixLidar is the provided third-party SEN0628 driver copied into
+  the PlatformIO project together with its license/examples.
+- Ir exists for analogue IR presence sensing but is not the primary arena range
+  source; the fitted D15 conflict also prevents right IR while motor bank 2 is
+  connected there.
+
+Desktop live application:
+
+- DebugGUI.py constructs the main window, serial connection controls, dashboard,
+  plots, parameters, command cards, logs, raw serial, 8x8 views, favorites,
+  keyboard drive, recording, Wiring Guide and Arena View integration.
+- BluetoothSerial.py owns the threaded COM transport, newline JSON parsing,
+  Qt signals and port enumeration.
+- DataRecorder.py writes .rdbg SQLite recordings with metadata, telemetry,
+  events and commands.
+- WiringGuide.py provides the editable/persistent CPU-centric connection table
+  and diagram. Arena sensor names/ports are joined to these saved entries.
+- ArenaView.py contains encoder/IMU odometry, the evidence grid, sensor layout
+  editor, top/bottom comparison, raw TOF panel and 64-zone cone projection.
+- communicationProtocol.md documents the serial JSON formats.
+- run_gui.ps1 launches DebugGUI.py using the GUI-local environment; setup.ps1
+  creates that environment and installs requirements.
+
+Diagnostics/tests:
+
+- diagnose_live_connection.py checks whether bytes/frames arrive without
+  commanding actuators.
+- diagnose_sensor_telemetry.py summarizes live IMU, encoders, point TOFs and
+  matrix spans without motion commands.
+- diagnose_arena_live.py uses production GUI/model code headlessly and saves a
+  screenshot plus pose/cell summary.
+- diagnose_reconnect_stress.py exercises repeated connection handling.
+- diagnose_safe_commands.py is for explicit safe command-path checks; inspect
+  it before use whenever hardware can move.
+- smoke_test.py performs basic application/module checks.
+- test_arena_view.py covers mapping, calibration, stationary yaw lock, spike/
+  sentinel rejection, 64-zone cone, raw panel, sensor editing, connection state
+  and keyboard direction mapping.
+- test_wiring_guide.py covers tab creation, persistence and schema migration.
+
+Offline recordings/analysis:
+
+- DataVisualisationAfter/DataVisualiser.py is the graphical saved-run viewer.
+- DataVisualisationAfter/DataAnalysisCLI.py produces textual/statistical run
+  analysis suitable for repeatable diagnostics.
+- ROBOT_DATA_WORKFLOW.md explains capture and analysis.
+- latest_analysis.md contains the most recent written interpretation.
+- Data/ contains the SQLite .rdbg recordings. Weight8x8.rdbg-wal and -shm are
+  SQLite sidecar files and should stay with the database if it was not cleanly
+  closed.
+
+Documentation/reference priority:
+
+1. This status file, especially sections 0 and 33–37.
+2. Active source/configuration files.
+3. ARENA_VIEW_SETUP.md, DEBUG_GUI_CONFIG.md, ENCODER_WIRING.md,
+   HX12K_WIRING.md, TOF8X8_WIRING.md and BLUETOOTH_SETUP.md.
+4. Supplied example sketches for hardware-specific comparison.
+5. The generic repository README is still the original GitLab template and is
+   not an accurate technical handoff.
 
 ===============================================================================
 END OF STATUS
