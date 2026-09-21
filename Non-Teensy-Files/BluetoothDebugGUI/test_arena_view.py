@@ -62,6 +62,14 @@ class ArenaModelTests(unittest.TestCase):
         self.assertAlmostEqual(math.degrees(self.map.theta), 88, places=5)
         self.assertGreater(self.map.y, 99)
 
+    def test_sparse_turn_uses_exact_arc_integration(self):
+        self.feed(0, 0, 0, heading=0)
+        self.feed(200, 0, 0, heading=0)
+        self.feed(400, 100, 0, heading=90)
+        expected = 100.0 / math.pi
+        self.assertAlmostEqual(self.map.x, expected, places=4)
+        self.assertAlmostEqual(self.map.y, expected, places=4)
+
     def test_running_fusion_is_usable_when_system_calibration_is_zero(self):
         # The first encoder frame establishes the odometry baseline; the next
         # two establish and then change the absolute IMU heading.

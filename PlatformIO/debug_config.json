@@ -196,6 +196,19 @@
       "args": []
     },
     {
+      "name": "autonomous_navigation",
+      "label": "Autonomous navigation",
+      "category": "Navigation",
+      "description": "Finds a wall, follows it to a corner, then maps the arena in 300 mm parallel sweep lanes. Navigation uses the top TOFs and 8x8 forward view plus left/right ultrasound; bottom TOFs remain weight-sensing only.",
+      "action": "navigation_toggle",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "RUN NAVIGATION", "arguments": {"enabled": true}},
+        {"label": "STOP NAVIGATION", "arguments": {"enabled": false}}
+      ]
+    },
+    {
       "name": "set_hx12k_angles",
       "label": "Set HX12K servo angles",
       "category": "HX12K",

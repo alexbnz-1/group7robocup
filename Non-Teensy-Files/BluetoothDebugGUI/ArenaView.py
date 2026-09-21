@@ -31,7 +31,7 @@ def _number(value):
 
 
 class ArenaModel:
-    """Local-frame odometry and a bounded square occupancy-evidence map."""
+    """Local-frame odometry and an expanding occupancy-evidence map."""
 
     def __init__(self):
         self.mm_per_count = 0.0
@@ -299,9 +299,17 @@ class ArenaModel:
                 self.linear_speed_mm_s = (
                     left_rate * left_scale + right_rate * right_scale
                 ) * 0.5
-            mid = (previous_theta + self.theta) / 2
-            self.x += ds * math.cos(mid)
-            self.y += ds * math.sin(mid)
+            # Integrate the exact constant-curvature arc between telemetry
+            # frames. The old midpoint approximation badly displaced the map
+            # during turns when Bluetooth delivered sparse pose samples.
+            dtheta = self.theta - previous_theta
+            if abs(dtheta) < 1e-6:
+                self.x += ds * math.cos(self.theta)
+                self.y += ds * math.sin(self.theta)
+            else:
+                radius = ds / dtheta
+                self.x += radius * (math.sin(self.theta) - math.sin(previous_theta))
+                self.y -= radius * (math.cos(self.theta) - math.cos(previous_theta))
             if not self.trail or math.hypot(self.x - self.trail[-1][0], self.y - self.trail[-1][1]) >= 15:
                 self.trail.append((self.x, self.y))
 
@@ -477,26 +485,48 @@ class ArenaCanvas(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QColor("#151b25"))
-        width = self.owner.arena_width.value()
-        height = self.owner.arena_height.value()
-        local = width <= 0 or height <= 0
-        world_width = width if not local else 6000.0
-        world_height = height if not local else 6000.0
+
+        # The map has no assumed arena rectangle. Fit the view around the robot
+        # and accumulated evidence; detected obstacle cells eventually form the
+        # wall boundary themselves.
+        cell_size = self.model.cell_size_mm
+        xs = [self.model.x]
+        ys = [self.model.y]
+        if self.model.trail:
+            xs.extend(point[0] for point in self.model.trail)
+            ys.extend(point[1] for point in self.model.trail)
+        if self.model.cells:
+            xs.extend(column * cell_size for column, _row in self.model.cells)
+            ys.extend(row * cell_size for _column, row in self.model.cells)
+        for x0, y0, x1, y1, _source in self.model.current_rays:
+            xs.extend((x0, x1))
+            ys.extend((y0, y1))
+        padding = 350.0
+        min_x, max_x = min(xs) - padding, max(xs) + padding
+        min_y, max_y = min(ys) - padding, max(ys) + padding
+        if max_x - min_x < 1500.0:
+            extra = (1500.0 - (max_x - min_x)) * 0.5
+            min_x -= extra
+            max_x += extra
+        if max_y - min_y < 1500.0:
+            extra = (1500.0 - (max_y - min_y)) * 0.5
+            min_y -= extra
+            max_y += extra
+        world_width = max_x - min_x
+        world_height = max_y - min_y
         scale = self.zoom * min((self.width() - 60) / world_width,
                                 (self.height() - 60) / world_height)
         scale = max(scale, 0.01)
-        origin = QPointF(self.width() / 2, self.height() / 2) + self.pan
 
         def screen(x, y):
-            return QPointF(origin.x() + x * scale, origin.y() - y * scale)
+            return QPointF(30 + (x - min_x) * scale + self.pan.x(),
+                           self.height() - 30 - (y - min_y) * scale + self.pan.y())
 
-        bounds = QRectF(screen(-world_width / 2, world_height / 2),
-                        screen(world_width / 2, -world_height / 2)).normalized()
-        cell_size = self.model.cell_size_mm
-        col_min = math.floor(-world_width / 2 / cell_size)
-        col_max = math.ceil(world_width / 2 / cell_size)
-        row_min = math.floor(-world_height / 2 / cell_size)
-        row_max = math.ceil(world_height / 2 / cell_size)
+        bounds = QRectF(screen(min_x, max_y), screen(max_x, min_y)).normalized()
+        col_min = math.floor(min_x / cell_size)
+        col_max = math.ceil(max_x / cell_size)
+        row_min = math.floor(min_y / cell_size)
+        row_max = math.ceil(max_y / cell_size)
         cols = col_max - col_min
         rows = row_max - row_min
         p.setClipRect(bounds)
@@ -504,8 +534,8 @@ class ArenaCanvas(QWidget):
         if cols * rows <= 1_000_000:
             if self._grid_key != key:
                 self._grid_key = key
-                self._grid_image = QImage(cols, rows, QImage.Format.Format_RGB32)
-                self._grid_image.fill(QColor("#374151"))
+                self._grid_image = QImage(cols, rows, QImage.Format.Format_ARGB32)
+                self._grid_image.fill(QColor(0, 0, 0, 0))
                 self._painted = {}
             for cell, evidence in self.model.cells.items():
                 votes = self.model.weight_votes.get(cell, 0)
@@ -521,7 +551,6 @@ class ArenaCanvas(QWidget):
                                   screen(col_max * cell_size, row_min * cell_size)).normalized()
             p.drawImage(image_bounds, self._grid_image)
         else:
-            p.fillRect(bounds, QColor("#374151"))
             p.setPen(Qt.PenStyle.NoPen)
             for (column, row), evidence in self.model.cells.items():
                 colour = "#a855f7" if self.model.weight_votes.get((column, row), 0) >= 2 else (
@@ -530,22 +559,9 @@ class ArenaCanvas(QWidget):
                 x = column * cell_size
                 y = row * cell_size
                 p.drawRect(QRectF(screen(x, y + cell_size), screen(x + cell_size, y)).normalized())
-        if cell_size * scale >= 6:
-            p.setPen(QPen(QColor("#253041"), 0.5))
-            for col in range(col_min, col_max + 1):
-                x = col * cell_size
-                p.drawLine(screen(x, row_min * cell_size), screen(x, row_max * cell_size))
-            for row in range(row_min, row_max + 1):
-                y = row * cell_size
-                p.drawLine(screen(col_min * cell_size, y), screen(col_max * cell_size, y))
         p.setClipping(False)
-        p.setPen(QPen(QColor("#8093a7"), 2))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(bounds)
-
         p.setPen(QColor("#667489"))
-        p.drawText(20, 23, "LOCAL VIEW — arena outline not surveyed" if local
-                   else "ARENA OUTLINE — dimensions user supplied; pose origin is arbitrary")
+        p.drawText(20, 23, "DISCOVERED MAP — red sensor returns form the arena boundary")
 
         if len(self.model.trail) > 1:
             p.setPen(QPen(QColor("#60a5fa"), 2))
@@ -752,6 +768,13 @@ class ArenaView(QWidget):
 
         self.arena_width = spin("width", "Arena width", 2400, 50000)
         self.arena_height = spin("height", "Arena length", 4900, 50000)
+        # Retain these values for old recording compatibility, but they no
+        # longer constrain or draw the live discovered map.
+        for control in (self.arena_width, self.arena_height):
+            label = form.labelForField(control)
+            if label is not None:
+                label.hide()
+            control.hide()
         # Powered straight-run calibration. The first two consistent trials
         # covered 775 mm over 8522/8080 counts. A third trial was rejected as
         # an approximately 12% distance outlier.
@@ -809,7 +832,7 @@ class ArenaView(QWidget):
                       "Wheel over map to zoom; drag map to pan. In the robot diagram, drag a sensor to place it and drag its white arrow tip to aim it. "
                       "Cyan circles are top point TOFs; orange squares are bottom point TOFs; yellow diamonds are ultrasound. "
                       "All sensor markers can be dragged to place them and their arrow tips can be dragged to aim them. "
-                      "Arena: 2400 × 4900 mm, 400 mm walls (top-down outline only). "
+                      "No arena outline is assumed; detected red wall cells build the boundary. "
                       "Initial wheel scale assumes ~80 mm diameter, 663 PPR and 4× decoding; verify with a measured push. "
                       "Blue is the robot trail. Free/obstacle colours are sensor evidence, not confirmed walls. "
                       "Set wheel scale and directions before trusting the history. "

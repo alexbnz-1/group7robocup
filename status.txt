@@ -2737,3 +2737,209 @@ Both replacement Python files pass `python -m py_compile`. The full Qt runtime
 test suite could not be executed in the handoff environment because PyQt6 is
 not installed there, so the existing project test suite should still be run in
 the project's normal GUI virtual environment after replacement.
+
+===============================================================================
+46. AUTONOMOUS NAVIGATION CONTROLLER
+===============================================================================
+
+The desktop additions from commit 0a71ee7 were reviewed in the project virtual
+environment. The complete 33-test Qt/offline suite passes, including the Arena
+View mapping, graphical sensor layout, wiring persistence, Bluetooth status,
+keyboard drive and ultrasound configuration tests.
+
+An `autonomous_navigation` command is declared in debug_config.json. It appears
+as one Navigation command card containing RUN NAVIGATION and STOP NAVIGATION.
+It requires Debug Mode. Starting navigation also enters the run state, while
+its STOP button neutralises motor bank 2 without disabling unrelated actuators.
+STOP ROBOT and leaving Debug Mode cancel navigation and neutralise the drive.
+
+Navigation runs on the Teensy rather than depending on continuous desktop
+commands. It fuses valid 100-3500 mm point-TOF readings, both ultrasound
+channels, the middle four SEN0628 columns for forward clearance, and the left
+and right matrix halves for turn selection. Equal negative motor-bank-2 values
+drive forward. Because this high-geared drivetrain does not move reliably below
+75 percent, the controller uses -80 percent in clear space, -75 percent below
+650 mm, and 75 percent opposing wheel commands for an in-place turn below
+350 mm. A turn is latched for 650 ms to prevent rapid oscillation and chooses
+the side with more measured clearance.
+
+The controller stops at neutral if Debug Mode/run state is lost, no usable
+forward range exists, or point-TOF acquisition is over one second old. Keyboard
+drive and manual 203 motor commands cancel navigation before taking control.
+Telemetry exposes `navigation.active`, numeric `navigation.state` (0 stopped,
+1 forward, 2 left, 3 right, 4 waiting), and fused front/left/right clearance.
+
+The first physical run produced a permanent clockwise avoidance circle. The
+cause was the original fusion rule taking the single minimum measurement from
+all 64 matrix zones and accepting readings down to 100 mm. A chassis/ground
+self-return or one noisy near pixel could therefore hold the avoidance branch
+forever. Navigation now rejects sub-200 mm values consistently with the GUI's
+established raw-v2 filtering. It uses the lower quartile of the valid central,
+left and right 8x8 zones instead of a single closest pixel, retaining sensitivity
+to a real plate or wall while rejecting isolated outliers.
+
+main.cpp remains unchanged and only calls BluetoothDebugWorkflow. Embedded JSON
+generation and the Teensy build succeed. The build uses 130936 bytes of flash
+code and 32480 bytes of RAM1 variables. The full desktop suite passes 33 tests.
+
+===============================================================================
+47. CURRENT NAVIGATION BEHAVIOUR AND COMPLETE RUN REPLAY
+===============================================================================
+
+The first high-speed navigation tests exposed that 500 ms point-sensor updates
+and a 350 mm avoidance threshold did not leave enough stopping distance at the
+required 75 percent minimum drive. Range polling is now independent of the
+telemetry rate and runs every 100 ms. Encoder and BNO055 samples run every 50
+ms. Navigation decisions execute before normal telemetry transmission so large
+Bluetooth JSON frames cannot delay a motor safety response. Avoidance begins at
+900 mm and the robot uses 75 percent from 900-1300 mm or 80 percent in clearer
+space.
+
+Avoidance turns are clearance-driven rather than blindly timed. The earlier
+900 mm forward envelope caused the robot to treat most of the arena as blocked
+and spin continuously. Forward avoidance now begins at 300 mm and clears at
+350 mm. All six point TOFs are physically aimed into the forward field at their
+fitted angles and therefore contribute to forward clearance along with the
+SEN0628 central region. Ultrasound A faces robot-left and ultrasound B faces
+robot-right; only those ultrasound channels supply side clearance. Side
+avoidance begins at 200 mm and clears at 250 mm. Once a turn has run for at
+least 350 ms, forward motion resumes when both the front and sides meet their
+clear thresholds. If no usable forward range is available, the robot keeps
+turning to search for clearance instead of stopping.
+
+Automatic navigation shutdowns based on missing range data, IMU availability,
+encoder direction or motion disagreement have been removed. Autonomous motion
+is neutralised only by an explicit STOP command, leaving Debug Mode, entering
+the global stopped state, or another manual drive command taking ownership.
+Encoders and BNO055 heading are still checked against the commanded motion and
+published as `navigation.motion_consistent`; this is diagnostic telemetry only
+and never stops the motors. Existing encoder rates, full IMU state, fused
+clearances, motor commands and navigation state are all recorded for diagnosis.
+
+Recording schema version 4 adds a structured `matrix_frames` table containing
+every full SEN0628 frame and a `ui_snapshots` table containing a once-per-second
+snapshot of the active tab, all telemetry, parameters, robot state, latest
+matrix, selected 8x8 view, favourites, commands, wiring guide and sensor
+geometry. Recording metadata embeds debug_config.json, the CPU wiring guide and
+initial arena sensor layout. Continuous raw serial, telemetry, commands,
+parameter changes, logs, state packets, annotations and faults remain intact.
+
+DataVisualiser has a Run Replay workspace with one synchronized timeline,
+play/pause, 0.25x-5x speed and Go to End controls. Nested views reproduce
+Dashboard, 8x8 TOF, Arena View, Plots, Parameters, Commands, Wiring Guide, Logs
+and Raw Serial over time. A separate End View reconstructs and freezes the final
+arena map. Version 3 recordings remain supported, including best-effort 8x8
+recovery from raw serial, but cannot reconstruct data absent from that format.
+
+This section supersedes the original stop conditions and thresholds documented
+in section 46. The firmware builds successfully with 130392 bytes of flash code
+and 32512 bytes of RAM1 variables. Python syntax checks pass. The expanded
+offline suite passes 36 tests, including matrix/snapshot persistence, temporary
+recording replay, all requested replay tabs, and the current non-stopping
+navigation behaviour.
+
+===============================================================================
+48. WALL-FOLLOWING ARENA COVERAGE PROGRAM
+===============================================================================
+
+The recording `FirstProperRun.rdbg` was analysed after the reactive controller
+again produced continuous turning. Over the 76.3 second run, navigation state
+3 was the median and final state. Motor bank 2 remained near A=-75 and B=+75.
+Encoder 1 reached -91573 counts while encoder 2 reached only -760 counts, which
+confirms that the run was dominated by a one-sided pivot/circle rather than
+forward travel. The fused forward range had a median of only 147.5 mm.
+
+The source of that permanently short range was the lower point-sensor group.
+`bottom_left_left` stayed between 110 and 245 mm with a 150 mm median, while
+`bottom_mid_left` frequently read around 200 mm or returned its 8191 out-of-
+range sentinel. These sensors can see one another or nearby robot structure.
+They are intended to distinguish low weights from walls and are no longer used
+by autonomous navigation. They remain initialised, telemetered, recorded and
+available to Arena View's top/bottom weight processing.
+
+Forward navigation now uses only `top_mid_left`, `top_mid_right`, and the
+central four columns of the SEN0628. It takes the median of those independent
+forward estimates, so one isolated short return cannot trap the robot in an
+avoidance turn. A broad wall still affects the majority. Forward wall distance
+is 300 mm. Ultrasound A is exclusively the robot-left range and ultrasound B is
+exclusively the robot-right range, with 200 mm side clearance.
+
+The former reactive obstacle wanderer has been replaced by a deterministic
+coverage state machine:
+
+1. `seek_wall`: hold the starting BNO055 heading and drive straight until the
+   robust forward range reaches 300 mm.
+2. `initial_turn`: make a BNO055-measured 90 degree right turn.
+3. `follow_wall`: follow the wall on the left using ultrasound A, targeting
+   250 mm, until the forward sensors identify the corner.
+4. `corner_turn`: make another 90 degree right turn into the first long sweep.
+5. `sweep`: hold heading and traverse the arena until the opposite wall.
+6. `lane_turn_out`, `lane_shift`, `lane_turn_in`: alternate right and left
+   U-turns, using the calibrated encoders to shift 300 mm into the next lane.
+7. After eight parallel lanes (covering the supplied 2400 mm arena width), enter
+   `complete` and command neutral motor pulses.
+
+Straight sections use 80 percent drive and small 75/80 differential corrections
+to hold IMU heading while respecting the drivetrain's measured 75 percent
+minimum. Right/left turns use opposing 80 percent commands and finish within
+seven degrees of the target heading. Side readings below 200 mm cause a forward
+steering correction during a sweep rather than restarting a permanent turn.
+
+Telemetry now records `navigation.phase`, `navigation.lane`, and
+`navigation.target_heading_deg` as well as the numeric state, fused ranges and
+motion-consistency diagnostic. The updated debug command description explains
+the coverage routine and the generated embedded configuration is rebuilt from
+the JSON automatically.
+
+The Teensy firmware builds successfully. It uses 130520 bytes of flash code and
+32512 bytes of RAM1 variables.
+
+===============================================================================
+49. ORTHOGONAL SWEEPS AND DISCOVERED-BOUNDARY MAP
+===============================================================================
+
+The subsequent recording `New run.rdbg` lasts 145.2 seconds. Navigation starts
+at 18.9 seconds, reaches the first wall at 23.6 seconds, follows it to the corner
+at 37.1 seconds, begins the first sweep at 39.6 seconds, and reaches lane 6 before
+the manual STOP at 142.7 seconds. The basic wall/corner/lane sequence therefore
+runs, but two independent problems were visible.
+
+First, every 90 degree target was previously calculated from the measured IMU
+heading at the end of the preceding leg. The seven-degree completion tolerance
+was consequently inherited by the next leg, allowing a few degrees of error to
+accumulate at every U-turn. Turns are now calculated from the exact commanded
+heading of the previous leg. Forward legs also retain that exact target rather
+than adopting the measured completion heading. All headings therefore remain
+on the four-direction lattice established when navigation starts, with no
+lane-to-lane accumulation.
+
+Second, the recording has regular telemetry through 19.4 seconds and then a
+34-second gap during autonomous motion, followed by widely spaced samples. The
+normal telemetry JSON had grown close to the former 3072-byte transmit limit,
+and the full-rate ultrasound electrical diagnostic packet plus 8x8 frames left
+little capacity on the 115200-baud link. RobotDebug now provides a 4096-byte
+transmit buffer. Motion, pose, navigation, IMU, encoder, range and matrix data
+retain their normal rates; only low-level ultrasound electrical diagnostics are
+reduced to one packet per second. This prevents long pose-history holes while
+still recording those diagnostics.
+
+Arena View no longer draws or clips to the supplied 2400 by 4900 mm rectangle.
+The old width/length controls remain internally for recording compatibility but
+are hidden and have no rendering effect. The canvas begins as an unbounded dark
+local frame, automatically fits around the robot, trail, current rays and known
+cells, and expands as observations accumulate. Only measured green free cells,
+red occupied cells and purple weight candidates are painted. Detected red wall
+cells therefore form the arena boundary naturally; there is no artificial
+outline or filled unknown rectangle. The same rendering is used by live Arena
+View, recording replay and End View.
+
+Map odometry now uses exact constant-curvature arc integration between pose
+samples instead of a midpoint approximation. This materially improves turns
+when Bluetooth samples are sparse or the drivetrain pivots around one wheel.
+An offline regression test covers a 90-degree sparse-sample arc.
+
+The updated Teensy firmware builds successfully with 130904 bytes of flash code
+and 33536 bytes of RAM1 variables. The complete offline suite passes all 38
+tests, including exact sparse-turn integration, absence of a fixed arena
+outline, orthogonal navigation targets, recording replay, sensor mapping and
+wiring persistence.

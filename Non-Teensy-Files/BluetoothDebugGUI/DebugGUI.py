@@ -383,6 +383,8 @@ class RobotDebugGUI(QMainWindow):
         # Recording metadata / parameter snapshot support.
         self.parameter_definitions = {}
         self.parameter_values = {}
+        self.local_config = {}
+        self.last_ui_snapshot_second = -1
 
         # Link-health counters.
         self.raw_line_times = deque(maxlen=5000)
@@ -450,6 +452,7 @@ class RobotDebugGUI(QMainWindow):
                 f"Could not load local debug controls: {error}",
             )
             return
+        self.local_config = config
 
         for parameter in config.get("parameters", []):
             if isinstance(parameter, dict):
@@ -562,6 +565,14 @@ class RobotDebugGUI(QMainWindow):
         session_metadata = {
             "test_name": self.test_name_edit.text().strip(),
             "test_notes": self.test_notes_edit.text().strip(),
+            "debug_config_json": json.dumps(self.local_config, separators=(",", ":")),
+            "wiring_guide_json": json.dumps(self.wiring_guide.entries, separators=(",", ":")),
+            "arena_layout_json": json.dumps({
+                "point": self.arena_view.model.sensor_specs,
+                "ultrasound": self.arena_view.model.ultrasound_specs,
+                "matrix": self.arena_view.model.matrix_spec,
+            }, separators=(",", ":")),
+            "arena_settings_json": json.dumps(self._arena_recording_settings(), separators=(",", ":")),
             **self.git_metadata(),
         }
 
@@ -586,6 +597,8 @@ class RobotDebugGUI(QMainWindow):
             except Exception:
                 pass
         self.recorder.record_parameter_snapshot(snapshot)
+        self.last_ui_snapshot_second = -1
+        self._record_ui_snapshot()
 
         self.record_button.setText(
             "Stop Recording"
@@ -655,6 +668,10 @@ class RobotDebugGUI(QMainWindow):
             self.recorder.elapsed
         )
 
+        if seconds != self.last_ui_snapshot_second:
+            self.last_ui_snapshot_second = seconds
+            self._record_ui_snapshot()
+
         hours, remainder = divmod(
             seconds,
             3600,
@@ -670,6 +687,44 @@ class RobotDebugGUI(QMainWindow):
             f"{minutes:02d}:"
             f"{seconds:02d}"
         )
+
+    def _record_ui_snapshot(self):
+        if not self.recorder.is_recording:
+            return
+        self.recorder.record_ui_snapshot({
+            "active_tab": self.tabs.tabText(self.tabs.currentIndex()),
+            "telemetry": dict(self.telemetry),
+            "parameters": dict(self.parameter_values),
+            "robot_state": {
+                "debug_mode": self.robot_debug_mode,
+                "stopped": self.robot_stopped,
+            },
+            "tof8x8": dict(getattr(self, "tof8x8_latest_message", {}) or {}),
+            "tof8x8_view": self.tof8x8_view_mode.currentText(),
+            "favourite_commands": sorted(self.favourite_commands),
+            "active_commands": sorted(self.command_definitions),
+            "wiring_guide": list(self.wiring_guide.entries),
+            "arena_layout": {
+                "point": self.arena_view.model.sensor_specs,
+                "ultrasound": self.arena_view.model.ultrasound_specs,
+                "matrix": self.arena_view.model.matrix_spec,
+            },
+            "arena_settings": self._arena_recording_settings(),
+        })
+
+    def _arena_recording_settings(self):
+        view = self.arena_view
+        return {
+            "width": view.arena_width.value(),
+            "height": view.arena_height.value(),
+            "encoder_1_mm_per_count": view.encoder_1_scale.value(),
+            "encoder_2_mm_per_count": view.encoder_2_scale.value(),
+            "track_width_mm": view.track_width.value(),
+            "cell_size_mm": view.grid_size.value(),
+            "weight_gap_mm": view.weight_gap.value(),
+            "matrix_fov_deg": view.matrix_fov.value(),
+            "matrix_mirrored": view.model.matrix_mirrored,
+        }
 
     def log_fault(self):
         """
@@ -1349,6 +1404,7 @@ class RobotDebugGUI(QMainWindow):
         self.tabs.addTab(page, "8x8 TOF")
 
     def on_tof8x8_frame(self, message: dict):
+        self.recorder.record_matrix(message)
         self.arena_view.receive_matrix(message)
         self.tof8x8_latest_message = message
         bus_name = str(message.get("bus", "I2C"))

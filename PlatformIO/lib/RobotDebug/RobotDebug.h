@@ -17,9 +17,10 @@ public:
     void send(JsonDocument& message);
 
 private:
-    // Includes the combined encoder, TOF, motor and IMU telemetry frame.
-    // Leave headroom so a valid JSON line is never silently dropped at 2 KB.
-    static constexpr size_t TX_BUFFER_SIZE = 3072;
+    // Includes the combined encoder, TOF, motor, navigation and IMU frame.
+    // Normal telemetry now includes navigation phase/heading and can exceed
+    // the former 3072-byte allocation once encoder counts gain more digits.
+    static constexpr size_t TX_BUFFER_SIZE = 4096;
     static constexpr size_t TX_CHUNK_SIZE = 20;
     Stream& stream_;
     MessageHandler handler_;

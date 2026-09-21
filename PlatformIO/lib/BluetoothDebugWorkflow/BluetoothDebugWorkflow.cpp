@@ -80,6 +80,9 @@ void BluetoothDebugWorkflow::update()
     }
     updateAutomaticServoRead();
     updateTof8x8();
+    updateMotionAndRangeSensors();
+    // Make the safety decision before potentially lengthy JSON transmission.
+    updateNavigation();
     sendTelemetry();
     // Start/sample echo after the potentially slower I2C/telemetry work so a
     // fresh trigger cannot be hidden inside those operations.
@@ -175,6 +178,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         debugMode_ = message["enabled"] | false;
         if (!debugMode_)
         {
+            stopNavigation();
             stopped_ = true;
             servos_.torqueOff(0xFE);
             dcMotor203_.stop();
@@ -213,6 +217,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
     }
     else if (strcmp(action, "stop") == 0)
     {
+        stopNavigation();
         servos_.torqueOff(0xFE);
         continuousVelocityActive_ = false;
         commandedVelocity_ = 0;
@@ -420,6 +425,9 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             return;
         }
 
+        if (navigationActive_)
+            stopNavigation("Navigation stopped by manual motor command");
+
         const int channelA = message["channel_a_percent"] | 0;
         const int channelB = message["channel_b_percent"] | 0;
         if (channelA < -100 || channelA > 100 || channelB < -100 || channelB > 100)
@@ -447,6 +455,9 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             return;
         }
 
+        if (navigationActive_)
+            stopNavigation("Navigation stopped by manual motor command");
+
         const int channelA = message["channel_a_percent"] | 0;
         const int channelB = message["channel_b_percent"] | 0;
         if (channelA < -100 || channelA > 100 || channelB < -100 || channelB > 100)
@@ -467,10 +478,41 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
     }
     else if (strcmp(action, "dc_motor_203_second_stop") == 0)
     {
+        stopNavigation();
         dcMotor203Second_.stop();
         dcMotor203SecondActive_ = false;
         dcMotor203SecondDeadman_ = false;
         link_.log("INFO", "Second 203 DC motor stopped at neutral pulse");
+    }
+    else if (strcmp(action, "navigation_toggle") == 0)
+    {
+        if (!message["enabled"].is<bool>())
+        {
+            link_.error("Navigation command requires enabled=true or false");
+            return;
+        }
+        if (!message["enabled"].as<bool>())
+        {
+            stopNavigation("Autonomous navigation stopped");
+            return;
+        }
+        if (!debugMode_)
+        {
+            link_.error("Autonomous navigation requires Debug Mode");
+            return;
+        }
+        navigationActive_ = true;
+        navigationState_ = NAV_SEEK_WALL;
+        navigationMotionStartedMs_ = millis();
+        navigationHeadingReferenceDeg_ = imu_.headingDeg();
+        navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
+        navigationLaneIndex_ = 0;
+        navigationSweepTurnRight_ = true;
+        navigationMotionConsistent_ = true;
+        stopped_ = false;
+        dcMotor203SecondDeadman_ = false;
+        sendState();
+        link_.log("WARNING", "Autonomous navigation started");
     }
     else if (strcmp(action, "encoder_zero") == 0)
     {
@@ -530,6 +572,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             link_.error("Robot is stopped; press Run Robot before moving bumper servos");
             return;
         }
+        if (navigationActive_)
+            stopNavigation("Navigation stopped by manual drive");
         if (!message["enabled"].is<bool>())
         {
             link_.error("Bumper servo command requires enabled=true or false");
@@ -699,10 +743,6 @@ void BluetoothDebugWorkflow::sendTelemetry()
         return;
     lastTelemetryMs_ = now;
 
-    readTofSensors();
-    encoders_.sample(now);
-    const bool imuSampleValid = imu_.update();
-
     JsonDocument message;
     message["type"] = "telemetry";
     message["time"] = now;
@@ -729,6 +769,29 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["dc_motor_203_second.channel_b_percent"] = dcMotor203Second_.channelBPercent();
     data["dc_motor_203_second.channel_a_pulse_us"] = dcMotor203Second_.channelAPulseUs();
     data["dc_motor_203_second.channel_b_pulse_us"] = dcMotor203Second_.channelBPulseUs();
+    data["navigation.active"] = navigationActive_;
+    data["navigation.state"] = navigationState_;
+    data["navigation.front_mm"] = navigationFrontMm_;
+    data["navigation.left_mm"] = navigationLeftMm_;
+    data["navigation.right_mm"] = navigationRightMm_;
+    const char* navigationPhase = "idle";
+    switch (navigationState_)
+    {
+        case NAV_SEEK_WALL: navigationPhase = "seek_wall"; break;
+        case NAV_INITIAL_TURN: navigationPhase = "initial_turn"; break;
+        case NAV_FOLLOW_WALL: navigationPhase = "follow_wall"; break;
+        case NAV_CORNER_TURN: navigationPhase = "corner_turn"; break;
+        case NAV_SWEEP: navigationPhase = "sweep"; break;
+        case NAV_LANE_TURN_OUT: navigationPhase = "lane_turn_out"; break;
+        case NAV_LANE_SHIFT: navigationPhase = "lane_shift"; break;
+        case NAV_LANE_TURN_IN: navigationPhase = "lane_turn_in"; break;
+        case NAV_COMPLETE: navigationPhase = "complete"; break;
+        default: break;
+    }
+    data["navigation.phase"] = navigationPhase;
+    data["navigation.lane"] = navigationLaneIndex_;
+    data["navigation.target_heading_deg"] = navigationTargetHeadingDeg_;
+    data["navigation.motion_consistent"] = navigationMotionConsistent_;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
     data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
@@ -761,7 +824,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         }
     }
     data["imu.available"] = imu_.available();
-    data["imu.valid"] = imuSampleValid;
+    data["imu.valid"] = lastImuSampleValid_;
     if (imu_.available()) {
         data["imu.bus"] = imu_.bus();
         data["imu.address"] = imu_.address();
@@ -776,7 +839,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         data["imu.fusion_running"] = imu_.fusionRunning();
         data["imu.self_test_result"] = imu_.selfTestResult();
         data["imu.self_test_passed"] = imu_.selfTestPassed();
-        if (imuSampleValid) {
+        if (lastImuSampleValid_) {
             data["imu.heading_deg"] = imu_.headingDeg();
             data["imu.roll_deg"] = imu_.rollDeg();
             data["imu.pitch_deg"] = imu_.pitchDeg();
@@ -822,9 +885,12 @@ void BluetoothDebugWorkflow::sendTelemetry()
         data["servo.position_error_deg"] = servoPositionErrorDeg_;
     link_.send(message);
 
-    // Keep electrical diagnostics in a second packet.  Combining these long
-    // signal names with the normal robot telemetry exceeds RobotDebug's JSON
-    // transmit buffer and causes the entire frame to be discarded.
+    // Keep electrical diagnostics in a second, slower packet. These raw pin
+    // values change far less often than motion state and sending them at the
+    // full telemetry rate needlessly saturates the 115200-baud radio link.
+    if (now - lastElectricalDiagnosticsMs_ < 1000U)
+        return;
+    lastElectricalDiagnosticsMs_ = now;
     JsonDocument diagnosticMessage;
     diagnosticMessage["type"] = "telemetry";
     diagnosticMessage["time"] = now;
@@ -1040,6 +1106,335 @@ void BluetoothDebugWorkflow::readTofSensors()
 
         tofDistanceMm_[i] = Tof::read(i);
         tofTimedOut_[i] = Tof::timedOut(i);
+    }
+}
+
+void BluetoothDebugWorkflow::updateMotionAndRangeSensors()
+{
+    const uint32_t now = millis();
+    if (now - lastMotionSampleMs_ >= 50U)
+    {
+        lastMotionSampleMs_ = now;
+        encoders_.sample(now);
+        lastImuSampleValid_ = imu_.update();
+    }
+    if (now - lastRangePollMs_ >= 100U)
+    {
+        lastRangePollMs_ = now;
+        readTofSensors();
+    }
+}
+
+void BluetoothDebugWorkflow::stopNavigation(const char* reason)
+{
+    navigationActive_ = false;
+    navigationState_ = NAV_IDLE;
+    dcMotor203Second_.stop();
+    dcMotor203SecondActive_ = false;
+    dcMotor203SecondDeadman_ = false;
+    if (reason != nullptr)
+        link_.log("INFO", reason);
+}
+
+void BluetoothDebugWorkflow::updateNavigation()
+{
+    if (!navigationActive_)
+        return;
+    const uint32_t now = millis();
+    if (!debugMode_ || stopped_)
+    {
+        stopNavigation();
+        return;
+    }
+
+    constexpr uint16_t FRONT_AVOID_MM = 300;
+    constexpr uint16_t SIDE_AVOID_MM = 200;
+    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 250;
+    constexpr float LANE_SPACING_MM = 300.0f;
+    constexpr uint8_t SWEEP_LANE_COUNT = 8;
+    constexpr float ENCODER_1_MM_PER_COUNT = 0.09094f;
+    constexpr float ENCODER_2_MM_PER_COUNT = 0.09592f;
+
+    uint16_t front = 0xFFFF, left = 0xFFFF, right = 0xFFFF;
+    auto includeMinimum = [](uint16_t& target, int value) {
+        if (value >= 30 && value <= 3500)
+            target = min(target, static_cast<uint16_t>(value));
+    };
+
+    // Navigation deliberately ignores every bottom point TOF. Those sensors
+    // can see one another/chassis hardware and are reserved for weight sensing
+    // and mapping. Only the two top point TOFs feed forward navigation.
+    uint16_t frontCandidates[MAX_TOF_SENSORS + 1] = {};
+    uint8_t frontCandidateCount = 0;
+    for (uint8_t i = 0; i < tofSensorCount_; ++i)
+    {
+        if (!tofAvailable_[i] || tofTimedOut_[i])
+            continue;
+        if (strncmp(tofSensorNames_[i], "top_", 4) != 0)
+            continue;
+        const int value = tofDistanceMm_[i];
+        if (value >= 30 && value <= 3500)
+            frontCandidates[frontCandidateCount++] = static_cast<uint16_t>(value);
+    }
+    for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
+    {
+        if (!ultrasoundSensors_[i].valid() || ultrasoundSensors_[i].timedOut())
+            continue;
+        // Ultrasound A faces robot-left and B faces robot-right.
+        if (i == 0) includeMinimum(left, ultrasoundSensors_[i].distanceMm());
+        else includeMinimum(right, ultrasoundSensors_[i].distanceMm());
+    }
+    if (tof8x8_.available() && tof8x8_.lastReadSucceeded())
+    {
+        uint16_t centreValues[32];
+        uint8_t centreCount = 0;
+        for (uint8_t row = 0; row < 8; ++row)
+            for (uint8_t col = 0; col < 8; ++col)
+            {
+                const uint16_t value = tof8x8_.distanceMm(row, col);
+                // Preserve the established 8x8 rejection of chassis/noise
+                // returns below 200 mm. The side-facing ultrasound channels
+                // provide the separate 200 mm side clearance.
+                if (value < 200 || value > 3500)
+                    continue;
+                if (col >= 2 && col <= 5) centreValues[centreCount++] = value;
+            }
+        auto lowerQuartile = [](uint16_t* values, uint8_t count) -> uint16_t {
+            if (count == 0) return 0xFFFF;
+            for (uint8_t i = 1; i < count; ++i)
+            {
+                const uint16_t value = values[i];
+                uint8_t j = i;
+                while (j > 0 && values[j - 1] > value)
+                {
+                    values[j] = values[j - 1];
+                    --j;
+                }
+                values[j] = value;
+            }
+            return values[(count - 1) / 4];
+        };
+        const uint16_t matrixForward = lowerQuartile(centreValues, centreCount);
+        if (matrixForward != 0xFFFF)
+            frontCandidates[frontCandidateCount++] = matrixForward;
+    }
+
+    // A median across the top-left, top-right and matrix forward estimates
+    // rejects one isolated short return without hiding a broad wall.
+    for (uint8_t i = 1; i < frontCandidateCount; ++i)
+    {
+        const uint16_t value = frontCandidates[i];
+        uint8_t j = i;
+        while (j > 0 && frontCandidates[j - 1] > value)
+        {
+            frontCandidates[j] = frontCandidates[j - 1];
+            --j;
+        }
+        frontCandidates[j] = value;
+    }
+    if (frontCandidateCount > 0)
+        front = frontCandidates[frontCandidateCount / 2];
+
+    navigationFrontMm_ = front == 0xFFFF ? 0 : front;
+    navigationLeftMm_ = left == 0xFFFF ? 0 : left;
+    navigationRightMm_ = right == 0xFFFF ? 0 : right;
+    const bool frontBlocked = front != 0xFFFF && front < FRONT_AVOID_MM;
+    const bool leftBlocked = left != 0xFFFF && left < SIDE_AVOID_MM;
+    const bool rightBlocked = right != 0xFFFF && right < SIDE_AVOID_MM;
+
+    auto normaliseHeading = [](float heading) {
+        while (heading >= 360.0f) heading -= 360.0f;
+        while (heading < 0.0f) heading += 360.0f;
+        return heading;
+    };
+    auto headingDelta = [](float from, float to) {
+        float delta = to - from;
+        while (delta > 180.0f) delta -= 360.0f;
+        while (delta < -180.0f) delta += 360.0f;
+        return delta;
+    };
+
+    auto setDrive = [&](int16_t channelA, int16_t channelB) {
+        dcMotor203Second_.setPercent(channelA, channelB);
+        dcMotor203SecondActive_ = channelA != 0 || channelB != 0;
+        dcMotor203SecondDeadman_ = false;
+    };
+    auto beginRightAngleTurn = [&](bool rightTurn, NavigationState state) {
+        // Always turn from the exact heading of the current leg, not from the
+        // slightly imperfect measured heading at the transition. Otherwise a
+        // few degrees of turn tolerance accumulate on every sweep lane.
+        navigationTargetHeadingDeg_ = normaliseHeading(
+            navigationHeadingReferenceDeg_ + (rightTurn ? 90.0f : -90.0f));
+        navigationState_ = state;
+        navigationMotionStartedMs_ = now;
+        navigationMotionConsistent_ = true;
+    };
+    auto runHeadingTurn = [&]() {
+        const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
+        if (lastImuSampleValid_ && fabsf(error) <= 7.0f &&
+            now - navigationMotionStartedMs_ >= 350U)
+        {
+            setDrive(0, 0);
+            return true;
+        }
+        const bool turnRight = error >= 0.0f;
+        setDrive(turnRight ? -80 : 80, turnRight ? 80 : -80);
+        return false;
+    };
+    auto driveOnHeading = [&](float targetHeading) {
+        const float error = headingDelta(imu_.headingDeg(), targetHeading);
+        if (error > 4.0f)
+            setDrive(-80, -75);  // correct right while retaining forward motion
+        else if (error < -4.0f)
+            setDrive(-75, -80);  // correct left while retaining forward motion
+        else
+            setDrive(-80, -80);
+    };
+    auto beginForwardLeg = [&](float exactHeading) {
+        navigationHeadingReferenceDeg_ = normaliseHeading(exactHeading);
+        navigationMotionStartedMs_ = now;
+        navigationMotionConsistent_ = true;
+    };
+
+    // Encoder/IMU agreement is recorded for diagnosis only. It never cancels
+    // the coverage program.
+    if (now - navigationMotionStartedMs_ >= 500U)
+    {
+        const float e1 = encoders_.firstCountsPerSecond();
+        const float e2 = encoders_.secondCountsPerSecond();
+        const bool forwardState = navigationState_ == NAV_SEEK_WALL ||
+            navigationState_ == NAV_FOLLOW_WALL ||
+            navigationState_ == NAV_SWEEP ||
+            navigationState_ == NAV_LANE_SHIFT;
+        if (forwardState)
+            navigationMotionConsistent_ = lastImuSampleValid_ &&
+                e1 < -10.0f && e2 > 10.0f;
+        else if (navigationState_ != NAV_IDLE && navigationState_ != NAV_COMPLETE)
+            navigationMotionConsistent_ = lastImuSampleValid_ &&
+                (fabsf(e1) > 10.0f || fabsf(e2) > 10.0f);
+    }
+
+    switch (navigationState_)
+    {
+        case NAV_SEEK_WALL:
+            if (frontBlocked)
+            {
+                setDrive(0, 0);
+                beginRightAngleTurn(true, NAV_INITIAL_TURN);
+                link_.log("INFO", "Navigation reached first wall; turning right");
+            }
+            else if (front == 0xFFFF)
+                setDrive(-75, 75);  // rotate until forward ranging is recovered
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_);
+            break;
+
+        case NAV_INITIAL_TURN:
+            if (runHeadingTurn())
+            {
+                navigationState_ = NAV_FOLLOW_WALL;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log("INFO", "Navigation following first wall to corner");
+            }
+            break;
+
+        case NAV_FOLLOW_WALL:
+            if (frontBlocked)
+            {
+                setDrive(0, 0);
+                beginRightAngleTurn(true, NAV_CORNER_TURN);
+                link_.log("INFO", "Navigation reached corner; entering sweep");
+            }
+            else if (left != 0xFFFF && left < WALL_FOLLOW_TARGET_MM - 30)
+                setDrive(-80, -75);
+            else if (left != 0xFFFF && left > WALL_FOLLOW_TARGET_MM + 50)
+                setDrive(-75, -80);
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_);
+            break;
+
+        case NAV_CORNER_TURN:
+            if (runHeadingTurn())
+            {
+                navigationState_ = NAV_SWEEP;
+                navigationLaneIndex_ = 0;
+                navigationSweepTurnRight_ = true;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log("INFO", "Arena sweep lane 1 started");
+            }
+            break;
+
+        case NAV_SWEEP:
+            if (frontBlocked)
+            {
+                if (navigationLaneIndex_ + 1 >= SWEEP_LANE_COUNT)
+                {
+                    navigationState_ = NAV_COMPLETE;
+                    setDrive(0, 0);
+                    link_.log("INFO", "Arena sweep complete");
+                }
+                else
+                {
+                    setDrive(0, 0);
+                    beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_OUT);
+                }
+            }
+            else if (leftBlocked && !rightBlocked)
+                setDrive(-80, -75);
+            else if (rightBlocked && !leftBlocked)
+                setDrive(-75, -80);
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_);
+            break;
+
+        case NAV_LANE_TURN_OUT:
+            if (runHeadingTurn())
+            {
+                navigationState_ = NAV_LANE_SHIFT;
+                navigationShiftStartEncoder1_ = encoders_.firstCount();
+                navigationShiftStartEncoder2_ = encoders_.secondCount();
+                beginForwardLeg(navigationTargetHeadingDeg_);
+            }
+            break;
+
+        case NAV_LANE_SHIFT:
+        {
+            const float firstDistance = fabsf(
+                (encoders_.firstCount() - navigationShiftStartEncoder1_) *
+                ENCODER_1_MM_PER_COUNT);
+            const float secondDistance = fabsf(
+                (encoders_.secondCount() - navigationShiftStartEncoder2_) *
+                ENCODER_2_MM_PER_COUNT);
+            const float shiftedMm = (firstDistance + secondDistance) * 0.5f;
+            if (shiftedMm >= LANE_SPACING_MM || frontBlocked)
+            {
+                setDrive(0, 0);
+                beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_IN);
+            }
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_);
+            break;
+        }
+
+        case NAV_LANE_TURN_IN:
+            if (runHeadingTurn())
+            {
+                ++navigationLaneIndex_;
+                navigationSweepTurnRight_ = !navigationSweepTurnRight_;
+                navigationState_ = NAV_SWEEP;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log("INFO", "Next arena sweep lane started");
+            }
+            break;
+
+        case NAV_COMPLETE:
+            setDrive(0, 0);
+            break;
+
+        default:
+            navigationState_ = NAV_SEEK_WALL;
+            beginForwardLeg(imu_.headingDeg());
+            break;
     }
 }
 

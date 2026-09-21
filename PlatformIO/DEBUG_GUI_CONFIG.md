@@ -114,6 +114,23 @@ Live Telemetry as `tof.<name>.available`, `tof.<name>.timed_out`, and
 
 ## Commands
 
+### Autonomous navigation
+
+The `autonomous_navigation` command creates one Navigation card with RUN and
+STOP buttons. RUN requires Debug Mode and directly enters the robot run state.
+The Teensy first drives straight to the wall ahead, turns right, follows that
+wall with the left ultrasound until the corner, then covers the arena in eight
+parallel lanes spaced 300 mm apart. The two top point TOFs and the SEN0628 form
+a robust median forward range with 300 mm clearance. All `bottom_*` TOFs are
+excluded from navigation and remain available for weight sensing and mapping.
+Ultrasound A/B provide left/right clearance with a 200 mm limit. STOP ROBOT,
+leaving Debug Mode, keyboard drive, and manual motor commands all take ownership
+away from navigation and neutralise bank 2. Encoder/IMU agreement is exposed as
+diagnostic telemetry and does not cancel navigation.
+The BNO055 holds headings and measures each 90-degree turn; calibrated encoders
+measure each lane shift. All autonomous movement commands respect the
+drivetrain's 75 percent minimum.
+
 Add an object to the `commands` array. The `action` selects firmware behaviour.
 The optional `category` is displayed as a badge inside the command card, for
 example `System`, `Herkulex`, `HX12K`, or `203 DC Motor`:
