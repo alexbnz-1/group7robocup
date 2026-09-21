@@ -508,9 +508,6 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
         navigationLaneIndex_ = 0;
         navigationSweepTurnRight_ = true;
-        navigationSweepLeftReferenceValid_ = false;
-        navigationSweepRightReferenceValid_ = false;
-        navigationSweepLateralErrorMm_ = 0;
         navigationMotionConsistent_ = true;
         stopped_ = false;
         dcMotor203SecondDeadman_ = false;
@@ -794,11 +791,6 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.phase"] = navigationPhase;
     data["navigation.lane"] = navigationLaneIndex_;
     data["navigation.target_heading_deg"] = navigationTargetHeadingDeg_;
-    data["navigation.sweep_left_reference_mm"] =
-        navigationSweepLeftReferenceValid_ ? navigationSweepLeftReferenceMm_ : 0;
-    data["navigation.sweep_right_reference_mm"] =
-        navigationSweepRightReferenceValid_ ? navigationSweepRightReferenceMm_ : 0;
-    data["navigation.sweep_lateral_error_mm"] = navigationSweepLateralErrorMm_;
     data["navigation.motion_consistent"] = navigationMotionConsistent_;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
@@ -1156,13 +1148,20 @@ void BluetoothDebugWorkflow::updateNavigation()
     }
 
     constexpr uint16_t FRONT_AVOID_MM = 300;
-    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 200;
-    constexpr uint16_t WALL_FOLLOW_DEADBAND_MM = 10;
-    constexpr int16_t SWEEP_LATERAL_DEADBAND_MM = 15;
-    constexpr float LANE_SPACING_MM = 250.0f;
-    constexpr uint8_t SWEEP_LANE_COUNT = 10;
+    constexpr uint16_t SIDE_AVOID_MM = 200;
+    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 250;
+    // The previous 300 mm lane spacing left visibly coarse bands in the map.
+    // 200 mm gives substantially more overlap between passes while still
+    // covering roughly the same total arena width.
+    constexpr float LANE_SPACING_MM = 200.0f;
+    constexpr uint8_t SWEEP_LANE_COUNT = 11;
     constexpr float ENCODER_1_MM_PER_COUNT = 0.09094f;
     constexpr float ENCODER_2_MM_PER_COUNT = 0.09592f;
+
+    static float wallFollowFilteredLeftMm = NAN;
+    static uint32_t wallFollowLastFallCount = 0;
+    static uint32_t wallFollowLastGoodMs = 0;
+    static bool wallFollowFilterArmed = false;
 
     uint16_t front = 0xFFFF, left = 0xFFFF, right = 0xFFFF;
     auto includeMinimum = [](uint16_t& target, int value) {
@@ -1244,10 +1243,47 @@ void BluetoothDebugWorkflow::updateNavigation()
     if (frontCandidateCount > 0)
         front = frontCandidates[frontCandidateCount / 2];
 
+    if (navigationState_ != NAV_FOLLOW_WALL)
+    {
+        wallFollowFilteredLeftMm = NAN;
+        wallFollowLastGoodMs = 0;
+        wallFollowFilterArmed = false;
+        if (ultrasoundSensorCount_ > 0)
+            wallFollowLastFallCount = ultrasoundSensors_[0].fallCount();
+    }
+    else if (ultrasoundSensorCount_ > 0)
+    {
+        const uint32_t fallCount = ultrasoundSensors_[0].fallCount();
+        if (!wallFollowFilterArmed)
+        {
+            wallFollowLastFallCount = fallCount;
+            wallFollowFilterArmed = true;
+        }
+        else if (fallCount != wallFollowLastFallCount)
+        {
+            wallFollowLastFallCount = fallCount;
+            if (ultrasoundSensors_[0].valid() && !ultrasoundSensors_[0].timedOut())
+            {
+                const float sampleMm = ultrasoundSensors_[0].distanceMm();
+                if (isnan(wallFollowFilteredLeftMm))
+                    wallFollowFilteredLeftMm = sampleMm;
+                else
+                {
+                    float stepMm = sampleMm - wallFollowFilteredLeftMm;
+                    stepMm = constrain(stepMm, -120.0f, 120.0f);
+                    wallFollowFilteredLeftMm += 0.35f * stepMm;
+                }
+                wallFollowLastGoodMs = now;
+            }
+        }
+    }
+
     navigationFrontMm_ = front == 0xFFFF ? 0 : front;
     navigationLeftMm_ = left == 0xFFFF ? 0 : left;
     navigationRightMm_ = right == 0xFFFF ? 0 : right;
     const bool frontBlocked = front != 0xFFFF && front < FRONT_AVOID_MM;
+    const bool leftBlocked = left != 0xFFFF && left < SIDE_AVOID_MM;
+    const bool rightBlocked = right != 0xFFFF && right < SIDE_AVOID_MM;
 
     auto normaliseHeading = [](float heading) {
         while (heading >= 360.0f) heading -= 360.0f;
@@ -1278,38 +1314,38 @@ void BluetoothDebugWorkflow::updateNavigation()
     };
     auto runHeadingTurn = [&]() {
         const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
-        if (lastImuSampleValid_ && fabsf(error) <= 7.0f &&
+        if (lastImuSampleValid_ && fabsf(error) <= 3.0f &&
             now - navigationMotionStartedMs_ >= 350U)
         {
             setDrive(0, 0);
             return true;
         }
         const bool turnRight = error >= 0.0f;
-        setDrive(turnRight ? -80 : 80, turnRight ? 80 : -80);
+        const int16_t turnPower = fabsf(error) > 15.0f ? 80 : 75;
+        setDrive(turnRight ? -turnPower : turnPower,
+                 turnRight ? turnPower : -turnPower);
         return false;
     };
-    auto driveOnHeading = [&](float targetHeading) {
+    auto driveOnHeading = [&](float targetHeading, int16_t basePower) {
+        if (!lastImuSampleValid_)
+        {
+            setDrive(-basePower, -basePower);
+            return;
+        }
         const float error = headingDelta(imu_.headingDeg(), targetHeading);
-        if (error > 4.0f)
-            setDrive(-80, -75);  // correct right while retaining forward motion
-        else if (error < -4.0f)
-            setDrive(-75, -80);  // correct left while retaining forward motion
-        else
-            setDrive(-80, -80);
+        float correction = constrain(error * 0.65f, -5.0f, 5.0f);
+        if (fabsf(error) < 0.75f)
+            correction = 0.0f;
+        const int16_t channelAPower = constrain(
+            static_cast<int16_t>(lroundf(basePower + correction)), 75, 85);
+        const int16_t channelBPower = constrain(
+            static_cast<int16_t>(lroundf(basePower - correction)), 75, 85);
+        setDrive(-channelAPower, -channelBPower);
     };
     auto beginForwardLeg = [&](float exactHeading) {
         navigationHeadingReferenceDeg_ = normaliseHeading(exactHeading);
         navigationMotionStartedMs_ = now;
         navigationMotionConsistent_ = true;
-    };
-    auto captureSweepSideReferences = [&]() {
-        navigationSweepLeftReferenceValid_ = left != 0xFFFF;
-        navigationSweepRightReferenceValid_ = right != 0xFFFF;
-        if (navigationSweepLeftReferenceValid_)
-            navigationSweepLeftReferenceMm_ = left;
-        if (navigationSweepRightReferenceValid_)
-            navigationSweepRightReferenceMm_ = right;
-        navigationSweepLateralErrorMm_ = 0;
     };
 
     // Encoder/IMU agreement is recorded for diagnosis only. It never cancels
@@ -1342,7 +1378,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             else if (front == 0xFFFF)
                 setDrive(-75, 75);  // rotate until forward ranging is recovered
             else
-                driveOnHeading(navigationHeadingReferenceDeg_);
+                driveOnHeading(navigationHeadingReferenceDeg_, 80);
             break;
 
         case NAV_INITIAL_TURN:
@@ -1361,29 +1397,22 @@ void BluetoothDebugWorkflow::updateNavigation()
                 beginRightAngleTurn(true, NAV_CORNER_TURN);
                 link_.log("INFO", "Navigation reached corner; entering sweep");
             }
-            else if (left != 0xFFFF &&
-                     left + WALL_FOLLOW_DEADBAND_MM < WALL_FOLLOW_TARGET_MM)
+            else if (!isnan(wallFollowFilteredLeftMm) &&
+                     now - wallFollowLastGoodMs <= 650U)
             {
-                // Too close: speed up the left wheel relative to the right so
-                // the robot arcs away from the wall without leaving forward drive.
-                const int16_t correction = constrain(
-                    static_cast<int16_t>((WALL_FOLLOW_TARGET_MM - left) / 8),
-                    static_cast<int16_t>(5), static_cast<int16_t>(10));
-                setDrive(-85, static_cast<int16_t>(-85 + correction));
-            }
-            else if (left != 0xFFFF &&
-                     left > WALL_FOLLOW_TARGET_MM + WALL_FOLLOW_DEADBAND_MM)
-            {
-                // Too far: the correction increases with distance, actively
-                // bringing the robot back toward the wall instead of allowing
-                // the separation to grow on every pass.
-                const int16_t correction = constrain(
-                    static_cast<int16_t>((left - WALL_FOLLOW_TARGET_MM) / 8),
-                    static_cast<int16_t>(5), static_cast<int16_t>(10));
-                setDrive(static_cast<int16_t>(-85 + correction), -85);
+                float wallErrorMm =
+                    static_cast<float>(WALL_FOLLOW_TARGET_MM) -
+                    wallFollowFilteredLeftMm;
+                if (fabsf(wallErrorMm) < 15.0f)
+                    wallErrorMm = 0.0f;
+                const float headingOffsetDeg =
+                    constrain(wallErrorMm * 0.06f, -10.0f, 10.0f);
+                const float wallTargetHeading = normaliseHeading(
+                    navigationHeadingReferenceDeg_ + headingOffsetDeg);
+                driveOnHeading(wallTargetHeading, 78);
             }
             else
-                driveOnHeading(navigationHeadingReferenceDeg_);
+                driveOnHeading(navigationHeadingReferenceDeg_, 78);
             break;
 
         case NAV_CORNER_TURN:
@@ -1393,25 +1422,11 @@ void BluetoothDebugWorkflow::updateNavigation()
                 navigationLaneIndex_ = 0;
                 navigationSweepTurnRight_ = true;
                 beginForwardLeg(navigationTargetHeadingDeg_);
-                captureSweepSideReferences();
                 link_.log("INFO", "Arena sweep lane 1 started");
             }
             break;
 
         case NAV_SWEEP:
-            // If a side echo was unavailable at the exact lane transition,
-            // adopt it as soon as it becomes valid rather than running the
-            // complete lane without lateral feedback.
-            if (!navigationSweepLeftReferenceValid_ && left != 0xFFFF)
-            {
-                navigationSweepLeftReferenceMm_ = left;
-                navigationSweepLeftReferenceValid_ = true;
-            }
-            if (!navigationSweepRightReferenceValid_ && right != 0xFFFF)
-            {
-                navigationSweepRightReferenceMm_ = right;
-                navigationSweepRightReferenceValid_ = true;
-            }
             if (frontBlocked)
             {
                 if (navigationLaneIndex_ + 1 >= SWEEP_LANE_COUNT)
@@ -1426,46 +1441,14 @@ void BluetoothDebugWorkflow::updateNavigation()
                     beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_OUT);
                 }
             }
+            else if (leftBlocked && !rightBlocked)
+                driveOnHeading(
+                    normaliseHeading(navigationHeadingReferenceDeg_ + 7.0f), 78);
+            else if (rightBlocked && !leftBlocked)
+                driveOnHeading(
+                    normaliseHeading(navigationHeadingReferenceDeg_ - 7.0f), 78);
             else
-            {
-                int32_t lateralErrorSum = 0;
-                uint8_t lateralSamples = 0;
-                if (navigationSweepLeftReferenceValid_ && left != 0xFFFF)
-                {
-                    // Positive when the robot has moved away from its left
-                    // reference wall (drifted right).
-                    lateralErrorSum += static_cast<int32_t>(left) -
-                                       navigationSweepLeftReferenceMm_;
-                    ++lateralSamples;
-                }
-                if (navigationSweepRightReferenceValid_ && right != 0xFFFF)
-                {
-                    // Also positive for rightward drift because the right
-                    // distance becomes smaller than its lane-start value.
-                    lateralErrorSum += static_cast<int32_t>(
-                        navigationSweepRightReferenceMm_) - right;
-                    ++lateralSamples;
-                }
-                navigationSweepLateralErrorMm_ = lateralSamples == 0 ? 0 :
-                    static_cast<int16_t>(lateralErrorSum / lateralSamples);
-
-                if (navigationSweepLateralErrorMm_ > SWEEP_LATERAL_DEADBAND_MM)
-                {
-                    const int16_t correction = constrain(
-                        static_cast<int16_t>(navigationSweepLateralErrorMm_ / 8),
-                        static_cast<int16_t>(5), static_cast<int16_t>(10));
-                    setDrive(static_cast<int16_t>(-85 + correction), -85);
-                }
-                else if (navigationSweepLateralErrorMm_ < -SWEEP_LATERAL_DEADBAND_MM)
-                {
-                    const int16_t correction = constrain(
-                        static_cast<int16_t>(-navigationSweepLateralErrorMm_ / 8),
-                        static_cast<int16_t>(5), static_cast<int16_t>(10));
-                    setDrive(-85, static_cast<int16_t>(-85 + correction));
-                }
-                else
-                    driveOnHeading(navigationHeadingReferenceDeg_);
-            }
+                driveOnHeading(navigationHeadingReferenceDeg_, 80);
             break;
 
         case NAV_LANE_TURN_OUT:
@@ -1493,7 +1476,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_IN);
             }
             else
-                driveOnHeading(navigationHeadingReferenceDeg_);
+                driveOnHeading(navigationHeadingReferenceDeg_, 75);
             break;
         }
 
@@ -1504,7 +1487,6 @@ void BluetoothDebugWorkflow::updateNavigation()
                 navigationSweepTurnRight_ = !navigationSweepTurnRight_;
                 navigationState_ = NAV_SWEEP;
                 beginForwardLeg(navigationTargetHeadingDeg_);
-                captureSweepSideReferences();
                 link_.log("INFO", "Next arena sweep lane started");
             }
             break;
@@ -1573,3 +1555,5 @@ JsonObject BluetoothDebugWorkflow::findCommand(const char* name)
             return command;
     return JsonObject();
 }
+
+

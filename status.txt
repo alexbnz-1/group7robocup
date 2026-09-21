@@ -2968,3 +2968,79 @@ The command description and embedded JSON configuration reflect the 200 mm wall
 target and 250 mm lane spacing. The firmware builds successfully with 131032
 bytes of flash code and 33536 bytes of RAM1 variables. All 38 offline tests
 pass.
+
+
+ONLINE CHAT ADDITION:
+
+===============================================================================
+50. WALL-FOLLOWING SMOOTHING AND FINER COVERAGE SWEEPS
+===============================================================================
+
+The coverage controller was tuned after the latest physical run showed that the
+basic wall/corner/lane sequence works, but the first wall-following leg wanders
+more than desired and the 300 mm sweep spacing leaves coverage bands wider than
+wanted.
+
+Only PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp changes.
+No desktop GUI, Bluetooth protocol, debug_config.json, sensor driver, pin
+assignment or recording format change is required.
+
+Wall following:
+
+- The left wall target remains 250 mm and still uses ultrasound A.
+- The previous wall follower used coarse threshold steering: one fixed motor
+  imbalance when closer than target-30 mm, the opposite imbalance when farther
+  than target+50 mm, and otherwise straight heading hold.
+- The new controller filters completed ultrasound-A echoes before steering.
+  It keys new samples from the ultrasound fall-edge count so repeated reads of
+  the same echo do not get over-weighted.
+- Large single-sample distance changes are rate limited to 120 mm before the
+  low-pass update. The accepted filter moves 35 percent of that limited step per
+  fresh echo.
+- A recent good ultrasound measurement is retained for 650 ms across a missed
+  echo/timeout. If no recent valid wall range exists, the robot holds the known
+  wall-parallel BNO055 heading rather than making a blind distance correction.
+- Wall-distance error is converted into a small heading offset around the exact
+  wall-parallel heading instead of directly switching between two motor pairs.
+  A +/-15 mm deadband is used around the 250 mm target. Outside it, the heading
+  offset is 0.06 degree/mm and is limited to +/-10 degrees.
+- Wall-follow forward power is 78 percent.
+
+Straight-line heading control:
+
+- The previous +/-4 degree bang-bang 80/75 steering has been replaced by
+  continuous proportional differential steering.
+- Heading error is multiplied by 0.65 and limited to +/-5 percentage points.
+- Errors below 0.75 degree are treated as zero.
+- The existing measured drivetrain minimum is respected by constraining each
+  requested drive channel to 75-85 percent.
+- Sweep side-clearance corrections now request a temporary +/-7 degree heading
+  offset instead of directly forcing a fixed 80/75 motor imbalance.
+
+Turns:
+
+- BNO055 turn completion tolerance is reduced from 7 degrees to 3 degrees.
+- Turns use 80 percent while more than 15 degrees from target and 75 percent
+  near the target. This is intended to reduce the angular error handed into the
+  following straight leg while remaining above the drivetrain's usable minimum.
+- The previously-added exact four-direction heading lattice is retained, so
+  turn error still does not accumulate lane to lane.
+
+Finer sweeps:
+
+- Lane spacing is reduced from 300 mm to 200 mm.
+- SWEEP_LANE_COUNT is increased from 8 to 11.
+- The routine therefore targets substantially tighter parallel passes while
+  keeping approximately the same overall arena-width coverage.
+- Encoder-based lane shift distance now naturally uses the new 200 mm constant.
+
+The current six point TOFs, SEN0628 8x8 sensor, both ultrasound sensors, BNO055,
+encoders, Bluetooth debug workflow, telemetry/recording, GUI and safety/manual
+ownership behaviour remain intact.
+
+This source was generated from the current testing-branch
+BluetoothDebugWorkflow.cpp. A Teensy build and physical run are still required.
+For the next run, specifically inspect the first follow_wall segment for
+oscillation around 250 mm, verify that 200 mm lane shifts are physically close
+to 200 mm, and confirm that the tighter 3 degree turn threshold does not cause
+a turn to hunt indefinitely at the drivetrain's 75 percent minimum.
