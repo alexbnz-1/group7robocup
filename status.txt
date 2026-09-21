@@ -2612,3 +2612,128 @@ opening the GUI again.
 ===============================================================================
 END OF STATUS
 ===============================================================================
+
+
+ONLINE CHATGPT ADDITIONS - CODEX TO READ
+
+===============================================================================
+44. ULTRASOUND A/B DESKTOP APP AND ARENA VIEW INTEGRATION
+===============================================================================
+
+The working ultrasound firmware from commit 12951a3 remains unchanged. The
+robot continues to use the full BluetoothDebugWorkflow rather than any of the
+temporary ultrasound-only diagnostic sketches or reduced test loops. The
+current workflow therefore continues servicing Bluetooth, Herkulex, both 203
+motor banks, keyboard-drive deadman handling, HX12K servos, both encoders,
+BNO055, six point TOFs, the SEN0628 8x8 TOF, D21 inductive input and both
+ultrasound channels together.
+
+The desktop Arena View now treats ultrasound A/B as first-class range sources.
+It reads the existing `ultrasound_sensors` entries from debug_config.json, so
+the confirmed working pin mapping remains:
+
+- Ultrasound A: TRIG D14 / ECHO D24.
+- Ultrasound B: TRIG D22 / ECHO D20.
+
+No Bluetooth protocol or firmware telemetry format change was required.
+BluetoothSerial already accepts both normal telemetry packets and the second
+ultrasound electrical-diagnostic telemetry packet sent with the same robot
+timestamp. DataRecorder and the generic Live Telemetry table therefore continue
+recording all ultrasound fields without any special transport path.
+
+Arena View now adds:
+
+- A dedicated raw Ultrasound sensors panel beside the point-TOF and 8x8 raw
+  displays.
+- Live display of valid distance, echo pulse width and rise/fall edge counts.
+- Explicit TIMEOUT / NO VALID RANGE states.
+- An `outside map` marker when the firmware regards a measurement as valid but
+  it lies outside the Arena View 10-3500 mm mapping window.
+- Numeric angle, right-offset and forward-offset controls for both ultrasound
+  channels. These persist through the existing QSettings mechanism.
+- Default positions of -90/+90 mm lateral and 180 mm forward for A/B
+  respectively. These are only starting estimates and should be replaced with
+  measured robot geometry.
+- Ultrasound obstacle/free-space evidence in the Arena View map. A range must
+  be valid, not timed out, within the map range, and repeat consistently before
+  it is accepted. The existing temporal range filter then suppresses isolated
+  jumps.
+- A live `ultrasound valid: X/2` summary in the Arena View status line.
+
+Ultrasound is deliberately excluded from the purple possible-weight
+top-versus-bottom comparison because its acoustic beam is much broader than the
+point TOF beams and does not provide an equivalent height-layer measurement.
+For the same reason, current mapping uses the configured centreline as
+diagnostic evidence rather than pretending the ultrasonic beam is a precise
+laser ray.
+
+The established graphical sensor canvas is intentionally left as the six point
+TOFs plus the 8x8 module so the existing TOF layout workflow and tests are not
+silently redefined. Ultrasound geometry is edited with the new numeric controls
+in the same Range sensors section.
+
+This is a desktop-only change. The current Teensy firmware should NOT be
+replaced with an older pre-ultrasound image. Restart the Python application to
+load the new ArenaView.py; no Teensy upload is required for this integration.
+
+The replacement ArenaView.py supplied with this status entry was syntax-checked
+with Python's AST parser before handoff. A physical live run is still required
+to confirm the measured A/B mounting offsets and angles and to observe the
+ultrasound map evidence alongside the already-working TOF/IMU/encoder streams.
+
+
+===============================================================================
+45. GRAPHICAL LEFT/RIGHT ULTRASOUND SENSOR LAYOUT
+===============================================================================
+
+The two working ultrasound channels are now represented as distinct physical
+sensors throughout the desktop app:
+
+- Ultrasound Left (A): channel A, TRIG D14 / ECHO D24.
+- Ultrasound Right (B): channel B, TRIG D22 / ECHO D20.
+
+WiringGuide.py now uses those left/right names for fresh settings. A one-time
+settings migration renames existing default "Ultrasound A" and "Ultrasound B"
+rows to the new physical names without renaming unrelated custom user-created
+ultrasound entries. The existing confirmed pin assignments are retained.
+
+ArenaView.py now places both ultrasound channels on the same graphical robot
+sensor-layout interface used by the TOF sensors. They appear as yellow diamond
+markers labelled US-A and US-B. Each marker can be dragged around the robot
+diagram to set its right/left and forward/back position, and the white arrow tip
+can be dragged to set its pointing angle. The corresponding numeric controls
+remain available and stay synchronised with graphical dragging.
+
+The existing six point-TOF sensors plus the 8x8 module remain the primary
+`sensor_canvas.specs` list so older TOF layout assumptions remain compatible.
+The two ultrasound sensors are held as auxiliary graphical specs and are
+included in all drawing, hit-testing, dragging and angle-editing operations.
+There are therefore nine visible draggable range-sensor markers in total:
+six point TOFs, one 8x8 TOF module and two ultrasound sensors.
+
+Arena View reads the ultrasound display names from the Wiring Guide. It also
+normalises old saved default names immediately, so the first app launch after
+this change shows "Ultrasound Left (A)" and "Ultrasound Right (B)" even though
+the Arena tab is constructed before the Wiring Guide tab performs its saved-
+settings migration.
+
+The ultrasound map behaviour from the previous integration is retained:
+`ultrasound.a.*` and `ultrasound.b.*` telemetry feed the dedicated raw
+ultrasound panel and, after the existing consistency/range filtering, contribute
+green free-space evidence and red obstacle endpoint evidence from the configured
+sensor pose. Ultrasound remains excluded from the purple top/bottom TOF weight
+comparison because its acoustic beam geometry is different.
+
+DebugGUI.py already connects `WiringGuide.entries_changed` to
+`ArenaView.reload_sensor_layout`, so editing the saved ultrasound rows in the
+Wiring Guide causes the Arena View sensor layout to reload without adding any
+new GUI plumbing.
+
+This is a desktop-only change. No Teensy firmware, debug_config.json or Bluetooth
+protocol change is required and no firmware upload is needed. Restart the GUI
+after replacing ArenaView.py and WiringGuide.py.
+
+Both replacement Python files pass `python -m py_compile`. The full Qt runtime
+test suite could not be executed in the handoff environment because PyQt6 is
+not installed there, so the existing project test suite should still be run in
+the project's normal GUI virtual environment after replacement.

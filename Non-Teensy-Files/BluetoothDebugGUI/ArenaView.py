@@ -1,4 +1,4 @@
-"""Live, local robot view from encoders, BNO055 and TOF telemetry.
+"""Live, local robot view from encoders, BNO055, TOF and ultrasound telemetry.
 
 This is a visualisation, not a navigation or collision-avoidance controller.
 The first received pose defines the origin; no absolute arena localisation exists.
@@ -48,6 +48,7 @@ class ArenaModel:
             {"name": "front", "angle": 0.0, "x": 0.0, "y": 0.0, "port": "XSHUT1"},
             {"name": "left", "angle": 90.0, "x": 0.0, "y": 0.0, "port": "XSHUT2"},
         ]
+        self.ultrasound_specs = []
         self.matrix_spec = {"name": "matrix", "port": "I2C1", "label": "8x8 TOF",
                             "angle": 0.0, "x": 0.0, "y": 150.0, "layer": "top"}
         self.cell_size_mm = 10.0
@@ -159,6 +160,30 @@ class ArenaModel:
                 if filtered is not None:
                     valid_distances[label] = filtered
                     self._add_observation(filtered, spec["angle"], label, spec["x"], spec["y"])
+
+        # Ultrasound contributes ordinary free/obstacle centreline evidence.
+        # Keep it out of the point-TOF top/bottom weight comparison because
+        # its acoustic beam is broad and has different geometry.
+        for spec in self.ultrasound_specs:
+            telemetry_name = spec["telemetry_name"]
+            if (frame.get(f"ultrasound.{telemetry_name}.valid") is not True or
+                    frame.get(f"ultrasound.{telemetry_name}.timed_out") is True):
+                continue
+            distance = _number(frame.get(f"ultrasound.{telemetry_name}.distance_mm"))
+            if (distance is not None and
+                    self.min_range_mm <= distance <= self.max_range_mm):
+                filtered = self._filtered_distance(
+                    f"ultrasound.{telemetry_name}", distance, confirm_initial=True
+                )
+                if filtered is not None:
+                    self._add_observation(
+                        filtered,
+                        spec["angle"],
+                        f"ultrasound.{telemetry_name}",
+                        spec["x"],
+                        spec["y"],
+                    )
+
         for bottom in self.sensor_specs:
             if bottom.get("layer") != "bottom" or bottom["name"] not in valid_distances:
                 continue
@@ -556,20 +581,36 @@ class SensorLayoutCanvas(QWidget):
         super().__init__(parent)
         self.setMinimumSize(300, 300)
         self.specs = []
+        self.aux_specs = []
         self.selected_name = None
         self.drag_mode = None
 
+    def _all_specs(self):
+        return self.specs + self.aux_specs
+
     def set_specs(self, specs):
         self.specs = specs
-        if self.selected_name not in {item["name"] for item in specs}:
-            self.selected_name = specs[0]["name"] if specs else None
+        all_specs = self._all_specs()
+        if self.selected_name not in {item["name"] for item in all_specs}:
+            self.selected_name = all_specs[0]["name"] if all_specs else None
+        self.update()
+
+    def set_aux_specs(self, specs):
+        """Add extra draggable sensors without changing the primary TOF spec list."""
+        self.aux_specs = specs
+        all_specs = self._all_specs()
+        if self.selected_name not in {item["name"] for item in all_specs}:
+            self.selected_name = all_specs[0]["name"] if all_specs else None
         self.update()
 
     def _scale(self):
         return min((self.width() - 55) / 700.0, (self.height() - 60) / 800.0)
 
     def _marker(self, spec):
-        layer_shift = -6 if spec.get("layer") == "top" else 6
+        if spec.get("kind") == "ultrasound":
+            layer_shift = 0
+        else:
+            layer_shift = -6 if spec.get("layer") == "top" else 6
         return QPointF(self.width() / 2 + spec["x"] * self._scale() + layer_shift,
                        self.height() / 2 - spec["y"] * self._scale())
 
@@ -596,15 +637,29 @@ class SensorLayoutCanvas(QWidget):
         p.drawText(int(centre.x() - 24), int(body.top() - 19), "FRONT")
         p.setPen(QColor("#94a3b8"))
         p.drawText(8, self.height() - 8, "Robot left ←                         → Robot right")
-        for spec in self.specs:
+        for spec in self._all_specs():
             marker = self._marker(spec)
             tip = self._tip(spec)
-            colour = QColor("#38bdf8" if spec.get("layer") == "top" else "#fb923c")
+            is_ultrasound = spec.get("kind") == "ultrasound"
+            colour = QColor(
+                "#facc15" if is_ultrasound
+                else "#38bdf8" if spec.get("layer") == "top"
+                else "#fb923c"
+            )
             selected = spec["name"] == self.selected_name
             p.setPen(QPen(colour, 3 if selected else 2))
             p.drawLine(marker, tip)
             p.setBrush(colour)
-            if spec.get("layer") == "top":
+            if is_ultrasound:
+                size = 9 if selected else 7
+                diamond = QPolygonF([
+                    QPointF(marker.x(), marker.y() - size),
+                    QPointF(marker.x() + size, marker.y()),
+                    QPointF(marker.x(), marker.y() + size),
+                    QPointF(marker.x() - size, marker.y()),
+                ])
+                p.drawPolygon(diamond)
+            elif spec.get("layer") == "top":
                 p.drawEllipse(marker, 8 if selected else 6, 8 if selected else 6)
             else:
                 size = 8 if selected else 6
@@ -620,11 +675,12 @@ class SensorLayoutCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         position = event.position()
-        current = next((s for s in self.specs if s["name"] == self.selected_name), None)
+        current = next((s for s in self._all_specs() if s["name"] == self.selected_name), None)
         if current and (position - self._tip(current)).manhattanLength() <= 17:
             self.drag_mode = "angle"
             return
-        nearest = min(self.specs, key=lambda s: (position - self._marker(s)).manhattanLength(),
+        nearest = min(self._all_specs(),
+                      key=lambda s: (position - self._marker(s)).manhattanLength(),
                       default=None)
         if nearest and (position - self._marker(nearest)).manhattanLength() <= 24:
             self.selected_name = nearest["name"]
@@ -635,7 +691,7 @@ class SensorLayoutCanvas(QWidget):
     def mouseMoveEvent(self, event):
         if not self.drag_mode:
             return
-        spec = next((s for s in self.specs if s["name"] == self.selected_name), None)
+        spec = next((s for s in self._all_specs() if s["name"] == self.selected_name), None)
         if spec is None:
             return
         position = event.position()
@@ -645,7 +701,10 @@ class SensorLayoutCanvas(QWidget):
                                             -(position.y() - marker.y())))
             self.geometry_changed.emit(spec["name"], "angle", max(-180.0, min(180.0, angle)))
         else:
-            shift = -6 if spec.get("layer") == "top" else 6
+            if spec.get("kind") == "ultrasound":
+                shift = 0
+            else:
+                shift = -6 if spec.get("layer") == "top" else 6
             lateral = (position.x() - self.width() / 2 - shift) / self._scale()
             forward = (self.height() / 2 - position.y()) / self._scale()
             self.geometry_changed.emit(spec["name"], "x", max(-500.0, min(500.0, lateral)))
@@ -674,7 +733,7 @@ class ArenaView(QWidget):
         side = QWidget()
         side.setMaximumWidth(330)
         form = QFormLayout(side)
-        self.status = QLabel("Waiting for encoder, IMU and TOF telemetry")
+        self.status = QLabel("Waiting for encoder, IMU, TOF and ultrasound telemetry")
         self.status.setWordWrap(True)
         form.addRow(self.status)
 
@@ -748,7 +807,8 @@ class ArenaView(QWidget):
         form.addRow(reset_view)
         note = QLabel("Grey: unknown · green: measured free · red: obstacle · purple: possible weight (bottom return, paired top sees farther). "
                       "Wheel over map to zoom; drag map to pan. In the robot diagram, drag a sensor to place it and drag its white arrow tip to aim it. "
-                      "Cyan circles are top; orange squares are bottom. "
+                      "Cyan circles are top point TOFs; orange squares are bottom point TOFs; yellow diamonds are ultrasound. "
+                      "All sensor markers can be dragged to place them and their arrow tips can be dragged to aim them. "
                       "Arena: 2400 × 4900 mm, 400 mm walls (top-down outline only). "
                       "Initial wheel scale assumes ~80 mm diameter, 663 PPR and 4× decoding; verify with a measured push. "
                       "Blue is the robot trail. Free/obstacle colours are sensor evidence, not confirmed walls. "
@@ -764,8 +824,8 @@ class ArenaView(QWidget):
         self._sync()
 
     def _build_raw_tof_panel(self):
-        """Build the always-visible raw point and matrix TOF readout."""
-        self.raw_tof_group = QGroupBox("Raw TOF readings — values before mapping filters")
+        """Build the always-visible raw range-sensor readout."""
+        self.raw_tof_group = QGroupBox("Raw range readings — values before mapping filters")
         self.raw_tof_group.setMaximumHeight(285)
         panel = QHBoxLayout(self.raw_tof_group)
 
@@ -775,6 +835,13 @@ class ArenaView(QWidget):
         self.raw_point_labels = {}
         self.raw_point_state = {}
         panel.addWidget(point_box, 2)
+
+        ultrasound_box = QGroupBox("Ultrasound sensors")
+        self.raw_ultrasound_grid = QGridLayout(ultrasound_box)
+        self.raw_ultrasound_grid.setColumnStretch(0, 1)
+        self.raw_ultrasound_labels = {}
+        self.raw_ultrasound_state = {}
+        panel.addWidget(ultrasound_box, 2)
 
         matrix_box = QGroupBox("8×8 TOF — raw millimetres")
         matrix_layout = QVBoxLayout(matrix_box)
@@ -846,6 +913,56 @@ class ArenaView(QWidget):
         label.setText(text)
         label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
 
+    def _rebuild_raw_ultrasound_rows(self):
+        while self.raw_ultrasound_grid.count():
+            item = self.raw_ultrasound_grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.raw_ultrasound_labels = {}
+        for row, spec in enumerate(self.model.ultrasound_specs):
+            telemetry_name = spec["telemetry_name"]
+            title = QLabel(f"{spec.get('label', telemetry_name)} ({spec.get('port', '?')})")
+            value = QLabel("—")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.raw_ultrasound_grid.addWidget(title, row, 0)
+            self.raw_ultrasound_grid.addWidget(value, row, 1)
+            self.raw_ultrasound_labels[telemetry_name] = value
+            self._refresh_raw_ultrasound(telemetry_name)
+
+    def _refresh_raw_ultrasound(self, name):
+        label = self.raw_ultrasound_labels.get(name)
+        if label is None:
+            return
+        state = self.raw_ultrasound_state.get(name, {})
+        valid = state.get("valid")
+        timed_out = state.get("timed_out")
+        distance = _number(state.get("distance_mm"))
+        echo_us = _number(state.get("echo_us"))
+        rise_count = _number(state.get("rise_count"))
+        fall_count = _number(state.get("fall_count"))
+
+        if timed_out is True:
+            text, colour = "TIMEOUT", "#f59e0b"
+        elif valid is True and distance is not None:
+            details = [f"{distance:g} mm"]
+            if echo_us is not None:
+                details.append(f"{echo_us:g} µs")
+            if rise_count is not None and fall_count is not None:
+                details.append(f"edges {int(rise_count)}/{int(fall_count)}")
+            if not self.model.min_range_mm <= distance <= self.model.max_range_mm:
+                details.append("outside map")
+                colour = "#f59e0b"
+            else:
+                colour = "#22c55e"
+            text = " · ".join(details)
+        elif valid is False:
+            text, colour = "NO VALID RANGE", "#9ca3af"
+        else:
+            text, colour = "—", "#9ca3af"
+
+        label.setText(text)
+        label.setStyleSheet(f"QLabel {{ color: {colour}; font-weight: bold; }}")
+
     def _refresh_raw_matrix(self, message):
         available = bool(message.get("available"))
         valid = bool(message.get("valid"))
@@ -873,24 +990,42 @@ class ArenaView(QWidget):
         """Join firmware telemetry names to the user's persisted port guide."""
         config_path = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
         try:
-            configured = json.loads(config_path.read_text(encoding="utf-8")).get("tof_sensors", [])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            configured = []
+            config = {}
+        configured = config.get("tof_sensors", [])
+        configured_ultrasound = config.get("ultrasound_sensors", [])
         try:
             guide = json.loads(str(self.settings.value("wiring_guide/entries_v1", "[]")))
         except (TypeError, ValueError):
             guide = []
         by_port = {}
+        ultrasound_labels = {}
         for entry in guide if isinstance(guide, list) else []:
             if not isinstance(entry, dict) or str(entry.get("kind", "")).lower() != "sensor":
                 continue
             port = str(entry.get("connector", "")).strip().upper()
-            if re.fullmatch(r"XSHUT[0-7]", port) and "tof" in str(entry.get("device", "")).lower():
-                by_port[port] = str(entry.get("device", port))
+            device = str(entry.get("device", "")).strip()
+            pins = str(entry.get("pins", "")).upper()
+            if re.fullmatch(r"XSHUT[0-7]", port) and "tof" in device.lower():
+                by_port[port] = device
+            if "ultrasound" in device.lower():
+                lower_device = device.lower()
+                display_device = device
+                if lower_device == "ultrasound a":
+                    display_device = "Ultrasound Left (A)"
+                elif lower_device == "ultrasound b":
+                    display_device = "Ultrasound Right (B)"
+                if ("(a)" in lower_device or lower_device.endswith(" a") or
+                        ("D14" in pins and "D24" in pins)):
+                    ultrasound_labels["a"] = display_device
+                elif ("(b)" in lower_device or lower_device.endswith(" b") or
+                      ("D22" in pins and "D20" in pins)):
+                    ultrasound_labels["b"] = display_device
 
         if self.sensor_group is not None:
             self.sensor_form_parent.removeRow(self.sensor_group)
-        self.sensor_group = QGroupBox("Point TOF sensors — robot point of view")
+        self.sensor_group = QGroupBox("Range sensors — robot point of view")
         sensor_form = QFormLayout(self.sensor_group)
         self.sensor_controls = {}
         specs = []
@@ -946,6 +1081,69 @@ class ArenaView(QWidget):
             controls["layer"] = layer_combo
             self.sensor_controls[name] = controls
             specs.append(spec)
+
+        # Ultrasound channels are ordinary draggable range sensors in the same
+        # robot-layout canvas. They retain their own telemetry names (a/b), while
+        # the user-facing labels come from the Wiring Guide when available.
+        ultrasound_specs = []
+        for index, sensor in enumerate(
+                configured_ultrasound if isinstance(configured_ultrasound, list) else []):
+            if not isinstance(sensor, dict):
+                continue
+            telemetry_name = str(sensor.get("name", "")).strip()
+            if not telemetry_name:
+                continue
+            control_name = f"ultrasound.{telemetry_name}"
+            trigger_pin = sensor.get("trigger_pin", "?")
+            echo_pin = sensor.get("echo_pin", "?")
+            default_label = (
+                "Ultrasound Left (A)" if telemetry_name.lower() == "a"
+                else "Ultrasound Right (B)" if telemetry_name.lower() == "b"
+                else str(sensor.get("label", f"Ultrasound {telemetry_name.upper()}"))
+            )
+            label = ultrasound_labels.get(telemetry_name.lower(), default_label)
+            lateral_default = -90 if index == 0 else 90
+            forward_default = 180
+            spec = {
+                "name": control_name,
+                "telemetry_name": telemetry_name,
+                "kind": "ultrasound",
+                "port": f"US-{telemetry_name.upper()}",
+                "label": label,
+                "angle": 0.0,
+                "x": float(lateral_default),
+                "y": float(forward_default),
+                "layer": "top",
+            }
+            sensor_form.addRow(QLabel(
+                f"{label} (TRIG D{trigger_pin}, ECHO D{echo_pin})"
+            ))
+            controls = {}
+            for field, caption, default in (
+                ("angle", "Angle (°)", 0),
+                ("x", "Right offset (mm)", lateral_default),
+                ("y", "Forward offset (mm)", forward_default),
+            ):
+                control = QDoubleSpinBox()
+                control.setRange(-180 if field == "angle" else -1000,
+                                 180 if field == "angle" else 1000)
+                control.setDecimals(1)
+                key = f"arena/sensors/{control_name}/{field}"
+                try:
+                    value = float(self.settings.value(key, default))
+                except (TypeError, ValueError):
+                    value = float(default)
+                control.setValue(value)
+                spec[field] = control.value()
+                control.valueChanged.connect(
+                    lambda new_value, s=spec, f=field, k=key:
+                    self._sensor_geometry_changed(s, f, k, new_value)
+                )
+                sensor_form.addRow(caption, control)
+                controls[field] = control
+            self.sensor_controls[control_name] = controls
+            ultrasound_specs.append(spec)
+
         matrix_entry = next((entry for entry in guide if isinstance(entry, dict) and
                              "8x8" in str(entry.get("device", "")).lower()), None)
         matrix_label = str(matrix_entry.get("device", "SEN0628 8x8 TOF")) if matrix_entry else "SEN0628 8x8 TOF"
@@ -981,9 +1179,12 @@ class ArenaView(QWidget):
         self.sensor_controls["matrix"] = matrix_controls
         self.sensor_form_parent.addRow(self.sensor_group)
         self.model.sensor_specs = specs
+        self.model.ultrasound_specs = ultrasound_specs
         self.model.matrix_spec = matrix
         self.sensor_canvas.set_specs(specs + [matrix])
+        self.sensor_canvas.set_aux_specs(ultrasound_specs)
         self._rebuild_raw_point_rows()
+        self._rebuild_raw_ultrasound_rows()
         self.sensor_unmatched = sorted(set(by_port) - configured_ports)
         self.reset_map()
 
@@ -1043,6 +1244,17 @@ class ArenaView(QWidget):
             sensor_name, field = match.groups()
             self.raw_point_state.setdefault(sensor_name, {})[field] = value
             self._refresh_raw_point(sensor_name)
+
+        ultrasound_match = re.fullmatch(
+            r"ultrasound\.([^.]+)\.(valid|timed_out|distance_mm|echo_us|"
+            r"trigger_count|rise_count|fall_count|echo_high)",
+            name,
+        )
+        if ultrasound_match:
+            sensor_name, field = ultrasound_match.groups()
+            self.raw_ultrasound_state.setdefault(sensor_name, {})[field] = value
+            self._refresh_raw_ultrasound(sensor_name)
+
         old_time = self.model._frame_time
         self.model.receive_telemetry(name, value, timestamp)
         if old_time is not None and old_time != timestamp:
@@ -1073,6 +1285,10 @@ class ArenaView(QWidget):
         )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
+        ultrasound_valid = sum(
+            m.latest.get(f"ultrasound.{spec['telemetry_name']}.valid") is True
+            for spec in m.ultrasound_specs
+        )
         missing = (f" Wiring Guide ports not active in firmware: {', '.join(self.sensor_unmatched)}."
                    if self.sensor_unmatched else "")
         self.status.setText(
@@ -1085,6 +1301,7 @@ class ArenaView(QWidget):
             f"self-test {'pass' if m.last_imu_self_test_passed is True else 'not confirmed'}. "
             f"{m.last_source}. "
             f"Point TOF online: {online}/{len(m.sensor_specs)}; "
+            f"ultrasound valid: {ultrasound_valid}/{len(m.ultrasound_specs)}; "
             f"8x8: {'ready' if m.last_matrix_available and m.last_matrix_valid else 'waiting/invalid'}. "
             f"Known grid squares: {len(m.cells)}; possible-weight squares: "
             f"{sum(v >= 2 for v in m.weight_votes.values())}.{missing}"
