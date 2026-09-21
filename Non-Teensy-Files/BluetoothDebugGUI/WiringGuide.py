@@ -42,6 +42,7 @@ DEFAULT_ENTRIES = [
     {"kind": "Sensor", "device": "TOF Short Bottom Mid Left", "connector": "XSHUT5", "pins": "I2C0 / XSHUT5", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Short Bottom Mid Right", "connector": "XSHUT0", "pins": "I2C0 / XSHUT0", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Short Bottom Right Right", "connector": "XSHUT3", "pins": "I2C0 / XSHUT3", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Short Bottom Left Left", "connector": "XSHUT4", "pins": "I2C0 / XSHUT4", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "SEN0628 8×8 TOF", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x33"},
     {"kind": "Sensor", "device": "BNO055 IMU", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x28/0x29"},
 ]
@@ -146,6 +147,16 @@ class WiringGuide(QWidget):
                                         if entry["device"] == "Dual encoder board"))
                     self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
                 self.settings.setValue("wiring_guide/encoder_raw2_migrated", True)
+                self.settings.sync()
+            # Add the confirmed XSHUT4 sensor once while retaining any custom
+            # XSHUT4 entry/label already created in the live Wiring Guide.
+            if not self.settings.value("wiring_guide/xshut4_migrated", False, type=bool):
+                if not any(entry["connector"].strip().upper() == "XSHUT4"
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["connector"] == "XSHUT4"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/xshut4_migrated", True)
                 self.settings.sync()
             return cleaned
         except (TypeError, ValueError):

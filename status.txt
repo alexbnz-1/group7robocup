@@ -1,8 +1,8 @@
 GROUP 7 ROBOCUP PROJECT STATUS
-Last updated: 2026-09-20 (Pacific/Auckland)
+Last updated: 2026-09-21 (Pacific/Auckland)
 Repository: C:\Users\alex\Desktop\group7robocup
 Current branch: testing
-Current committed revision before the bumper edit: 9803c52 - changed lower bound for tof
+Current committed revision before the XSHUT4 edit: 3617188 - Added bumper on off button
 
 ===============================================================================
 0. READ THIS FIRST — AUTHORITATIVE RESUME SNAPSHOT
@@ -17,9 +17,11 @@ numbered section rather than an older historical statement.
 Repository state at this handoff:
 
 - Branch: testing.
-- Revision before the current bumper edit: 9803c52.
-- Current local changes add the paired bumper-servo command and its generated
-  definition, tests and documentation.
+- Revision before the current XSHUT4 edit: 3617188.
+- Current local changes add the sixth point TOF on XSHUT4 plus its generated
+  definition, Wiring Guide migration, diagnostics, tests and documentation.
+  They also correct the 8x8 top-down geometry so equal-depth returns make a
+  straight boundary rather than a circular arc.
 - Desktop platform used for testing: Windows.
 - Firmware target: Teensy 4.0 using Arduino through PlatformIO.
 - Arena dimensions: 2400 mm wide, 4900 mm long, 400 mm walls.
@@ -39,8 +41,8 @@ Current hardware assignments:
 - Encoder calibration: encoder 1 is inverted at 0.09094 mm/count; encoder 2 is
   not inverted at 0.09592 mm/count. The 40 mm wheel track is still a supplied
   value that should be physically confirmed.
-- Five point TOFs are selected through the SX1509 XSHUT expander: XSHUT1 and
-  XSHUT2 long range; XSHUT5, XSHUT0 and XSHUT3 short range. Their assigned
+- Six point TOFs are selected through the SX1509 XSHUT expander: XSHUT1 and
+  XSHUT2 long range; XSHUT5, XSHUT0, XSHUT3 and XSHUT4 short range. Their assigned
   I2C addresses start at 0x40. Configuration names live in debug_config.json.
 - SEN0628 8x8 TOF: raw I2C1 / Wire1, detected at 0x33.
 - BNO055 IMU: I2C1 / Wire1 at 0x28. The driver probes I2C1 first and I2C0 as a
@@ -56,7 +58,8 @@ Most recent live verification:
 - BNO055 was available on bus 1, fusion status was running, self-test passed,
   gyro/magnetometer calibration were 3/3, and no active system error existed.
 - The 8x8 sensor was valid at 0x33 and delivered 23 frames in that sample.
-- All five point sensors reported available, although bottom_mid_left returned
+- Before XSHUT4 was added, all five configured point sensors reported available,
+  although bottom_mid_left returned
   zero throughout and bottom_mid_right occasionally returned 8191. Zero, 8191
   and all other values outside 10–3500 mm are shown raw but rejected by the
   arena mapper.
@@ -2411,6 +2414,56 @@ the Teensy 4.0 firmware successfully; code uses 127704 bytes of flash code and
 29824 bytes of RAM1 variables. The warnings are in the Teensy framework and
 supplied MatrixLidar driver, not the new bumper handler. This firmware change
 must be uploaded before the buttons can operate the real servos.
+
+===============================================================================
+40. SIXTH POINT TOF ON XSHUT4
+===============================================================================
+
+XSHUT4 is now configured as the sixth point sensor. Its firmware telemetry name
+is `bottom_left_left`, its type is short range, and its default descriptive
+label is Bottom far-left short-range TOF. The Wiring Guide display name is
+TOF Short Bottom Left Left. Existing custom Wiring Guide entries are preserved:
+the migration only inserts this default row when no XSHUT4 connector already
+exists.
+
+Adding the sensor to PlatformIO/debug_config.json automatically makes the
+Bluetooth workflow initialise it, assign the next address in the 0x40–0x47
+range, read it with normal telemetry, and expose `tof.bottom_left_left.*`.
+Arena View then discovers it from the same configuration and includes it in
+the raw readout, layout editor, top/bottom layer logic and evidence grid. The
+live diagnostic summary also knows the new telemetry name.
+
+The firmware compiles successfully with six point sensors. The desktop suite
+passes all 29 tests, including the exact XSHUT0/1/2/3/4/5 configuration and an
+existing-settings migration that retains custom entries while adding XSHUT4.
+The rebuilt firmware must be uploaded before the Teensy will publish the sixth
+sensor. Restart the desktop app after the upload so it requests the new
+definitions and reloads the Wiring Guide/Arena layout.
+
+===============================================================================
+41. FLAT-PLANE 8X8 ARENA PROJECTION
+===============================================================================
+
+The 8x8 Arena View previously treated each column median as radial range. Equal
+values were therefore plotted on a circular arc, making a flat plate look
+curved even when it was moved squarely toward and away from the sensor.
+
+Matrix values are now interpreted as forward depth along the sensor module's
+centreline. For each horizontal bearing, the mapper converts that depth to ray
+length using depth divided by the cosine of the bearing relative to the module
+centreline. The free-space fill and red occupied endpoint use the same planar
+geometry. Equal column depths consequently terminate at the same forward
+coordinate and form a straight line perpendicular to the configured module
+angle. Real measurements may still form small 10 mm steps because each column
+has independent noise and the evidence grid uses 10 mm cells.
+
+The arena-model regression test now explicitly feeds an equal 1000 mm frame,
+checks all eight projected endpoints have the same forward coordinate, and
+checks the expected 1150 mm world position after the module's 150 mm mounting
+offset. The complete desktop suite passes all 29 tests. This is a desktop-only
+mapping correction and requires an app restart, not a Teensy upload. Press
+Reset local map after restarting to discard curved evidence stored by the old
+projector.
 
 ===============================================================================
 END OF STATUS

@@ -29,6 +29,12 @@
       "label": "Bottom far-right short-range TOF",
       "type": "short",
       "port": "XSHUT3"
+    },
+    {
+      "name": "bottom_left_left",
+      "label": "Bottom far-left short-range TOF",
+      "type": "short",
+      "port": "XSHUT4"
     }
 
   ],

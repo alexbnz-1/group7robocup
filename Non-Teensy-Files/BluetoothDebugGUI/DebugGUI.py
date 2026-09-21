@@ -2500,7 +2500,7 @@ class RobotDebugGUI(QMainWindow):
             self.firmware_warning_label.setText(
                 "Robot telemetry is live, but the Teensy is running the older "
                 "front/left TOF firmware. Upload the current PlatformIO build "
-                "to enable the IMU and five-sensor Arena View."
+                "to enable the IMU and six-sensor Arena View."
             )
             self.firmware_warning_label.show()
         self.telemetry_event_times.append(now)

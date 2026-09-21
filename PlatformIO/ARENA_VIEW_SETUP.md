@@ -59,8 +59,8 @@ telemetry and the separate 8x8 view remain unfiltered. Point-sensor zero and
 10–3500 mm mapping range, are rejected before this temporal filter. The 10 mm
 lower bound keeps a zero sentinel invalid while retaining close measurements.
 
-The current Wiring Guide names five point sensors: XSHUT1 and XSHUT2 are long
-range; XSHUT5, XSHUT0, and XSHUT3 are short range. These same five ports are
+The current Wiring Guide names six point sensors: XSHUT1 and XSHUT2 are long
+range; XSHUT5, XSHUT0, XSHUT3, and XSHUT4 are short range. These same six ports are
 now in `debug_config.json` and their individual telemetry feeds the grid.
 The GUI joins them to Wiring Guide entries by XSHUT port. Each has editable
 robot-right offset, forward offset, and pointing angle. The starting offsets
@@ -89,6 +89,12 @@ pixels, waits for two consistent frames, and paints that column's complete
 horizontal angular sector as a filled wedge. The eight wedges form the cone.
 The raw table remains the literal source for all individual zone values.
 
+Matrix ranges are projected as forward depth relative to the module centreline,
+not as equal-radius points on a circular arc. Each horizontal ray is extended by
+`depth / cos(ray angle)`, so a flat plate square to the sensor produces a straight
+red boundary across the cone. Natural per-column measurement differences can
+still make the boundary slightly stepped because the map uses 10 mm cells.
+
 The map now defaults to **10 mm (1 cm) cells**. The map is zoomable with the
 mouse wheel and pannable by dragging; use Reset map zoom / pan to return to the
 full-arena view. The GUI caches the grid as an image so the finer resolution
@@ -97,7 +103,7 @@ If an older installation was still using the former 100 mm default, the app
 migrates it to 10 mm once; a deliberately customised size is retained.
 
 The robot diagram in Arena View is a mounting-layout editor, not a measured
-chassis drawing. It shows five point sensors and the 8x8 module. Drag a sensor
+chassis drawing. It shows six point sensors and the 8x8 module. Drag a sensor
 marker to set its robot-right and forward offsets; drag its white arrow tip
 to set beam direction. Every sensor also has numeric offset/angle controls
 and a top/bottom height-layer selector. Cyan circles mean top and orange

@@ -128,7 +128,10 @@ class ArenaModelTests(unittest.TestCase):
         self.assertEqual(len(self.map.points), 8)
         self.assertEqual(len(self.map.current_rays), 24)
         horizontal = [point[0] for point in self.map.points]
+        forward = [point[1] for point in self.map.points]
         self.assertGreater(max(horizontal) - min(horizontal), 800)
+        self.assertLess(max(forward) - min(forward), 1e-6)
+        self.assertAlmostEqual(forward[0], 1150.0, places=5)
         self.assertGreater(len(self.map.cells), 3000)
         self.assertLess(self.map.cells.get(self.map._cell(0, 700), 0), 0)
         self.assertNotIn(self.map._cell(800, 700), self.map.cells)
@@ -182,12 +185,12 @@ class ArenaModelTests(unittest.TestCase):
         self.map.finish_frame()
         self.assertFalse(self.map.cells)
 
-    def test_firmware_contains_all_five_wiring_ports(self):
+    def test_firmware_contains_all_six_wiring_ports(self):
         config = Path(__file__).resolve().parents[2] / "PlatformIO" / "debug_config.json"
         sensors = json.loads(config.read_text(encoding="utf-8"))["tof_sensors"]
         self.assertEqual({sensor["port"]: sensor["type"] for sensor in sensors}, {
             "XSHUT1": "long", "XSHUT2": "long", "XSHUT5": "short",
-            "XSHUT0": "short", "XSHUT3": "short",
+            "XSHUT0": "short", "XSHUT3": "short", "XSHUT4": "short",
         })
 
     def test_centimetre_cells(self):
@@ -266,7 +269,7 @@ class SensorLayoutTests(unittest.TestCase):
             settings = QSettings(str(Path(directory) / "layout.ini"), QSettings.Format.IniFormat)
             view = ArenaView(settings)
             self.assertEqual(view.grid_size.value(), 10)
-            self.assertEqual(len(view.sensor_canvas.specs), 6)
+            self.assertEqual(len(view.sensor_canvas.specs), 7)
             view.sensor_canvas.resize(340, 340)
             spec = next(s for s in view.model.sensor_specs if s["name"] == "bottom_mid_left")
             view.sensor_controls[spec["name"]]["layer"].setCurrentText("top")

@@ -51,7 +51,7 @@ class WiringGuideTest(unittest.TestCase):
             self.assertNotIn("Test encoder", [entry["device"] for entry in second.entries])
             second.close()
 
-    def test_existing_guide_gets_encoder_without_losing_edits(self):
+    def test_existing_guide_gets_encoder_and_xshut4_without_losing_edits(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings_file = str(Path(temporary) / "existing.ini")
             settings = QSettings(settings_file, QSettings.Format.IniFormat)
@@ -62,6 +62,7 @@ class WiringGuideTest(unittest.TestCase):
             guide = WiringGuide(settings)
             self.assertEqual(guide.entries[0]["device"], "Custom device")
             self.assertEqual(guide.entries[1]["device"], "Dual encoder board")
+            self.assertEqual(guide.entries[2]["connector"], "XSHUT4")
             guide.close()
 
 

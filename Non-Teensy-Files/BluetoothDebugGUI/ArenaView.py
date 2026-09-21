@@ -315,47 +315,56 @@ class ArenaModel:
             self.cells[endpoint] = min(8, self.cells.get(endpoint, 0) + 3)
 
     def _add_wedge_observation(self, distance_mm, centre_angle_deg, width_deg,
-                               source, lateral_mm=0.0, forward_mm=0.0):
-        """Paint one matrix column as a filled top-down angular sector."""
+                               source, lateral_mm=0.0, forward_mm=0.0,
+                               reference_angle_deg=0.0):
+        """Paint a matrix sector whose distance is forward depth, not radius."""
         if not self.min_range_mm <= distance_mm <= self.max_range_mm:
             return
         origin_x = self.x + forward_mm * math.cos(self.theta) + lateral_mm * math.sin(self.theta)
         origin_y = self.y + forward_mm * math.sin(self.theta) - lateral_mm * math.cos(self.theta)
         half_width = width_deg * 0.5
+
+        def plane_endpoint(angle_deg):
+            # Equal matrix depths lie on a plane perpendicular to the module's
+            # centreline. Dividing by cos converts axial depth to ray length.
+            relative = math.radians(angle_deg - reference_angle_deg)
+            cosine = max(0.05, math.cos(relative))
+            return self._endpoint(distance_mm / cosine, angle_deg,
+                                  lateral_mm, forward_mm)
+
         for offset in (-half_width, 0.0, half_width):
-            target = self._endpoint(distance_mm, centre_angle_deg + offset,
-                                    lateral_mm, forward_mm)
+            target = plane_endpoint(centre_angle_deg + offset)
             self.current_rays.append((origin_x, origin_y, *target, source))
         if self.mm_per_count <= 0:
             return
 
-        centre_target = self._endpoint(distance_mm, centre_angle_deg,
-                                       lateral_mm, forward_mm)
+        centre_target = plane_endpoint(centre_angle_deg)
         self.points.append((*centre_target, source))
-        width_rad = math.radians(width_deg)
-        base_angle = self.theta + math.radians(centre_angle_deg)
-        free_limit = max(0.0, distance_mm - self.cell_size_mm * 1.5)
         free_cells = set()
-        radius = self.cell_size_mm * 0.5
-        while radius <= free_limit:
-            samples = max(1, math.ceil(radius * width_rad / self.cell_size_mm))
-            for index in range(samples + 1):
-                fraction = index / samples
-                angle = base_angle - width_rad * 0.5 + width_rad * fraction
-                free_cells.add(self._cell(origin_x + radius * math.cos(angle),
-                                          origin_y + radius * math.sin(angle)))
-            radius += self.cell_size_mm
+        left_relative = math.radians(centre_angle_deg - half_width - reference_angle_deg)
+        right_relative = math.radians(centre_angle_deg + half_width - reference_angle_deg)
+        cap_width = abs(distance_mm * (math.tan(right_relative) - math.tan(left_relative)))
+        angular_samples = max(2, math.ceil(cap_width / self.cell_size_mm))
+        endpoint_cells = set()
+        for index in range(angular_samples + 1):
+            fraction = index / angular_samples
+            angle_deg = centre_angle_deg - half_width + width_deg * fraction
+            relative = math.radians(angle_deg - reference_angle_deg)
+            ray_length = distance_mm / max(0.05, math.cos(relative))
+            world_angle = self.theta + math.radians(angle_deg)
+            free_limit = max(0.0, ray_length - self.cell_size_mm * 1.5)
+            radius = self.cell_size_mm * 0.5
+            while radius <= free_limit:
+                free_cells.add(self._cell(origin_x + radius * math.cos(world_angle),
+                                          origin_y + radius * math.sin(world_angle)))
+                radius += self.cell_size_mm
+            endpoint_cells.add(self._cell(
+                origin_x + ray_length * math.cos(world_angle),
+                origin_y + ray_length * math.sin(world_angle)
+            ))
         for cell in free_cells:
             self.cells[cell] = max(-8, self.cells.get(cell, 0) - 1)
-
-        endpoint_samples = max(
-            2, math.ceil(distance_mm * width_rad / self.cell_size_mm)
-        )
-        for index in range(endpoint_samples + 1):
-            fraction = index / endpoint_samples
-            angle = base_angle - width_rad * 0.5 + width_rad * fraction
-            cell = self._cell(origin_x + distance_mm * math.cos(angle),
-                              origin_y + distance_mm * math.sin(angle))
+        for cell in endpoint_cells:
             self.cells[cell] = min(8, self.cells.get(cell, 0) + 3)
 
     def receive_matrix(self, message):
@@ -399,7 +408,8 @@ class ArenaModel:
             self.matrix_top_samples.append((angle, distance))
             self._add_wedge_observation(
                 distance, angle, sector_width, "8x8",
-                self.matrix_spec["x"], self.matrix_spec["y"]
+                self.matrix_spec["x"], self.matrix_spec["y"],
+                self.matrix_spec["angle"]
             )
 
 

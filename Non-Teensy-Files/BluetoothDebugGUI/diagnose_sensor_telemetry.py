@@ -46,7 +46,7 @@ def main():
         link.disconnect_port()
         tof_names = [
             "top_mid_left", "top_mid_right", "bottom_mid_left",
-            "bottom_mid_right", "bottom_right_right",
+            "bottom_mid_right", "bottom_right_right", "bottom_left_left",
         ]
         print(f"port={port} duration_s={duration_ms / 1000:.1f} errors={errors}")
         print("system:", {key: latest.get(key) for key in (
