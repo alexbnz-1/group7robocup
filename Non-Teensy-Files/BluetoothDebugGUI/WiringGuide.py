@@ -37,6 +37,9 @@ DEFAULT_ENTRIES = [
     {"kind": "Servo", "device": "HX12K C", "connector": "Digital Raw 1 / level shift", "pins": "D31", "notes": "Level-shifted servo output"},
     {"kind": "Servo", "device": "HX12K D", "connector": "Digital Raw 1 / level shift", "pins": "D30", "notes": "Level-shifted servo output"},
     {"kind": "Sensor", "device": "Dual encoder board", "connector": "Digital Raw 2", "pins": "E1 A:D2 B:D3 / E2 A:D4 B:D5", "notes": "Quadrature; 3.3 V signals only"},
+    {"kind": "Sensor", "device": "Inductive proximity sensor", "connector": "Digital", "pins": "D21", "notes": "Active-low digital input; INPUT_PULLUP; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "Ultrasound A", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D14 / ECHO D24", "notes": "Original D24/D14 pair with signal directions reversed; 3.3 V maximum"},
+    {"kind": "Sensor", "device": "Ultrasound B", "connector": "Ultrasound interface / 8-pin", "pins": "TRIG D22 / ECHO D20", "notes": "Original D20/D22 pair with signal directions reversed; 3.3 V maximum"},
     {"kind": "Sensor", "device": "TOF Long Top Mid Left", "connector": "XSHUT1", "pins": "I2C0 / XSHUT1", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Long Top Mid Right", "connector": "XSHUT2", "pins": "I2C0 / XSHUT2", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Short Bottom Mid Left", "connector": "XSHUT5", "pins": "I2C0 / XSHUT5", "notes": "Configured in debug_config.json"},
@@ -157,6 +160,66 @@ class WiringGuide(QWidget):
                                         if entry["connector"] == "XSHUT4"))
                     self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
                 self.settings.setValue("wiring_guide/xshut4_migrated", True)
+                self.settings.sync()
+            # Add the confirmed D21 proximity input once without replacing any
+            # custom wiring rows or labels.
+            if not self.settings.value("wiring_guide/inductive_d21_migrated", False, type=bool):
+                if not any("D21" in entry["pins"].upper() or
+                           "inductive" in entry["device"].lower() for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Inductive proximity sensor"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/inductive_d21_migrated", True)
+                self.settings.sync()
+            if not self.settings.value("wiring_guide/ultrasound_d24_d14_migrated", False, type=bool):
+                if not any("D24" in entry["pins"].upper() and
+                           ("D14" in entry["pins"].upper() or "D22" in entry["pins"].upper())
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Ultrasound A"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_d24_d14_migrated", True)
+                self.settings.sync()
+            if not self.settings.value("wiring_guide/ultrasound_d20_d22_migrated", False, type=bool):
+                if not any("D20" in entry["pins"].upper() and
+                           ("D22" in entry["pins"].upper() or "D14" in entry["pins"].upper())
+                           for entry in cleaned):
+                    cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                        if entry["device"] == "Ultrasound B"))
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_d20_d22_migrated", True)
+                self.settings.sync()
+            if not self.settings.value("wiring_guide/ultrasound_echo_swap_migrated", False, type=bool):
+                changed = False
+                for entry in cleaned:
+                    pins = entry["pins"].strip().upper()
+                    if pins == "TRIG D24 / ECHO D14":
+                        entry["pins"] = "TRIG D24 / ECHO D22"
+                        entry["notes"] = "Test mapping after swapping the two echo lines; 3.3 V maximum"
+                        changed = True
+                    elif pins == "TRIG D20 / ECHO D22":
+                        entry["pins"] = "TRIG D20 / ECHO D14"
+                        entry["notes"] = "Test mapping after swapping the two echo lines; 3.3 V maximum"
+                        changed = True
+                if changed:
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_echo_swap_migrated", True)
+                self.settings.sync()
+            if not self.settings.value("wiring_guide/ultrasound_direction_swap_migrated", False, type=bool):
+                changed = False
+                for entry in cleaned:
+                    pins = entry["pins"].strip().upper()
+                    if pins in ("TRIG D24 / ECHO D14", "TRIG D24 / ECHO D22"):
+                        entry["pins"] = "TRIG D14 / ECHO D24"
+                        entry["notes"] = "Original D24/D14 pair with signal directions reversed; 3.3 V maximum"
+                        changed = True
+                    elif pins in ("TRIG D20 / ECHO D22", "TRIG D20 / ECHO D14"):
+                        entry["pins"] = "TRIG D22 / ECHO D20"
+                        entry["notes"] = "Original D20/D22 pair with signal directions reversed; 3.3 V maximum"
+                        changed = True
+                if changed:
+                    self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/ultrasound_direction_swap_migrated", True)
                 self.settings.sync()
             return cleaned
         except (TypeError, ValueError):

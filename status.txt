@@ -21,7 +21,9 @@ Repository state at this handoff:
 - Current local changes add the sixth point TOF on XSHUT4 plus its generated
   definition, Wiring Guide migration, diagnostics, tests and documentation.
   They also correct the 8x8 top-down geometry so equal-depth returns make a
-  straight boundary rather than a circular arc.
+  straight boundary rather than a circular arc, and add the JSON-configured
+  D21 inductive proximity input with debounced telemetry. The current work also
+  adds the front ultrasound board on trigger D24 and echo D14.
 - Desktop platform used for testing: Windows.
 - Firmware target: Teensy 4.0 using Arduino through PlatformIO.
 - Arena dimensions: 2400 mm wide, 4900 mm long, 400 mm walls.
@@ -38,6 +40,12 @@ Current hardware assignments:
 - HX12K level-shift outputs: A D33, B D32, C D31, D D30.
 - Dual quadrature encoders on Digital Raw 2: encoder 1 D2/D3 and encoder 2
   D4/D5. These pins must not also be enabled as motor outputs.
+- Inductive proximity sensor: D21 digital input, configured active-low with
+  internal pull-up and 20 ms debounce. The signal at D21 must remain 0–3.3 V.
+- Dual ultrasound interface on its 8-pin cable: test mapping channel A trigger
+  D14 / echo D24; channel B trigger D22 / echo D20. They are sampled alternately and
+  non-blockingly at 100 ms intervals with a 30 ms timeout. Echo inputs must
+  remain 0–3.3 V.
 - Encoder calibration: encoder 1 is inverted at 0.09094 mm/count; encoder 2 is
   not inverted at 0.09592 mm/count. The 40 mm wheel track is still a supplied
   value that should be physically confirmed.
@@ -63,7 +71,7 @@ Most recent live verification:
   zero throughout and bottom_mid_right occasionally returned 8191. Zero, 8191
   and all other values outside 10–3500 mm are shown raw but rejected by the
   arena mapper.
-- The offline desktop suite passes all 29 tests.
+- The offline desktop suite passes all 33 tests.
 
 Newest desktop behavior:
 
@@ -2099,7 +2107,9 @@ group7robocup\
 |   |-- DEBUG_GUI_CONFIG.md
 |   |-- ENCODER_WIRING.md
 |   |-- HX12K_WIRING.md
+|   |-- INDUCTIVE_PROXIMITY_WIRING.md
 |   |-- TOF8X8_WIRING.md
+|   |-- ULTRASOUND_WIRING.md
 |   |-- debug_config.json
 |   |-- platformio.ini
 |   |-- include\
@@ -2123,6 +2133,10 @@ group7robocup\
 |       |-- DcMotor203\
 |       |   |-- DcMotor203.cpp
 |       |   `-- DcMotor203.h
+|       |-- DigitalInputSensor\
+|       |   |-- DigitalInputSensor.cpp
+|       |   |-- DigitalInputSensor.h
+|       |   `-- library.json
 |       |-- DualEncoder\
 |       |   |-- DualEncoder.cpp
 |       |   `-- DualEncoder.h
@@ -2145,6 +2159,10 @@ group7robocup\
 |       |-- Tof8x8\
 |       |   |-- Tof8x8.cpp
 |       |   `-- Tof8x8.h
+|       |-- UltrasoundSensor\
+|       |   |-- UltrasoundSensor.cpp
+|       |   |-- UltrasoundSensor.h
+|       |   `-- library.json
 |       `-- DFRobot_MatrixLidar\
 |           |-- DFRobot_MatrixLidar.cpp
 |           |-- DFRobot_MatrixLidar.h
@@ -2269,7 +2287,7 @@ Firmware entry/configuration:
 - PlatformIO/include/config.h is the authoritative compile-time pin/UART/I2C
   assignment file.
 - PlatformIO/debug_config.json is the human-edited list of GUI commands,
-  parameters and point-TOF definitions.
+  parameters, digital inputs, ultrasound sensors and point-TOF definitions.
 - PlatformIO/scripts/embed_debug_config.py validates/compacts that JSON before
   every build and writes PlatformIO/include/debug_config.generated.h.
 - PlatformIO/platformio.ini selects Teensy 4.0, dependencies and the pre-build
@@ -2289,6 +2307,8 @@ Firmware device libraries:
 - Bno055Imu probes Wire1 then Wire and publishes full fusion/diagnostic state.
 - DcMotor203 generates the 1.05–1.95 ms servo-style motor-driver pulses with
   1.50 ms neutral and supports forward/reverse percentages.
+- DigitalInputSensor provides configurable polarity, pull-up and debounce while
+  retaining both logical detection and raw-level diagnostics.
 - DualEncoder wraps Encoder.h for two x4 quadrature channels and reports count,
   delta and counts/second.
 - HerkulexTeensy implements packet protocol, angle read/write, zero-relative
@@ -2298,6 +2318,8 @@ Firmware device libraries:
   unique runtime addresses.
 - Tof8x8 wraps the supplied DFRobot MatrixLidar library, uses Wire1, scans the
   supported addresses and returns complete row-major 64-zone frames.
+- UltrasoundSensor performs timed trigger/echo ranging without blocking the
+  Bluetooth and actuator service loop while waiting for an echo.
 - DFRobot_MatrixLidar is the provided third-party SEN0628 driver copied into
   the PlatformIO project together with its license/examples.
 - Ir exists for analogue IR presence sensing but is not the primary arena range
@@ -2464,6 +2486,128 @@ offset. The complete desktop suite passes all 29 tests. This is a desktop-only
 mapping correction and requires an app restart, not a Teensy upload. Press
 Reset local map after restarting to discard curved evidence stored by the old
 projector.
+
+===============================================================================
+42. D21 INDUCTIVE PROXIMITY INPUT
+===============================================================================
+
+The inductive proximity sensor is assigned to Teensy D21. The obsolete D11
+placeholder in config.h was corrected. D21 does not conflict with the current
+Bluetooth, Herkulex, motor, encoder, HX12K, I2C or TOF assignments.
+
+A reusable DigitalInputSensor library now owns digital input setup and
+debouncing. Inputs are listed in the top-level `digital_inputs` array in
+debug_config.json, so additional switches or presence sensors can be added
+without cluttering main.cpp. Each entry chooses a unique name, pin, active
+polarity, internal pull-up setting and debounce time. Up to eight are accepted;
+invalid or duplicate definitions produce a robot-side error.
+
+The current entry is `inductive_proximity`, pin 21, active-low, pull-up enabled,
+with 20 ms debounce. It publishes the debounced logical state as
+`digital.inductive_proximity.detected`, the debounced electrical level as
+`digital.inductive_proximity.raw_high`, and the accepted edge count as
+`digital.inductive_proximity.transitions`. These appear automatically in Live
+Telemetry and recordings. The Wiring Guide adds the D21 row to both fresh and
+already-saved layouts while preserving user edits.
+
+D21 is a 3.3 V-only Teensy input. A raw industrial sensor output at 5 V, 12 V or
+24 V must not be attached directly. The supplied interface cable, an
+optoisolator or a suitable level shifter must limit the CPU-side output to
+0–3.3 V. Full commissioning steps and polarity guidance are in
+PlatformIO/INDUCTIVE_PROXIMITY_WIRING.md.
+
+The Teensy 4.0 firmware builds successfully with this input enabled. The build
+uses 127320 bytes of flash code and 30208 bytes of RAM1 variables. The complete
+desktop suite passes all 30 tests, including the persistent Wiring Guide
+migration and an exact check of the D21 active-low/pull-up/debounce definition.
+The generated embedded configuration was refreshed by the successful build.
+This change requires uploading the rebuilt firmware before live D21 telemetry
+will appear.
+
+===============================================================================
+43. FRONT ULTRASOUND ON D24/D14
+===============================================================================
+
+The dual trigger/echo ultrasound interface is configured with channel A TRIG on
+D14 and ECHO on D24, plus channel B TRIG on D22 and ECHO on D20 through the
+8-pin cable. Live edge capture confirms this reversed-within-each-pair mapping
+is the working mapping. The old D9/D10 placeholders in config.h were replaced.
+D14 is also A0, so the unused IR_LEFT placeholder cannot operate at the same
+time.
+
+A reusable UltrasoundSensor library sends a 10 microsecond trigger every 100 ms
+and captures both echo edges with hardware interrupts. It does not use the
+example's unbounded `pulseIn()` call, so a missing echo cannot stall serial
+parsing, motor deadman handling or servo service. The echo times out after 30
+ms. Successful pulse duration is converted to millimetres using approximately
+0.343 mm per microsecond and divided by two for the outward/return path;
+20–5000 mm is the accepted range.
+
+Ultrasound devices are now declared in the top-level `ultrasound_sensors` JSON
+array. The supplied interface has A/B sockets and the workflow supports both,
+but each requires its own trigger/echo pair. A scheduler permits only one
+transmitter/listener pair at a time and alternates completed measurements, so
+the channels cannot cross-trigger one another. Channel A publishes
+`ultrasound.a.valid`, `.timed_out`, `.echo_us`, and `.distance_mm` when
+valid. Channel B publishes the corresponding `ultrasound.b.*` fields. Dynamic
+telemetry makes both appear in the GUI and recordings without adding
+GUI-specific controls.
+
+The Wiring Guide adds a persistent Front ultrasound board row to both new and
+existing settings while retaining custom entries. Electrical and commissioning
+details are in PlatformIO/ULTRASOUND_WIRING.md. D14 must never receive more than
+3.3 V; condition any 5 V echo output before it reaches the Teensy.
+
+The final Teensy 4.0 build succeeds, using 127704 bytes of flash code and 31360
+bytes of RAM1 variables. All 33 desktop tests pass, including exact ultrasound JSON
+configuration and migration into an existing customised Wiring Guide. The
+generated embedded configuration is current. Upload this firmware before
+expecting the `ultrasound.a.*` and `ultrasound.b.*` telemetry fields from the robot.
+
+The interface-board documentation shows two HC-SR04 modules connected through
+the 8-pin CPU cable, while the single-sensor example uses the smaller cable.
+The initial D24-trigger/D14-echo and D20-trigger/D22-echo mapping produced only
+timeouts. Exchanging the echo lines between channels also produced no response.
+The current hardware mapping restores the original pair grouping but reverses
+the function within each pair: D14-trigger/D24-echo for A and
+D22-trigger/D20-echo for B. Live testing confirms both channels work in this
+configuration.
+
+The ultrasound driver now captures ECHO edges with hardware interrupts instead
+of relying on loop polling. This prevents short echo pulses from being missed
+while the workflow services I2C sensors or Bluetooth. It also publishes raw
+12-bit echo ADC/current voltage, minimum and maximum ADC/voltage observed during
+the last ping, trigger low/high ADC and estimated high voltage, current digital
+echo level, and cumulative trigger/rise/fall counters for both channels. The
+read-only live sensor diagnostic prints all of these fields. The instrumented
+firmware was built and uploaded successfully for electrical diagnosis. That
+build uses 128152 bytes of flash code and 31424 bytes of RAM1 variables.
+
+The added diagnostics initially made the combined telemetry JSON exceed the
+3071-byte RobotDebug transmit limit, which silently discarded every normal
+telemetry frame while the separately transmitted 8x8 frames continued. Normal
+telemetry and ultrasound electrical diagnostics are now sent as two telemetry
+frames with the same timestamp. The GUI merges these by signal name as usual.
+
+A successful 15-second COM10 capture after this correction received 120 signal
+names with no protocol errors. Ultrasound A reported 9 triggers, 9 rising edges
+and 9 falling edges, a 6768 microsecond pulse and a valid 1161 mm distance.
+Ultrasound B also reported 9/9/9 edges, a 4282 microsecond pulse and a valid
+734 mm distance. Both trigger outputs measured ADC 0 low and ADC 4095 high,
+equivalent to 0.0 V and 3.3 V at 12-bit resolution. Both echo inputs were 0 V
+when idle. The slower loop-level ADC sampling missed the echo-high interval,
+but the one-for-one rising/falling interrupt counts prove that both echo inputs
+crossed the Teensy digital threshold on every ping. Measuring the exact
+echo-high amplitude requires a scope or multimeter; ADC conversion inside the
+edge interrupt was tested and removed because it stalled runtime service.
+
+The restored safe firmware builds and uploads successfully, using 128408 bytes
+of flash code and 31424 bytes of RAM1 variables. All 33 desktop tests pass.
+After the final upload, two later COM10 captures opened the PC-side CH9143 port
+but received no bytes at all, including no independent 8x8 packets. This is a
+Bluetooth link reconnection state after the Teensy reset rather than an
+ultrasound failure; the remote Bluetooth side should be power-cycled before
+opening the GUI again.
 
 ===============================================================================
 END OF STATUS

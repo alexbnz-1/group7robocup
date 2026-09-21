@@ -4,12 +4,14 @@
 #include <ArduinoJson.h>
 #include <Bno055Imu.h>
 #include <DcMotor203.h>
+#include <DigitalInputSensor.h>
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
 #include <RobotDebug.h>
 #include <Tof.h>
 #include <Tof8x8.h>
+#include <UltrasoundSensor.h>
 
 class BluetoothDebugWorkflow {
 public:
@@ -20,6 +22,8 @@ public:
 
 private:
     static constexpr uint8_t MAX_TOF_SENSORS = 8;
+    static constexpr uint8_t MAX_DIGITAL_INPUTS = 8;
+    static constexpr uint8_t MAX_ULTRASOUND_SENSORS = 2;
     HardwareSerialIMXRT& bluetoothPort_;
     uint8_t bluetoothRxBuffer_[2048] = {};
     HerkulexTeensy servos_;
@@ -69,6 +73,14 @@ private:
     bool tofTimedOut_[MAX_TOF_SENSORS] = {};
     int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
     uint32_t lastTof8x8FrameMs_ = 0;
+    uint8_t digitalInputCount_ = 0;
+    char digitalInputNames_[MAX_DIGITAL_INPUTS][25] = {};
+    DigitalInputSensor digitalInputs_[MAX_DIGITAL_INPUTS];
+    uint8_t ultrasoundSensorCount_ = 0;
+    char ultrasoundSensorNames_[MAX_ULTRASOUND_SENSORS][25] = {};
+    UltrasoundSensor ultrasoundSensors_[MAX_ULTRASOUND_SENSORS];
+    int8_t activeUltrasoundIndex_ = -1;
+    uint8_t nextUltrasoundIndex_ = 0;
 
     static void dispatch(JsonDocument& message, void* context);
     void handleMessage(JsonDocument& message);
@@ -78,6 +90,9 @@ private:
     void sendState();
     void sendTelemetry();
     void initialiseTofSensors();
+    void initialiseDigitalInputs();
+    void initialiseUltrasoundSensors();
+    void updateUltrasoundSensors();
     void readTofSensors();
     void updateTof8x8();
     void sendTof8x8Frame();

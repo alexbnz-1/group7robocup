@@ -33,6 +33,62 @@ The special parameter `debug.telemetry_interval_ms` also controls the actual
 telemetry interval. Other parameters are available through the workflow's JSON
 registry; connecting them to new robot algorithms requires a matching C++ use.
 
+## Digital inputs
+
+Add switches and proximity/presence sensors to the top-level `digital_inputs`
+array. The workflow configures, debounces and publishes them without changing
+`main.cpp`:
+
+```json
+"digital_inputs": [
+  {
+    "name": "inductive_proximity",
+    "label": "Inductive proximity sensor",
+    "pin": 21,
+    "active_low": true,
+    "pullup": true,
+    "debounce_ms": 20
+  }
+]
+```
+
+Names and pins must be unique; up to eight inputs are supported. Each publishes
+`digital.<name>.detected`, `digital.<name>.raw_high`, and
+`digital.<name>.transitions`. The current D21 input is documented in
+`INDUCTIVE_PROXIMITY_WIRING.md`.
+
+## Ultrasound sensors
+
+Trigger/echo ultrasound boards are listed in `ultrasound_sensors`:
+
+```json
+"ultrasound_sensors": [
+  {
+    "name": "a",
+    "label": "Ultrasound A",
+    "trigger_pin": 14,
+    "echo_pin": 24,
+    "interval_ms": 100,
+    "timeout_us": 30000
+  },
+  {
+    "name": "b",
+    "label": "Ultrasound B",
+    "trigger_pin": 22,
+    "echo_pin": 20,
+    "interval_ms": 100,
+    "timeout_us": 30000
+  }
+]
+```
+
+The non-blocking driver publishes `ultrasound.<name>.valid`, `.timed_out`,
+`.echo_us`, and `.distance_mm`. Up to two sensors are supported for the A/B
+interface board. The workflow pings them sequentially so one receiver cannot
+mistake the other transmitter's pulse for its own. Distance is omitted when the
+current measurement is not valid. Voltage requirements are documented in
+`ULTRASOUND_WIRING.md`.
+
 ## TOF sensors
 
 Add each VL53 TOF sensor to the top-level `tof_sensors` array. No change to

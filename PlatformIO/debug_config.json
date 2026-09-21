@@ -1,4 +1,32 @@
 {
+  "digital_inputs": [
+    {
+      "name": "inductive_proximity",
+      "label": "Inductive proximity sensor",
+      "pin": 21,
+      "active_low": true,
+      "pullup": true,
+      "debounce_ms": 20
+    }
+  ],
+  "ultrasound_sensors": [
+    {
+      "name": "a",
+      "label": "Ultrasound A",
+      "trigger_pin": 14,
+      "echo_pin": 24,
+      "interval_ms": 100,
+      "timeout_us": 30000
+    },
+    {
+      "name": "b",
+      "label": "Ultrasound B",
+      "trigger_pin": 22,
+      "echo_pin": 20,
+      "interval_ms": 100,
+      "timeout_us": 30000
+    }
+  ],
   "tof_sensors": [
     {
       "name": "top_mid_left",

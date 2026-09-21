@@ -92,6 +92,18 @@ def main():
                 "max": max(numeric_samples.get(f"tof.{name}.distance_mm", [0])),
             } for name in tof_names
         })
+        for name in ("a", "b"):
+            prefix = f"ultrasound.{name}."
+            print(f"ultrasound.{name}:", {
+                suffix: latest.get(prefix + suffix) for suffix in (
+                    "valid", "timed_out", "distance_mm", "echo_us",
+                    "echo_high", "echo_adc", "echo_voltage_v",
+                    "ping_min_adc", "ping_max_adc", "ping_min_voltage_v",
+                    "ping_max_voltage_v", "trigger_low_adc",
+                    "trigger_high_adc", "trigger_high_voltage_v",
+                    "trigger_count", "rise_count", "fall_count",
+                )
+            })
         if matrices:
             last = matrices[-1]
             data = last.get("data") if isinstance(last.get("data"), list) else []

@@ -45,6 +45,8 @@ void BluetoothDebugWorkflow::begin()
         return;
     }
 
+    initialiseDigitalInputs();
+    initialiseUltrasoundSensors();
     initialiseTofSensors();
     const bool tof8x8Ready = tof8x8_.begin();
     const bool imuReady = imu_.begin();
@@ -65,6 +67,9 @@ void BluetoothDebugWorkflow::begin()
 void BluetoothDebugWorkflow::update()
 {
     link_.update();
+    const uint32_t now = millis();
+    for (uint8_t i = 0; i < digitalInputCount_; ++i)
+        digitalInputs_[i].update(now);
     if (dcMotor203SecondDeadman_ && dcMotor203SecondActive_ &&
         millis() - lastDcMotor203SecondCommandMs_ > KEYBOARD_DRIVE_TIMEOUT_MS)
     {
@@ -76,6 +81,9 @@ void BluetoothDebugWorkflow::update()
     updateAutomaticServoRead();
     updateTof8x8();
     sendTelemetry();
+    // Start/sample echo after the potentially slower I2C/telemetry work so a
+    // fresh trigger cannot be hidden inside those operations.
+    updateUltrasoundSensors();
 }
 
 void BluetoothDebugWorkflow::dispatch(JsonDocument& message, void* context)
@@ -727,6 +735,31 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["encoder.2.count"] = encoders_.secondCount();
     data["encoder.2.delta"] = encoders_.secondDelta();
     data["encoder.2.counts_per_s"] = encoders_.secondCountsPerSecond();
+    for (uint8_t i = 0; i < digitalInputCount_; ++i)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "digital.%s.detected", digitalInputNames_[i]);
+        data[key] = digitalInputs_[i].detected();
+        snprintf(key, sizeof(key), "digital.%s.raw_high", digitalInputNames_[i]);
+        data[key] = digitalInputs_[i].rawHigh();
+        snprintf(key, sizeof(key), "digital.%s.transitions", digitalInputNames_[i]);
+        data[key] = digitalInputs_[i].transitionCount();
+    }
+    for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "ultrasound.%s.valid", ultrasoundSensorNames_[i]);
+        data[key] = ultrasoundSensors_[i].valid();
+        snprintf(key, sizeof(key), "ultrasound.%s.timed_out", ultrasoundSensorNames_[i]);
+        data[key] = ultrasoundSensors_[i].timedOut();
+        snprintf(key, sizeof(key), "ultrasound.%s.echo_us", ultrasoundSensorNames_[i]);
+        data[key] = ultrasoundSensors_[i].echoUs();
+        if (ultrasoundSensors_[i].valid())
+        {
+            snprintf(key, sizeof(key), "ultrasound.%s.distance_mm", ultrasoundSensorNames_[i]);
+            data[key] = ultrasoundSensors_[i].distanceMm();
+        }
+    }
     data["imu.available"] = imu_.available();
     data["imu.valid"] = imuSampleValid;
     if (imu_.available()) {
@@ -788,6 +821,151 @@ void BluetoothDebugWorkflow::sendTelemetry()
     if (!isnan(servoPositionErrorDeg_))
         data["servo.position_error_deg"] = servoPositionErrorDeg_;
     link_.send(message);
+
+    // Keep electrical diagnostics in a second packet.  Combining these long
+    // signal names with the normal robot telemetry exceeds RobotDebug's JSON
+    // transmit buffer and causes the entire frame to be discarded.
+    JsonDocument diagnosticMessage;
+    diagnosticMessage["type"] = "telemetry";
+    diagnosticMessage["time"] = now;
+    JsonObject diagnostics = diagnosticMessage["data"].to<JsonObject>();
+    for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
+    {
+        char key[64];
+        snprintf(key, sizeof(key), "ultrasound.%s.echo_high", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].echoHigh();
+        snprintf(key, sizeof(key), "ultrasound.%s.trigger_count", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].triggerCount();
+        snprintf(key, sizeof(key), "ultrasound.%s.rise_count", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].riseCount();
+        snprintf(key, sizeof(key), "ultrasound.%s.fall_count", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].fallCount();
+        snprintf(key, sizeof(key), "ultrasound.%s.echo_adc", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].currentEchoAdc();
+        snprintf(key, sizeof(key), "ultrasound.%s.echo_voltage_v", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].currentEchoAdc() * (3.3f / 4095.0f);
+        snprintf(key, sizeof(key), "ultrasound.%s.ping_min_adc", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].lastMinEchoAdc();
+        snprintf(key, sizeof(key), "ultrasound.%s.ping_max_adc", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].lastMaxEchoAdc();
+        snprintf(key, sizeof(key), "ultrasound.%s.ping_min_voltage_v", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].lastMinEchoAdc() * (3.3f / 4095.0f);
+        snprintf(key, sizeof(key), "ultrasound.%s.ping_max_voltage_v", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].lastMaxEchoAdc() * (3.3f / 4095.0f);
+        snprintf(key, sizeof(key), "ultrasound.%s.trigger_low_adc", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].triggerLowAdc();
+        snprintf(key, sizeof(key), "ultrasound.%s.trigger_high_adc", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].triggerHighAdc();
+        snprintf(key, sizeof(key), "ultrasound.%s.trigger_high_voltage_v", ultrasoundSensorNames_[i]);
+        diagnostics[key] = ultrasoundSensors_[i].triggerHighAdc() * (3.3f / 4095.0f);
+    }
+    link_.send(diagnosticMessage);
+}
+
+void BluetoothDebugWorkflow::initialiseDigitalInputs()
+{
+    for (JsonObject input : config_["digital_inputs"].as<JsonArray>())
+    {
+        if (digitalInputCount_ >= MAX_DIGITAL_INPUTS)
+        {
+            link_.error("Maximum of eight digital inputs exceeded");
+            break;
+        }
+
+        const char* name = input["name"] | "";
+        const int pin = input["pin"] | -1;
+        bool duplicate = false;
+        for (uint8_t i = 0; i < digitalInputCount_; ++i)
+            duplicate = duplicate || strcmp(name, digitalInputNames_[i]) == 0 ||
+                        pin == digitalInputs_[i].pin();
+
+        if (name[0] == '\0' || strlen(name) >= sizeof(digitalInputNames_[0]) ||
+            pin < 0 || pin > 41 || duplicate)
+        {
+            link_.error("Invalid or duplicate digital input JSON entry");
+            continue;
+        }
+
+        strncpy(digitalInputNames_[digitalInputCount_], name,
+                sizeof(digitalInputNames_[0]) - 1);
+        const bool activeLow = input["active_low"] | true;
+        const bool pullup = input["pullup"] | true;
+        const uint16_t debounceMs = constrain(input["debounce_ms"] | 20, 0, 1000);
+        digitalInputs_[digitalInputCount_].begin(
+            static_cast<uint8_t>(pin), activeLow, pullup, debounceMs);
+        ++digitalInputCount_;
+    }
+}
+
+void BluetoothDebugWorkflow::initialiseUltrasoundSensors()
+{
+    for (JsonObject sensor : config_["ultrasound_sensors"].as<JsonArray>())
+    {
+        if (ultrasoundSensorCount_ >= MAX_ULTRASOUND_SENSORS)
+        {
+            link_.error("Maximum of two ultrasound sensors exceeded");
+            break;
+        }
+
+        const char* name = sensor["name"] | "";
+        const int triggerPin = sensor["trigger_pin"] | -1;
+        const int echoPin = sensor["echo_pin"] | -1;
+        bool duplicate = triggerPin == echoPin;
+        for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
+            duplicate = duplicate || strcmp(name, ultrasoundSensorNames_[i]) == 0 ||
+                        triggerPin == ultrasoundSensors_[i].triggerPin() ||
+                        triggerPin == ultrasoundSensors_[i].echoPin() ||
+                        echoPin == ultrasoundSensors_[i].triggerPin() ||
+                        echoPin == ultrasoundSensors_[i].echoPin();
+
+        if (name[0] == '\0' || strlen(name) >= sizeof(ultrasoundSensorNames_[0]) ||
+            triggerPin < 0 || triggerPin > 41 || echoPin < 0 || echoPin > 41 || duplicate)
+        {
+            link_.error("Invalid or duplicate ultrasound JSON entry");
+            continue;
+        }
+
+        strncpy(ultrasoundSensorNames_[ultrasoundSensorCount_], name,
+                sizeof(ultrasoundSensorNames_[0]) - 1);
+        const uint32_t intervalMs = constrain(sensor["interval_ms"] | 100UL, 50UL, 2000UL);
+        const uint32_t timeoutUs = constrain(sensor["timeout_us"] | 30000UL, 1000UL, 50000UL);
+        ultrasoundSensors_[ultrasoundSensorCount_].begin(
+            static_cast<uint8_t>(triggerPin), static_cast<uint8_t>(echoPin),
+            intervalMs, timeoutUs);
+        ++ultrasoundSensorCount_;
+    }
+}
+
+void BluetoothDebugWorkflow::updateUltrasoundSensors()
+{
+    if (ultrasoundSensorCount_ == 0)
+        return;
+
+    const uint32_t nowUs = micros();
+    for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
+        ultrasoundSensors_[i].sampleEchoLevel();
+    if (activeUltrasoundIndex_ >= 0)
+    {
+        UltrasoundSensor& active = ultrasoundSensors_[activeUltrasoundIndex_];
+        active.update(nowUs);
+        if (active.busy())
+            return;
+        nextUltrasoundIndex_ = (static_cast<uint8_t>(activeUltrasoundIndex_) + 1) %
+                               ultrasoundSensorCount_;
+        activeUltrasoundIndex_ = -1;
+    }
+
+    // Only one transducer may transmit/listen at a time. This avoids channel A
+    // receiving channel B's ping on the two-socket interface board.
+    for (uint8_t offset = 0; offset < ultrasoundSensorCount_; ++offset)
+    {
+        const uint8_t index = (nextUltrasoundIndex_ + offset) % ultrasoundSensorCount_;
+        if (!ultrasoundSensors_[index].readyToTrigger(nowUs))
+            continue;
+        ultrasoundSensors_[index].trigger(nowUs);
+        activeUltrasoundIndex_ = index;
+        return;
+    }
 }
 
 void BluetoothDebugWorkflow::initialiseTofSensors()
