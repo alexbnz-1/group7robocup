@@ -109,6 +109,11 @@ private:
     int32_t navigationShiftStartEncoder2_ = 0;
     uint8_t navigationLaneIndex_ = 0;
     bool navigationSweepTurnRight_ = true;
+    uint16_t navigationSweepLeftReferenceMm_ = 0;
+    uint16_t navigationSweepRightReferenceMm_ = 0;
+    bool navigationSweepLeftReferenceValid_ = false;
+    bool navigationSweepRightReferenceValid_ = false;
+    int16_t navigationSweepLateralErrorMm_ = 0;
     bool navigationMotionConsistent_ = true;
 
     static void dispatch(JsonDocument& message, void* context);

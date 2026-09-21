@@ -2943,3 +2943,28 @@ and 33536 bytes of RAM1 variables. The complete offline suite passes all 38
 tests, including exact sparse-turn integration, absence of a fixed arena
 outline, orthogonal navigation targets, recording replay, sensor mapping and
 wiring persistence.
+
+===============================================================================
+50. TIGHTER WALL FOLLOWING AND CLOSER COVERAGE LANES
+===============================================================================
+
+The first-wall following phase now targets 200 mm from the left wall instead of
+250 mm. A narrow 10 mm deadband prevents needless twitching. Outside that band,
+the steering correction grows proportionally with ultrasound distance error:
+the motor pair uses a differential from 5 to 10 percentage points while both
+wheels continue forward at or above the drivetrain's reliable 75 percent
+minimum. If ultrasound A reports increasing separation, the left wheel is
+slowed relative to the right wheel to arc back toward the wall. If it reports
+less than 190 mm, the opposite differential arcs away. Inside the deadband the
+BNO055 resumes exact parallel-heading hold, preventing the range correction
+from becoming a permanent curve.
+
+Parallel coverage lane spacing is reduced from 300 mm to 250 mm. The program
+now performs ten lanes rather than eight, preserving coverage of the supplied
+2400 mm arena width while producing greater overlap between adjacent sensor
+passes.
+
+The command description and embedded JSON configuration reflect the 200 mm wall
+target and 250 mm lane spacing. The firmware builds successfully with 131032
+bytes of flash code and 33536 bytes of RAM1 variables. All 38 offline tests
+pass.

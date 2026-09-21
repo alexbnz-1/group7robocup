@@ -199,7 +199,7 @@
       "name": "autonomous_navigation",
       "label": "Autonomous navigation",
       "category": "Navigation",
-      "description": "Finds a wall, follows it to a corner, then maps the arena in 300 mm parallel sweep lanes. Navigation uses the top TOFs and 8x8 forward view plus left/right ultrasound; bottom TOFs remain weight-sensing only.",
+      "description": "Finds a wall, follows it at 200 mm to a corner, then maps the arena in 250 mm parallel sweep lanes. Navigation uses the top TOFs and 8x8 forward view plus left/right ultrasound; bottom TOFs remain weight-sensing only.",
       "action": "navigation_toggle",
       "debug_mode_required": true,
       "args": [],

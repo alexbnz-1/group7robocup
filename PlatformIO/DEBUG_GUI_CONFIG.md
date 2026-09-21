@@ -119,8 +119,13 @@ Live Telemetry as `tof.<name>.available`, `tof.<name>.timed_out`, and
 The `autonomous_navigation` command creates one Navigation card with RUN and
 STOP buttons. RUN requires Debug Mode and directly enters the robot run state.
 The Teensy first drives straight to the wall ahead, turns right, follows that
-wall with the left ultrasound until the corner, then covers the arena in eight
-parallel lanes spaced 300 mm apart. The two top point TOFs and the SEN0628 form
+wall with the left ultrasound at a 200 mm target until the corner, then covers
+the arena in ten parallel lanes spaced 250 mm apart. The wall follower applies
+a proportional correction whenever the ultrasound moves outside a 10 mm
+deadband, then returns to exact IMU heading hold. At the start of every
+sweep lane, the controller captures both side-ultrasound distances and steers
+to preserve those lane-specific values within 15 mm; inside that band the IMU
+holds the exact orthogonal heading. The two top point TOFs and the SEN0628 form
 a robust median forward range with 300 mm clearance. All `bottom_*` TOFs are
 excluded from navigation and remain available for weight sensing and mapping.
 Ultrasound A/B provide left/right clearance with a 200 mm limit. STOP ROBOT,
