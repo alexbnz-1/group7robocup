@@ -3945,3 +3945,590 @@ Required local verification:
 5. Drive through a deliberately false mapped wall location and verify the
    crossed section is removed/split while unrelated wall sections remain.
 6. Keep the physical STOP control ready during the first autonomous trial.
+
+
+===============================================================================
+61. SENSOR-FUSED WALL MAPPING / TOF NOISE REJECTION / WALL RECLASSIFICATION
+===============================================================================
+
+This change is based on the current testing branch commit:
+
+- 4c6459844c4bf76db0783eb0aaca71bd3bfb78bb
+  "Added new internal wall recognition, not working but yk"
+
+Affected file:
+
+- Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py
+
+No Teensy firmware, navigation state machine, pin allocation, Bluetooth packet,
+debug_config.json setting, sensor driver or recording format was changed.
+Navigation controller version remains 7.
+
+Problem addressed:
+
+The previous wall mapper promoted range endpoints into persistent wall geometry
+too quickly. A few noisy point-TOF or 8x8 returns could therefore become dashed
+orange internal-wall segments. Large numbers of those false segments could make
+the map look like a maze even when later free-space evidence disagreed.
+
+The mapper now uses a staged sensor-fusion pipeline:
+
+  raw range -> temporal validation -> occupancy/free-space evidence
+            -> pending wall evidence -> confirmed wall geometry
+            -> internal/external classification
+
+1. STRONGER TEMPORAL FILTERING
+
+- Top point-TOF sensors no longer allow their first valid sample to become wall
+  geometry immediately.
+- A new top-TOF baseline must be supported by three mutually-consistent samples
+  before that distance is accepted for wall mapping.
+- The rolling median history was increased from 3 to 5 accepted samples.
+- Bottom TOFs retain their immediate behaviour because they are primarily used
+  for near-floor/weight logic rather than persistent wall creation.
+- Ultrasound and 8x8 columns continue to require initial confirmation before
+  contributing persistent geometry.
+
+2. PENDING WALL-EVIDENCE FUSION
+
+- A valid range endpoint is no longer converted directly into a wall track.
+- Candidate wall endpoints are accumulated into spatially-compatible evidence
+  clusters first.
+- Approximate geometry matching for a pending cluster requires:
+  - the same horizontal/vertical orientation;
+  - perpendicular coordinate agreement within roughly 120 mm;
+  - longitudinal continuity within roughly 220 mm.
+- Source weights are intentionally unequal:
+  - temporally-confirmed point TOF: 2.0 wall-confidence units;
+  - coherent 8x8 sector: 2.5 wall-confidence units;
+  - ultrasound: 0.75 wall-confidence units.
+- A pending cluster needs at least 4.0 confidence units and at least two accepted
+  observations before becoming persistent wall geometry.
+- This means ultrasound mainly corroborates geometry rather than defining a
+  precise wall by itself.
+- Weak stale unconfirmed clusters decay instead of remaining forever.
+- Free-space rays crossing a pending endpoint reduce its confidence before it
+  can become a wall.
+- The last approximately 100 mm of a point-TOF ray, and approximately 140 mm of
+  an 8x8 sector, are excluded from this contradiction test so centimetre-level
+  endpoint quantisation cannot cancel a genuine wall.
+
+3. 8x8 SPATIAL SENSOR FUSION
+
+The 8x8 matrix now has two separate spatial-consensus tests before it can create
+persistent wall geometry.
+
+Vertical consistency inside one matrix column:
+
+- At least four valid pixels are required in the column.
+- A median is calculated.
+- At least four pixels must remain within max(80 mm, 12 percent of range) of
+  that median.
+- A few isolated flying pixels therefore cannot define the complete angular
+  sector.
+
+Horizontal consistency between columns:
+
+- A matrix column is allowed to create persistent wall evidence only when an
+  immediately adjacent column reports a similar depth.
+- Adjacent depths must agree within max(100 mm, 15 percent of the nearer range).
+- An isolated valid-looking 8x8 column still contributes low-confidence
+  occupancy information, but it cannot create an orange/red wall line.
+- Coherent neighbouring columns are given stronger occupied-cell evidence and
+  wall-confidence weight.
+
+4. OCCUPANCY-GRID CONFIDENCE
+
+- Point-TOF endpoints now add less occupied evidence per sample than before.
+- Ultrasound endpoints add only weak occupied evidence because of their broad
+  acoustic beam.
+- Coherent 8x8 sectors add strong occupied evidence; non-coherent sectors add
+  only weak evidence.
+- Every valid ray still adds free-space evidence in front of the measured
+  endpoint.
+- The visual occupancy layer no longer paints every +1 cell bright red or every
+  -1 cell green:
+  - red requires occupancy evidence >= +4;
+  - green requires free-space evidence <= -3;
+  - low-confidence cells are rendered as the dark map background.
+- This is deliberately a visual confidence threshold; the underlying evidence
+  values are still retained and can strengthen or weaken later.
+
+5. INTERNAL WALLS ARE NOW THE DEFAULT CONFIRMED GEOMETRY
+
+- A newly-confirmed wall is initially classified as an internal wall.
+- It is drawn as a dashed orange segment only after the fused evidence stage has
+  confirmed it.
+- A single wall seen in one direction is no longer immediately declared to be
+  one of the four arena boundaries.
+- This prevents a genuine internal obstacle from becoming a false outer wall
+  simply because it was encountered before the real arena boundary.
+
+6. COLLINEAR INTERNAL WALL MERGING
+
+- Nearby internal chunks with the same orientation are merged when:
+  - their perpendicular coordinates are within approximately 220 mm; and
+  - the gap along the wall is no more than approximately 350 mm.
+- The merged line uses the median observed perpendicular coordinate and extends
+  across the combined supported longitudinal range.
+- This specifically addresses runs where the same physical wall appeared as a
+  long sequence of separate orange dashes.
+
+7. AUTOMATIC INTERNAL -> EXTERNAL WALL PROMOTION
+
+A long merged internal line can now become a solid red arena boundary when the
+explored geometry supports that classification.
+
+Current promotion requirements:
+
+- supported wall span >= 800 mm;
+- at least 6 confirmed wall observations;
+- at least 5 recorded robot-trail points on one side of the line;
+- no more than 1 qualifying trail point on the opposite side.
+
+This makes external-wall classification depend on BOTH wall evidence and known
+free/explored space. For example:
+
+- a long horizontal wall with explored trajectory only below it -> north arena
+  boundary;
+- a long horizontal wall with explored trajectory only above it -> south;
+- a long vertical wall with explored trajectory only left of it -> east;
+- a long vertical wall with explored trajectory only right of it -> west.
+
+Once a line becomes an arena boundary:
+
+- it is drawn solid red;
+- later collinear confirmed chunks within roughly 200 mm extend the same red
+  boundary instead of creating more orange segments beside it;
+- a farther, better-supported outer line can supersede an earlier boundary.
+
+8. ROBOT TRAJECTORY STILL OVERRIDES RANGE EVIDENCE
+
+The existing encoder/BNO055 translation-validation logic remains intact.
+Only IMU-confirmed chassis motion can correct wall geometry.
+
+When the robot physically traverses a location:
+
+- the approximately 210 mm radius chassis corridor receives strong free-space
+  evidence;
+- pending wall evidence in the traversed corridor is deleted;
+- a crossed internal wall is shortened or split around the approximately
+  440 mm proven-open corridor;
+- a crossed outer boundary is demoted/invalidated;
+- surviving pieces of crossed geometry are marked so they cannot immediately
+  promote themselves back into an arena boundary.
+
+Therefore a noisy TOF wall that the robot later physically drives through is
+still removed, while a real wall with only one genuine gap retains the wall
+sections on either side of that gap.
+
+9. MAP STATUS / DISPLAY
+
+- Header now describes the map as sensor-fused.
+- Solid red = promoted external arena boundary.
+- Dashed orange = confirmed internal wall.
+- Low-confidence range speckle is not drawn as a wall.
+- Status now reports:
+  - confirmed external boundary count;
+  - confirmed internal wall count;
+  - current pending/unconfirmed wall-cluster count.
+
+Verification performed while preparing this change:
+
+- The source baseline was verified against current GitHub ArenaView.py blob:
+  571eccc16b6b30abdf27b98a0b416e66af51d035
+- `python -m py_compile ArenaView.py` passes.
+- Synthetic ArenaModel tests pass for:
+  - rapidly changing point-TOF noise producing no wall geometry;
+  - repeated consistent point-TOF data becoming a confirmed internal wall;
+  - one isolated 8x8 column NOT creating wall geometry;
+  - adjacent coherent 8x8 columns creating wall evidence;
+  - separated collinear internal segments merging into one long line;
+  - a long one-sided internal line promoting to an external arena boundary;
+  - later collinear segments extending the promoted external boundary instead
+    of remaining separate internal-wall dashes;
+  - confirmed chassis traversal carving/splitting false wall geometry.
+- Full PyQt GUI regression tests were not run in this environment because PyQt6
+  is not installed here.
+
+Physical verification recommended:
+
+1. Run Arena View with the robot stationary in front of an ordinary wall and
+   confirm scattered TOF noise no longer immediately creates orange dashes.
+2. Sweep the 8x8 across a broad flat wall and confirm coherent adjacent sectors
+   still build wall geometry.
+3. Put a genuine internal wall/box in the arena and confirm it first appears as
+   dashed orange after repeated evidence.
+4. Drive/sweep alongside a long arena edge and confirm its orange chunks merge
+   and then promote into one solid red external boundary.
+5. Deliberately drive through a previously false mapped wall location and verify
+   that the contradicted section disappears/splits.
+6. Keep the physical STOP control ready during autonomous testing.
+
+
+===============================================================================
+61. SENSOR-FUSED WALL MAPPING / TOF NOISE REJECTION / WALL RECLASSIFICATION
+===============================================================================
+
+This change is based on the current testing branch commit:
+
+- 4c6459844c4bf76db0783eb0aaca71bd3bfb78bb
+  "Added new internal wall recognition, not working but yk"
+
+Affected file:
+
+- Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py
+
+No Teensy firmware, navigation state machine, pin allocation, Bluetooth packet,
+debug_config.json setting, sensor driver or recording format was changed.
+Navigation controller version remains 7.
+
+Problem addressed:
+
+The previous wall mapper promoted range endpoints into persistent wall geometry
+too quickly. A few noisy point-TOF or 8x8 returns could therefore become dashed
+orange internal-wall segments. Large numbers of those false segments could make
+the map look like a maze even when later free-space evidence disagreed.
+
+The mapper now uses a staged sensor-fusion pipeline:
+
+  raw range -> temporal validation -> occupancy/free-space evidence
+            -> pending wall evidence -> confirmed wall geometry
+            -> internal/external classification
+
+1. STRONGER TEMPORAL FILTERING
+
+- Top point-TOF sensors no longer allow their first valid sample to become wall
+  geometry immediately.
+- A new top-TOF baseline must be supported by three mutually-consistent samples
+  before that distance is accepted for wall mapping.
+- The rolling median history was increased from 3 to 5 accepted samples.
+- Bottom TOFs retain their immediate behaviour because they are primarily used
+  for near-floor/weight logic rather than persistent wall creation.
+- Ultrasound and 8x8 columns continue to require initial confirmation before
+  contributing persistent geometry.
+
+2. PENDING WALL-EVIDENCE FUSION
+
+- A valid range endpoint is no longer converted directly into a wall track.
+- Candidate wall endpoints are accumulated into spatially-compatible evidence
+  clusters first.
+- Approximate geometry matching for a pending cluster requires:
+  - the same horizontal/vertical orientation;
+  - perpendicular coordinate agreement within roughly 120 mm;
+  - longitudinal continuity within roughly 220 mm.
+- Source weights are intentionally unequal:
+  - temporally-confirmed point TOF: 2.0 wall-confidence units;
+  - coherent 8x8 sector: 2.5 wall-confidence units;
+  - ultrasound: 0.75 wall-confidence units.
+- A pending cluster needs at least 4.0 confidence units and at least two accepted
+  observations before becoming persistent wall geometry.
+- This means ultrasound mainly corroborates geometry rather than defining a
+  precise wall by itself.
+- Weak stale unconfirmed clusters decay instead of remaining forever.
+- Free-space rays crossing a pending endpoint reduce its confidence before it
+  can become a wall.
+- The last approximately 100 mm of a point-TOF ray, and approximately 140 mm of
+  an 8x8 sector, are excluded from this contradiction test so centimetre-level
+  endpoint quantisation cannot cancel a genuine wall.
+
+3. 8x8 SPATIAL SENSOR FUSION
+
+The 8x8 matrix now has two separate spatial-consensus tests before it can create
+persistent wall geometry.
+
+Vertical consistency inside one matrix column:
+
+- At least four valid pixels are required in the column.
+- A median is calculated.
+- At least four pixels must remain within max(80 mm, 12 percent of range) of
+  that median.
+- A few isolated flying pixels therefore cannot define the complete angular
+  sector.
+
+Horizontal consistency between columns:
+
+- A matrix column is allowed to create persistent wall evidence only when an
+  immediately adjacent column reports a similar depth.
+- Adjacent depths must agree within max(100 mm, 15 percent of the nearer range).
+- An isolated valid-looking 8x8 column still contributes low-confidence
+  occupancy information, but it cannot create an orange/red wall line.
+- Coherent neighbouring columns are given stronger occupied-cell evidence and
+  wall-confidence weight.
+
+4. OCCUPANCY-GRID CONFIDENCE
+
+- Point-TOF endpoints now add less occupied evidence per sample than before.
+- Ultrasound endpoints add only weak occupied evidence because of their broad
+  acoustic beam.
+- Coherent 8x8 sectors add strong occupied evidence; non-coherent sectors add
+  only weak evidence.
+- Every valid ray still adds free-space evidence in front of the measured
+  endpoint.
+- The visual occupancy layer no longer paints every +1 cell bright red or every
+  -1 cell green:
+  - red requires occupancy evidence >= +4;
+  - green requires free-space evidence <= -3;
+  - low-confidence cells are rendered as the dark map background.
+- This is deliberately a visual confidence threshold; the underlying evidence
+  values are still retained and can strengthen or weaken later.
+
+5. INTERNAL WALLS ARE NOW THE DEFAULT CONFIRMED GEOMETRY
+
+- A newly-confirmed wall is initially classified as an internal wall.
+- It is drawn as a dashed orange segment only after the fused evidence stage has
+  confirmed it.
+- A single wall seen in one direction is no longer immediately declared to be
+  one of the four arena boundaries.
+- This prevents a genuine internal obstacle from becoming a false outer wall
+  simply because it was encountered before the real arena boundary.
+
+6. COLLINEAR INTERNAL WALL MERGING
+
+- Nearby internal chunks with the same orientation are merged when:
+  - their perpendicular coordinates are within approximately 220 mm; and
+  - the gap along the wall is no more than approximately 350 mm.
+- The merged line uses the median observed perpendicular coordinate and extends
+  across the combined supported longitudinal range.
+- This specifically addresses runs where the same physical wall appeared as a
+  long sequence of separate orange dashes.
+
+7. AUTOMATIC INTERNAL -> EXTERNAL WALL PROMOTION
+
+A long merged internal line can now become a solid red arena boundary when the
+explored geometry supports that classification.
+
+Current promotion requirements:
+
+- supported wall span >= 800 mm;
+- at least 6 confirmed wall observations;
+- at least 5 recorded robot-trail points on one side of the line;
+- no more than 1 qualifying trail point on the opposite side.
+
+This makes external-wall classification depend on BOTH wall evidence and known
+free/explored space. For example:
+
+- a long horizontal wall with explored trajectory only below it -> north arena
+  boundary;
+- a long horizontal wall with explored trajectory only above it -> south;
+- a long vertical wall with explored trajectory only left of it -> east;
+- a long vertical wall with explored trajectory only right of it -> west.
+
+Once a line becomes an arena boundary:
+
+- it is drawn solid red;
+- later collinear confirmed chunks within roughly 200 mm extend the same red
+  boundary instead of creating more orange segments beside it;
+- a farther, better-supported outer line can supersede an earlier boundary.
+
+8. ROBOT TRAJECTORY STILL OVERRIDES RANGE EVIDENCE
+
+The existing encoder/BNO055 translation-validation logic remains intact.
+Only IMU-confirmed chassis motion can correct wall geometry.
+
+When the robot physically traverses a location:
+
+- the approximately 210 mm radius chassis corridor receives strong free-space
+  evidence;
+- pending wall evidence in the traversed corridor is deleted;
+- a crossed internal wall is shortened or split around the approximately
+  440 mm proven-open corridor;
+- a crossed outer boundary is demoted/invalidated;
+- surviving pieces of crossed geometry are marked so they cannot immediately
+  promote themselves back into an arena boundary.
+
+Therefore a noisy TOF wall that the robot later physically drives through is
+still removed, while a real wall with only one genuine gap retains the wall
+sections on either side of that gap.
+
+9. MAP STATUS / DISPLAY
+
+- Header now describes the map as sensor-fused.
+- Solid red = promoted external arena boundary.
+- Dashed orange = confirmed internal wall.
+- Low-confidence range speckle is not drawn as a wall.
+- Status now reports:
+  - confirmed external boundary count;
+  - confirmed internal wall count;
+  - current pending/unconfirmed wall-cluster count.
+
+Verification performed while preparing this change:
+
+- The source baseline was verified against current GitHub ArenaView.py blob:
+  571eccc16b6b30abdf27b98a0b416e66af51d035
+- `python -m py_compile ArenaView.py` passes.
+- Synthetic ArenaModel tests pass for:
+  - rapidly changing point-TOF noise producing no wall geometry;
+  - repeated consistent point-TOF data becoming a confirmed internal wall;
+  - one isolated 8x8 column NOT creating wall geometry;
+  - adjacent coherent 8x8 columns creating wall evidence;
+  - separated collinear internal segments merging into one long line;
+  - a long one-sided internal line promoting to an external arena boundary;
+  - later collinear segments extending the promoted external boundary instead
+    of remaining separate internal-wall dashes;
+  - confirmed chassis traversal carving/splitting false wall geometry.
+- Full PyQt GUI regression tests were not run in this environment because PyQt6
+  is not installed here.
+
+Physical verification recommended:
+
+1. Run Arena View with the robot stationary in front of an ordinary wall and
+   confirm scattered TOF noise no longer immediately creates orange dashes.
+2. Sweep the 8x8 across a broad flat wall and confirm coherent adjacent sectors
+   still build wall geometry.
+3. Put a genuine internal wall/box in the arena and confirm it first appears as
+   dashed orange after repeated evidence.
+4. Drive/sweep alongside a long arena edge and confirm its orange chunks merge
+   and then promote into one solid red external boundary.
+5. Deliberately drive through a previously false mapped wall location and verify
+   that the contradicted section disappears/splits.
+6. Keep the physical STOP control ready during autonomous testing.
+2026-09-22 navigation gap and floor-return update
+-------------------------------------------------
+- Reviewed the latest 19:19 recording and the current post-19:00 source before editing. The recording contains malformed/torn telemetry signal names, so some individual signal names in that file are not trustworthy; the navigation and mapping changes below do not depend on those damaged names.
+- Added a Navigation tuning tab immediately above the raw range readouts in Arena View. APPLY NAVIGATION TUNING sends every value to the Teensy, stores it in the desktop settings, and records the change in an active .rdbg recording.
+- Added three selectable navigation behaviours:
+  - Balanced coverage: passes a confirmed opening only when it is approximately centred.
+  - Gap explorer: can steer toward an off-centre opening when its measured width is sufficient.
+  - Conservative wall-safe: never lets an apparent opening override a detected wall.
+- Added live parameters for front stopping distance, side clearance, wall-follow distance, sweep spacing, physical robot width, gap safety margin, minimum open depth, number of ignored lower 8x8 rows, and number of frames required to confirm a gap.
+- Gap recognition now searches all eight horizontal columns, not only the far-left and far-right flanks. It finds contiguous open columns, projects their angular width into millimetres at the nearest measured depth, and requires width >= robot width + safety margin. It also requires repeated frames before declaring the opening passable.
+- The firmware publishes navigation.gap_passable, navigation.gap_width_mm, navigation.gap_centre_column_x2, navigation.strategy and navigation.matrix_floor_rows so recordings show exactly why a gap was or was not accepted.
+- Bottom point TOFs no longer paint red/free occupancy into the arena map. They remain available in raw telemetry and are still paired with top measurements for purple possible-weight detection. This removes floor/chassis returns from the persistent wall map.
+- The lower rows ignored from the 8x8 are adjustable and apply to both firmware navigation and desktop mapping. The default is two rows; use zero only if the module is level and confirmed not to see the floor.
+- The firmware compiles successfully for Teensy 4.0. The generated embedded debug configuration includes the new navigation parameters.
+2026-09-22 Bluetooth error-count diagnosis
+------------------------------------------
+- Investigated the reported 14 protocol errors using the newest recording and a live COM10 connection.
+- The Bluetooth byte stream itself was valid JSON. The apparent protocol-error count was made from robot-generated error messages, not malformed packets.
+- The Teensy had been running an incompatible firmware build with a different telemetry schema such as drive.left_percent, imu.heading and tof.array.r0c0. It rejected the current GUI handshake, parameter messages and autonomous_navigation command as Unknown command. Each rejection incremented the GUI counter, producing the reported total.
+- Built and uploaded the current PlatformIO BluetoothDebugWorkflow firmware to the connected Teensy through its programming USB connection.
+- Ran the read-only live reconnect diagnostic on COM10. It received 249 valid messages across an initial connection and reconnection, populated 116 telemetry rows, and reported zero link or robot errors.
+- Renamed the GUI health counter from Protocol errors to Link/robot errors because the counter includes both serial-worker failures and valid error messages deliberately reported by the robot.
+2026-09-22 Arena button command rejection diagnosis
+---------------------------------------------------
+- Reproduced the Arena View failures without moving the robot. Six RUN NAVIGATION clicks in the 19:44 recording each received a valid JSON error response saying Unknown command.
+- Captured the live command definitions from COM10. The controller connected to Bluetooth currently advertises only drive_set, stop, set_debug_mode, servo_set, encoders_reset, bluetooth_probe and set_text_mode. It advertises only telemetry.interval_ms, drive.max_percent and servo.pulse_us parameters. It therefore cannot accept autonomous_navigation, run, or any navigation tuning parameter.
+- The command-line upload was changed to the verifiable teensy-cli protocol. The programming USB Teensy entered its HalfKay bootloader and accepted the project image after a retry, but COM10 continued serving the unrelated generic command set. The USB Teensy and Bluetooth link are therefore not currently reaching the same running firmware/controller.
+- No motor movement or autonomous navigation was commanded during diagnosis. Only debug-mode enable, run/stop command validation and one parameter lookup were tested; unsupported messages were rejected before actuation.
+- To restore Arena controls, the programming USB cable must be attached to the same Teensy whose Serial1 connector carries the robot-side CH9143 Bluetooth board. Once that physical pairing is confirmed, upload the current PlatformIO firmware with teensy-cli and verify that COM10 advertises autonomous_navigation and the navigation.* parameters.
+2026-09-22 verified Arena firmware upload
+-----------------------------------------
+- After the Teensy programming button was pressed, loaded the exact image at PlatformIO/.pio/build/teensy40/firmware.hex with teensy_loader_cli. The loader confirmed that it found the HalfKay bootloader, programmed the image and booted it.
+- Queried COM10 after boot. The robot now advertises the complete project command set, including autonomous_navigation, run, stop, all Herkulex/DC motor/HX12K commands and TOF commands.
+- Confirmed that COM10 advertises all navigation tuning parameters and produced ten live tof_8x8 frames during the verification window.
+- Exercised Debug Mode, Run Motors, navigation.front_avoid_mm parameter update and Stop Motors without commanding wheel movement. The robot returned the expected state transitions and zero errors.
+
+2026-09-22 latest navigation recording diagnosis for web handoff
+----------------------------------------------------------------
+Recording analysed:
+
+- `Non-Teensy-Files/DataVisualisationAfter/Data/GAPEXPLOREREAGGRESSIVE.rdbg`
+- Recorded from 20:44:55 to 20:46:40 NZST; 104.12 seconds of telemetry.
+- Navigation ran from approximately 3.24 seconds until STOP at 101.51 seconds.
+- This was not actually a Gap Explorer run despite the filename. The saved
+  parameter snapshot has `navigation.strategy = 0` (Balanced), and the
+  recording contains no navigation parameter-change events. The GUI tuning
+  selection was therefore not applied to the controller for this run.
+
+Main observed behaviour:
+
+- The robot entered nine separately sampled reverse segments, totalling about
+  16.94 seconds and approximately 3.55 metres of encoder-estimated reverse
+  travel. This directly explains the visibly excessive backwards movement.
+- Full reverse was deliberately commanded by the navigation controller:
+  motor-bank-2 channels A and B were both +100 percent in recovery reverse.
+  Normal forward travel was approximately A=-100, B=-100. The motor driver did
+  not spontaneously reverse and the encoder directions match the commands.
+- The reverse/recovery sequences were concentrated at approximately 24-32 s,
+  42-45 s, 68-69 s, 84-85 s, and 94-102 s. The final sequence alone repeatedly
+  alternated reverse and nominal recovery-turn states until STOP was pressed.
+- Logs explicitly reported `Recovery heading still blocked; backing away
+  again` at about 25, 27, 29, 42, 94, 96, 97, 99 and 100 seconds.
+- Five recovery episodes were counted. Only about one second of real sweep
+  operation occurred before an obstacle detour and recovery reset the robot to
+  wall-seeking again. The algorithm therefore spent most of the test repeatedly
+  reacquiring a first wall instead of mapping in lanes.
+
+Confirmed recovery-state defect:
+
+- `beginRightAngleTurn()` constructs its target from
+  `navigationHeadingReferenceDeg_ +/- 90 degrees`, meaning the heading of the
+  last completed forward leg, rather than from the robot's current heading.
+- When an initial/corner turn ends facing another wall, no new forward leg has
+  begun, so the old heading reference has not been updated. Recovery then asks
+  for the same 90-degree target the robot has already reached.
+- This is visible directly in the recording. Around 25-29 s the IMU heading is
+  about 262-268 degrees and the recovery target remains about 266.4 degrees.
+  Around 94-102 s the heading is about 353-355 degrees and the target remains
+  about 356.4 degrees. The nominal `recovery_turn` therefore performs almost no
+  useful rotation, sees the same wall again, and commands another reverse.
+- `NAV_RECOVERY_REVERSE` also recalculates the turn side from the latest
+  ultrasound values before every attempt. That can overwrite the intended
+  alternating direction and repeatedly choose the same apparently open side.
+- Recommended correction: recovery and clearance turns must calculate the next
+  target from the current valid IMU heading at recovery entry, retain that
+  target/direction for the whole attempt, and force a materially different
+  heading after a blocked attempt. Do not reuse the stale forward-leg heading
+  reference. Add a maximum recovery-attempt count and choose a 180-degree exit
+  or stop/replan after repeated blocked headings rather than accumulating
+  multiple 350-800 mm reverse legs.
+
+Why the almost-boxed-in escape was unreliable:
+
+- The special U-shaped escape requires front blocked AND both side ultrasound
+  distances below 350 mm at the same update. That condition was usually not
+  satisfied. During failed recoveries the left side was commonly 211-324 mm,
+  but the right side was often reported between roughly 564 mm and 4.3 m, or
+  briefly as zero/unknown. The controller consequently treated this as an
+  ordinary blocked turn instead of a U-shaped enclosure.
+- One right-ultrasound sample was only 36 mm while neighbouring values were far
+  larger. The side data therefore contains at least one extreme transient.
+  Single side samples should be validity/range checked and median-filtered
+  before they select a recovery direction.
+- The forward 8x8 classified a broad wall for 50 of 105 telemetry samples
+  (47.6 percent), including the end of the run. A passable gap was confirmed in
+  only 7 of 105 samples (6.7 percent), and the final gap state was false. The
+  robot was genuinely being told that the forward view remained blocked; the
+  failure was the recovery response, not absence of forward-wall detection.
+- Gap Explorer still needs a separate later test after applying strategy 1.
+  This recording tests Balanced strategy and must not be used as evidence that
+  the Gap Explorer selection itself worked or failed.
+
+Motion and communication evidence:
+
+- `navigation.motion_consistent` was true for 98 of 105 samples (93.3 percent).
+  Encoder rates changed consistently with the commanded forward, reverse and
+  turn directions, so the strange path is principally commanded behaviour.
+- The IMU heading followed the turns and was close to the saved target during
+  the repeated failed recovery attempts. This further confirms that the robot
+  was not merely ignoring turn motor commands; the target itself was stale.
+- Bluetooth dropped-message and dropped-byte counters remained zero for the
+  full recording. Maximum main-loop gap stayed tightly between 40.59 and
+  43.64 ms. This run was not caused by a telemetry stall or overloaded loop.
+
+Arena-view geometry issue:
+
+- The recording embeds `track_width_mm = 40.0` while the wheels are about
+  80 mm diameter and the photographed chassis is much wider than 40 mm. If
+  `track_width_mm` is intended to be drive-wheel centre-to-centre spacing, 40 mm
+  is physically implausible and likely missing a zero. This must be measured
+  directly; do not blindly change it to 400 mm without measurement.
+- A track width ten times too small makes encoder-derived yaw roughly ten times
+  too large. Even with IMU correction this can severely distort pose history,
+  sensor projection and the drawn arena during turns/reversals. Correcting the
+  recovery controller will not by itself repair the displayed map until the
+  real wheel-centre spacing is entered.
+
+Recommended next order of work:
+
+1. Measure and enter the true centre-to-centre drive-wheel track width.
+2. Fix recovery targets to be relative to the current IMU heading and prevent
+   the side-choice logic from overwriting the selected alternating direction.
+3. Bound the number and total distance of consecutive recovery reverses.
+4. Filter/validate side ultrasound data and allow a boxed-area classification
+   to persist briefly instead of requiring three simultaneous raw readings.
+5. Explicitly APPLY strategy 1 in Arena View, verify a recorded parameter event
+   and `navigation.strategy = 1`, then perform a new Gap Explorer test.
+6. Reassess arena mapping only after odometry geometry and recovery motion are
+   corrected; the present map is being fed a physically incorrect pose path.

@@ -73,11 +73,22 @@
       "description": "Delay between telemetry packets",
       "datatype": "int",
       "unit": "ms",
-      "value": 500,
-      "min": 50,
+      "value": 1000,
+      "min": 750,
       "max": 2000,
       "step": 50
-    }
+    },
+    {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative)","datatype":"int","value":0,"min":0,"max":2,"step":1},
+    {"name":"navigation.front_avoid_mm","label":"Navigation front stop","datatype":"int","unit":"mm","value":300,"min":100,"max":1000,"step":25},
+    {"name":"navigation.side_avoid_mm","label":"Navigation side clearance","datatype":"int","unit":"mm","value":200,"min":80,"max":800,"step":25},
+    {"name":"navigation.wall_follow_mm","label":"Wall-follow distance","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
+    {"name":"navigation.lane_spacing_mm","label":"Sweep lane spacing","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
+    {"name":"navigation.robot_width_mm","label":"Robot physical width","datatype":"int","unit":"mm","value":430,"min":100,"max":1200,"step":10},
+    {"name":"navigation.gap_margin_mm","label":"Gap safety margin","datatype":"int","unit":"mm","value":80,"min":0,"max":500,"step":10},
+    {"name":"navigation.gap_depth_mm","label":"Minimum depth considered open","datatype":"int","unit":"mm","value":550,"min":250,"max":3000,"step":25},
+    {"name":"navigation.matrix_floor_rows","label":"Ignored lower 8x8 rows","datatype":"int","value":2,"min":0,"max":4,"step":1},
+    {"name":"navigation.matrix_fov_deg","label":"8x8 horizontal field of view","datatype":"int","unit":"deg","value":40,"min":20,"max":90,"step":1},
+    {"name":"navigation.gap_confirm_frames","label":"Gap confirmation frames","datatype":"int","value":2,"min":1,"max":5,"step":1}
   ],
   "commands": [
     {

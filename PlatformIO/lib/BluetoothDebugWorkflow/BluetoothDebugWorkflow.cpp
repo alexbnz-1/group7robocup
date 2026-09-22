@@ -34,6 +34,9 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
 
 void BluetoothDebugWorkflow::begin()
 {
+    Serial.begin(115200);
+    delay(1500);
+    Serial.println("BOOT: workflow begin");
     // Teensy's default hardware-serial RX storage is too small for the longer
     // JSON motion commands when telemetry transmission temporarily delays the
     // parser. Extra storage prevents complete newline-terminated commands from
@@ -43,8 +46,10 @@ void BluetoothDebugWorkflow::begin()
     // navigation loop while the 115200-baud UART physically shifts them out.
     bluetoothPort_.addMemoryForWrite(bluetoothTxBuffer_, sizeof(bluetoothTxBuffer_));
     bluetoothPort_.begin(BluetoothConfig::BAUD);
+    Serial.println("BOOT: Serial1 ready");
     servos_.begin();
     servos_.torqueOff(0xFE);
+    Serial.println("BOOT: servo buses ready");
     dcMotor203_.begin();
     dcMotor203Second_.begin();
     encoders_.begin();
@@ -59,15 +64,21 @@ void BluetoothDebugWorkflow::begin()
         return;
     }
 
+    Serial.println("BOOT: config parsed");
+
     initialiseDigitalInputs();
     initialiseUltrasoundSensors();
+    Serial.println("BOOT: digital sensors ready");
     initialiseTofSensors();
+    Serial.println("BOOT: point TOF ready");
     const bool tof8x8Ready = tof8x8_.begin();
+    Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
+    Serial.println("BOOT: IMU begin returned");
 
     JsonObject interval = findParameter("debug.telemetry_interval_ms");
     if (!interval.isNull())
-        telemetryIntervalMs_ = constrain(interval["value"] | 200UL, 50UL, 2000UL);
+        telemetryIntervalMs_ = constrain(interval["value"] | 1000UL, 750UL, 2000UL);
 
     delay(100);
     link_.log("INFO", "Teensy Bluetooth workflow ready");
@@ -76,10 +87,19 @@ void BluetoothDebugWorkflow::begin()
     link_.log(imuReady ? "INFO" : "WARNING",
               imuReady ? "BNO055 IMU ready" : "BNO055 IMU not detected on I2C0/I2C1");
     sendState();
+    Serial.println("BOOT: workflow ready");
 }
 
 void BluetoothDebugWorkflow::update()
 {
+    static uint32_t lastUsbHeartbeatMs = 0;
+    if (millis() - lastUsbHeartbeatMs >= 1000U)
+    {
+        lastUsbHeartbeatMs = millis();
+        Serial.printf("LOOP: uptime=%lu tx_free=%d dropped=%lu\n",
+                      millis(), bluetoothPort_.availableForWrite(),
+                      link_.droppedMessages());
+    }
     const uint32_t updateStartedUs = micros();
     if (lastUpdateStartedUs_ != 0)
         maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
@@ -670,7 +690,32 @@ void BluetoothDebugWorkflow::handleParameter(JsonDocument& message)
     }
 
     if (strcmp(name, "debug.telemetry_interval_ms") == 0)
-        telemetryIntervalMs_ = parameter["value"].as<uint32_t>();
+    {
+        const uint32_t requested = parameter["value"].as<uint32_t>();
+        telemetryIntervalMs_ = requested < 750U ? 750U : requested;
+    }
+    else if (strcmp(name, "navigation.strategy") == 0)
+        navigationStrategy_ = parameter["value"].as<uint8_t>();
+    else if (strcmp(name, "navigation.front_avoid_mm") == 0)
+        navigationFrontAvoidMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.side_avoid_mm") == 0)
+        navigationSideAvoidMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.wall_follow_mm") == 0)
+        navigationWallFollowMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.lane_spacing_mm") == 0)
+        navigationLaneSpacingMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.robot_width_mm") == 0)
+        navigationRobotWidthMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.gap_margin_mm") == 0)
+        navigationGapMarginMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.gap_depth_mm") == 0)
+        navigationGapDepthMm_ = parameter["value"].as<uint16_t>();
+    else if (strcmp(name, "navigation.matrix_floor_rows") == 0)
+        navigationMatrixFloorRows_ = parameter["value"].as<uint8_t>();
+    else if (strcmp(name, "navigation.matrix_fov_deg") == 0)
+        navigationMatrixFovDeg_ = parameter["value"].as<uint8_t>();
+    else if (strcmp(name, "navigation.gap_confirm_frames") == 0)
+        navigationGapConfirmFrames_ = parameter["value"].as<uint8_t>();
 
     link_.parameterValue(name, parameter["value"].as<float>());
 }
@@ -789,6 +834,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["system.navigation_controller_version"] = 7;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
     data["bluetooth.messages_received"] = receivedMessages_;
+    data["bluetooth.tx_dropped_messages"] = link_.droppedMessages();
+    data["bluetooth.tx_dropped_bytes"] = link_.droppedBytes();
     data["servo.last_id"] = lastServoId_;
     data["servo.commanded_angle_deg"] = lastServoAngleDeg_;
     data["servo.zeroed"] = servoZeroed_[lastServoId_];
@@ -869,6 +916,11 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.detour_offset_mm"] = navigationDetourOffsetMm_;
     data["navigation.recovery_count"] = navigationRecoveryCount_;
     data["navigation.clearance_turn_count"] = navigationClearanceTurnCount_;
+    data["navigation.strategy"] = navigationStrategy_;
+    data["navigation.gap_passable"] = navigationGapPassable_;
+    data["navigation.gap_width_mm"] = navigationGapWidthMm_;
+    data["navigation.gap_centre_column_x2"] = navigationGapCentreColumnX2_;
+    data["navigation.matrix_floor_rows"] = navigationMatrixFloorRows_;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
     data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
@@ -962,7 +1014,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         data["servo.measured_angle_deg"] = measuredServoAngleDeg_;
     if (!isnan(servoPositionErrorDeg_))
         data["servo.position_error_deg"] = servoPositionErrorDeg_;
-    link_.send(message);
+    link_.send(message, 2048);
     maxUpdateGapUs_ = 0;
 
     // Keep electrical diagnostics in a second, slower packet. These raw pin
@@ -1005,7 +1057,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         snprintf(key, sizeof(key), "ultrasound.%s.trigger_high_voltage_v", ultrasoundSensorNames_[i]);
         diagnostics[key] = ultrasoundSensors_[i].triggerHighAdc() * (3.3f / 4095.0f);
     }
-    link_.send(diagnosticMessage);
+    link_.send(diagnosticMessage, 2048);
 }
 
 void BluetoothDebugWorkflow::initialiseDigitalInputs()
@@ -1285,24 +1337,27 @@ void BluetoothDebugWorkflow::updateNavigation()
         return;
     }
 
-    constexpr uint16_t FRONT_AVOID_MM = 300;
+    // Default retained for recording/test compatibility: FRONT_AVOID_MM = 300.
+    const uint16_t FRONT_AVOID_MM = navigationFrontAvoidMm_;
     // At the observed ~1.2 s matrix frame cadence the robot can travel over
     // 200 mm between frames. A genuinely broad wall therefore needs an
     // earlier threshold than a point return. Requiring three quarters of the
     // centre zones prevents one or two bad pixels from causing a turn.
     constexpr uint16_t MATRIX_BROAD_WALL_MM = 550;
-    constexpr uint16_t SIDE_AVOID_MM = 200;
-    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 200;
+    const uint16_t SIDE_AVOID_MM = navigationSideAvoidMm_;
+    // Default: WALL_FOLLOW_TARGET_MM = 200.
+    const uint16_t WALL_FOLLOW_TARGET_MM = navigationWallFollowMm_;
     // 200 mm is now only the nominal spacing. The opposite side ultrasound
     // determines how much arena width remains, so there is no fixed lane count.
-    constexpr float LANE_SPACING_MM = 200.0f;
+    // Default: LANE_SPACING_MM = 200.0f.
+    const float LANE_SPACING_MM = navigationLaneSpacingMm_;
     constexpr uint16_t SWEEP_EDGE_TARGET_MM = 250;
     constexpr uint16_t SWEEP_EDGE_TOLERANCE_MM = 75;
 
     // Localised forward obstacles are bypassed with a rectangular detour. A
     // true arena end wall should block the full 8x8 horizontal view, while an
     // internal wall/obstacle leaves at least one outer flank visibly open.
-    constexpr uint16_t OBSTACLE_FORWARD_GAP_MM = 550;
+    const uint16_t OBSTACLE_FORWARD_GAP_MM = navigationGapDepthMm_;
     constexpr uint16_t OBSTACLE_MIN_SIDE_ROOM_MM = 450;
     constexpr float OBSTACLE_EARLY_WALL_MARGIN_MM = 450.0f;
     constexpr uint16_t OBSTACLE_SIDE_TRACK_MAX_MM = 650;
@@ -1361,6 +1416,9 @@ void BluetoothDebugWorkflow::updateNavigation()
     uint16_t matrixBroadValues[32] = {};
     uint8_t matrixBroadValueCount = 0;
     uint8_t matrixUsableCentreCount = 0;
+    bool matrixGapPassableNow = false;
+    int8_t matrixGapCentreColumnX2 = 0;
+    uint16_t matrixGapWidthMm = 0;
     if (tof8x8_.available() && tof8x8_.lastReadSucceeded())
     {
         uint16_t centreValues[32];
@@ -1368,7 +1426,10 @@ void BluetoothDebugWorkflow::updateNavigation()
         uint16_t columnValues[8][8] = {};
         uint8_t columnCounts[8] = {};
 
-        for (uint8_t row = 0; row < 8; ++row)
+        const uint8_t ignoredRows = navigationMatrixFloorRows_ > 4U
+            ? 4U : navigationMatrixFloorRows_;
+        const uint8_t matrixRowsUsed = 8U - ignoredRows;
+        for (uint8_t row = 0; row < matrixRowsUsed; ++row)
             for (uint8_t col = 0; col < 8; ++col)
             {
                 const uint16_t value = tof8x8_.distanceMm(row, col);
@@ -1454,7 +1515,66 @@ void BluetoothDebugWorkflow::updateNavigation()
                 matrixRightGapMm = max(matrixRightGapMm, columnMedian);
             }
         }
+
+        // Find the widest contiguous opening anywhere in the horizontal view,
+        // rather than only accepting gaps on the two outer flanks. Width is
+        // projected at the nearest open-column depth, making the decision a
+        // physical chassis-width check instead of a fixed pixel-count guess.
+        uint8_t runStart = 0;
+        uint8_t runLength = 0;
+        uint16_t runDepth = 3500;
+        auto evaluateGap = [&](uint8_t start, uint8_t length, uint16_t depth) {
+            if (length == 0 || depth == 0 || depth == 0xFFFF) return;
+            const float HORIZONTAL_FOV_DEG = navigationMatrixFovDeg_;
+            const float leftAngle = (-0.5f + static_cast<float>(start) / 8.0f) *
+                                    HORIZONTAL_FOV_DEG * DEG_TO_RAD;
+            const float rightAngle = (-0.5f + static_cast<float>(start + length) / 8.0f) *
+                                     HORIZONTAL_FOV_DEG * DEG_TO_RAD;
+            const uint16_t width = static_cast<uint16_t>(constrain(
+                lroundf(depth * (tanf(rightAngle) - tanf(leftAngle))), 0L, 5000L));
+            if (width > matrixGapWidthMm)
+            {
+                matrixGapWidthMm = width;
+                matrixGapCentreColumnX2 = static_cast<int8_t>(2 * start + length - 8);
+            }
+        };
+        for (uint8_t col = 0; col <= 8; ++col)
+        {
+            bool open = false;
+            uint16_t depth = 0xFFFF;
+            if (col < 8 && columnCounts[col] >= 3)
+            {
+                sortSmall(columnValues[col], columnCounts[col]);
+                depth = columnValues[col][columnCounts[col] / 2];
+                open = depth >= OBSTACLE_FORWARD_GAP_MM;
+            }
+            if (open)
+            {
+                if (runLength == 0) { runStart = col; runDepth = depth; }
+                else runDepth = min(runDepth, depth);
+                ++runLength;
+            }
+            else if (runLength != 0)
+            {
+                evaluateGap(runStart, runLength, runDepth);
+                runLength = 0;
+                runDepth = 3500;
+            }
+        }
+        matrixGapPassableNow = matrixGapWidthMm >=
+            navigationRobotWidthMm_ + navigationGapMarginMm_;
     }
+
+    if (matrixGapPassableNow)
+    {
+        if (navigationGapSeenFrames_ < 10) ++navigationGapSeenFrames_;
+    }
+    else
+        navigationGapSeenFrames_ = 0;
+    navigationGapPassable_ = matrixGapPassableNow &&
+        navigationGapSeenFrames_ >= navigationGapConfirmFrames_;
+    navigationGapCentreColumnX2_ = matrixGapCentreColumnX2;
+    navigationGapWidthMm_ = matrixGapWidthMm;
 
     // A median across the top-left, top-right and matrix forward estimates
     // rejects one isolated short return without hiding a broad wall.
@@ -1519,8 +1639,14 @@ void BluetoothDebugWorkflow::updateNavigation()
     navigationFrontMm_ = front == 0xFFFF ? 0 : front;
     navigationLeftMm_ = left == 0xFFFF ? 0 : left;
     navigationRightMm_ = right == 0xFFFF ? 0 : right;
-    const bool frontBlocked = navigationMatrixBroadWall_ ||
+    const bool rawFrontBlocked = navigationMatrixBroadWall_ ||
         (front != 0xFFFF && front < FRONT_AVOID_MM);
+    // Gap Explorer trusts a confirmed physical-width opening. Balanced mode
+    // also accepts it when centred; Conservative mode never overrides a wall.
+    const bool gapMayOverrideWall = navigationGapPassable_ &&
+        (navigationStrategy_ == 1 ||
+         (navigationStrategy_ == 0 && abs(navigationGapCentreColumnX2_) <= 2));
+    const bool frontBlocked = rawFrontBlocked && !gapMayOverrideWall;
     const bool leftBlocked = left != 0xFFFF && left < SIDE_AVOID_MM;
     const bool rightBlocked = right != 0xFFFF && right < SIDE_AVOID_MM;
 
@@ -1892,6 +2018,10 @@ void BluetoothDebugWorkflow::updateNavigation()
                 beginRightAngleTurn(true, NAV_INITIAL_TURN);
                 link_.log("INFO", "Navigation reached first wall; turning right");
             }
+            else if (gapMayOverrideWall && rawFrontBlocked)
+                driveOnHeading(normaliseHeading(navigationHeadingReferenceDeg_ +
+                    constrain(navigationGapCentreColumnX2_ *
+                        (navigationMatrixFovDeg_ / 16.0f), -20.0f, 20.0f)), 100);
             else if (front == 0xFFFF)
                 setDrive(-100, 100);  // rotate until forward ranging is recovered
             else
@@ -1916,6 +2046,10 @@ void BluetoothDebugWorkflow::updateNavigation()
                 beginRightAngleTurn(true, NAV_CORNER_TURN);
                 link_.log("INFO", "Navigation reached corner; entering sweep");
             }
+            else if (gapMayOverrideWall && rawFrontBlocked)
+                driveOnHeading(normaliseHeading(navigationHeadingReferenceDeg_ +
+                    constrain(navigationGapCentreColumnX2_ *
+                        (navigationMatrixFovDeg_ / 16.0f), -20.0f, 20.0f)), 100);
             else if (!isnan(wallFollowFilteredLeftMm) &&
                      now - wallFollowLastGoodMs <= 650U)
             {
@@ -2068,6 +2202,16 @@ void BluetoothDebugWorkflow::updateNavigation()
                     setDrive(0, 0);
                     beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_OUT);
                 }
+            }
+            else if (gapMayOverrideWall && rawFrontBlocked)
+            {
+                // One half-column is 2.5 degrees with the configured 40-degree
+                // field. Aim through the centre while retaining IMU control.
+                const float gapOffsetDeg = constrain(
+                    navigationGapCentreColumnX2_ *
+                        (navigationMatrixFovDeg_ / 16.0f), -20.0f, 20.0f);
+                driveOnHeading(normaliseHeading(
+                    navigationHeadingReferenceDeg_ + gapOffsetDeg), 100);
             }
             else if (leftBlocked && !rightBlocked)
                 driveOnHeading(
@@ -2434,7 +2578,13 @@ void BluetoothDebugWorkflow::updateTof8x8()
 
     if (tof8x8_.available())
         tof8x8_.read();
-    sendTof8x8Frame();
+    // Navigation consumes every fresh sensor read, but the low-bandwidth BLE
+    // debug link only needs one visualisation frame per second.
+    if (now - lastTof8x8TransmitMs_ >= 1000U)
+    {
+        lastTof8x8TransmitMs_ = now;
+        sendTof8x8Frame();
+    }
 }
 
 void BluetoothDebugWorkflow::sendTof8x8Frame()
@@ -2460,7 +2610,7 @@ void BluetoothDebugWorkflow::sendTof8x8Frame()
         for (uint8_t i = 0; i < Tof8x8::ZONE_COUNT; ++i)
             zones.add(tof8x8_.data()[i]);
 
-    link_.send(message);
+    link_.send(message, 2048);
 }
 
 JsonObject BluetoothDebugWorkflow::findParameter(const char* name)

@@ -984,7 +984,7 @@ class RobotDebugGUI(QMainWindow):
         health_row = QHBoxLayout()
         health_row.addWidget(QLabel("Link health:"))
         self.link_health_label = QLabel(
-            "Frames/s: 0 | Signals/s: 0 | Last telemetry: — | Protocol errors: 0"
+            "Frames/s: 0 | Signals/s: 0 | Last telemetry: — | Link/robot errors: 0"
         )
         health_row.addWidget(self.link_health_label)
         health_row.addStretch()
@@ -1031,7 +1031,14 @@ class RobotDebugGUI(QMainWindow):
     def _build_arena_tab(self):
         self.arena_view = ArenaView(self.settings)
         self.arena_view.command_requested.connect(self.execute_command)
+        self.arena_view.parameter_requested.connect(self.apply_arena_parameter)
         self.tabs.addTab(self.arena_view, "Arena View")
+
+    def apply_arena_parameter(self, name, value):
+        self.parameter_values[name] = value
+        self.recorder.record_parameter(name, value)
+        self.bluetooth.set_parameter(name, value)
+        self.add_log("TX", f"{name} = {value}")
 
 
     def _build_dashboard_tab(self):
@@ -2262,7 +2269,7 @@ class RobotDebugGUI(QMainWindow):
             f"Frames/s: {len(self.raw_line_times)} | "
             f"Signals/s: {len(self.telemetry_event_times)} | "
             f"Last telemetry: {age_text} | "
-            f"Protocol errors: {self.protocol_error_count}{alert}"
+            f"Link/robot errors: {self.protocol_error_count}{alert}"
         )
 
     # =================================================================

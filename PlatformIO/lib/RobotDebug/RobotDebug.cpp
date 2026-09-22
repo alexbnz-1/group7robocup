@@ -56,19 +56,39 @@ void RobotDebug::finishLine()
         handler_(message, context_);
 }
 
-void RobotDebug::send(JsonDocument& message)
+bool RobotDebug::send(JsonDocument& message, size_t reserveBytes)
 {
     const size_t required = measureJson(message);
     if (required >= sizeof(txBuffer_))
-        return;
+    {
+        ++droppedMessages_;
+        droppedBytes_ += required + 1;
+        return false;
+    }
 
     const size_t length = serializeJson(message, txBuffer_, sizeof(txBuffer_));
-    // The Teensy workflow installs a large hardware-UART TX ring. Queue the
-    // complete line there and let the UART drain it asynchronously. The old
-    // 20-byte/delay/flush loop stalled navigation for hundreds of milliseconds
-    // per telemetry frame and made time-based motor pulses uncontrollable.
-    stream_.write(reinterpret_cast<const uint8_t*>(txBuffer_), length);
+    // Never begin a line unless the complete JSON, newline, and requested
+    // command-response reserve fit in the UART ring. HardwareSerial::write()
+    // may otherwise accept a prefix, and the next send then joins two partial
+    // documents into one corrupt line. Dropping one complete bulk frame is far
+    // safer than wedging the CH9143 and preserves room for Stop/parameter ACKs.
+    const size_t requiredSpace = length + 1 + reserveBytes;
+    if (stream_.availableForWrite() < static_cast<int>(requiredSpace))
+    {
+        ++droppedMessages_;
+        droppedBytes_ += length + 1;
+        return false;
+    }
+    const size_t written = stream_.write(
+        reinterpret_cast<const uint8_t*>(txBuffer_), length);
+    if (written != length)
+    {
+        ++droppedMessages_;
+        droppedBytes_ += length + 1 - written;
+        return false;
+    }
     stream_.write('\n');
+    return true;
 }
 
 void RobotDebug::log(const char* level, const char* text)

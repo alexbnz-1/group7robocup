@@ -26,6 +26,10 @@ private:
     static constexpr uint8_t MAX_ULTRASOUND_SENSORS = 2;
     HardwareSerialIMXRT& bluetoothPort_;
     uint8_t bluetoothRxBuffer_[2048] = {};
+    // 8 KiB is large enough for one complete telemetry frame plus the 2 KiB
+    // command-response reserve.  Keep this below 32 KiB: Teensy's UART ring
+    // head/tail counters are 16-bit and the larger field test buffer prevented
+    // Serial1 from producing any bytes after boot on this board.
     uint8_t bluetoothTxBuffer_[8192] = {};
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
@@ -77,6 +81,7 @@ private:
     bool tofTimedOut_[MAX_TOF_SENSORS] = {};
     int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
     uint32_t lastTof8x8FrameMs_ = 0;
+    uint32_t lastTof8x8TransmitMs_ = 0;
     uint8_t digitalInputCount_ = 0;
     char digitalInputNames_[MAX_DIGITAL_INPUTS][25] = {};
     DigitalInputSensor digitalInputs_[MAX_DIGITAL_INPUTS];
@@ -169,6 +174,21 @@ private:
     bool navigationRecoveryTurnRight_ = true;
     uint16_t navigationRecoveryCount_ = 0;
     uint8_t navigationClearanceTurnCount_ = 0;
+    uint8_t navigationStrategy_ = 0;
+    uint16_t navigationFrontAvoidMm_ = 300;
+    uint16_t navigationSideAvoidMm_ = 200;
+    uint16_t navigationWallFollowMm_ = 200;
+    uint16_t navigationLaneSpacingMm_ = 200;
+    uint16_t navigationRobotWidthMm_ = 430;
+    uint16_t navigationGapMarginMm_ = 80;
+    uint16_t navigationGapDepthMm_ = 550;
+    uint8_t navigationMatrixFloorRows_ = 2;
+    uint8_t navigationMatrixFovDeg_ = 40;
+    uint8_t navigationGapConfirmFrames_ = 2;
+    uint8_t navigationGapSeenFrames_ = 0;
+    bool navigationGapPassable_ = false;
+    int8_t navigationGapCentreColumnX2_ = 0;
+    uint16_t navigationGapWidthMm_ = 0;
 
     bool navigationMotionConsistent_ = true;
 
