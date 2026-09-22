@@ -4532,3 +4532,464 @@ Recommended next order of work:
    and `navigation.strategy = 1`, then perform a new Gap Explorer test.
 6. Reassess arena mapping only after odometry geometry and recovery motion are
    corrected; the present map is being fed a physically incorrect pose path.
+
+
+2026-09-22 navigation recovery v8 fix from GAPEXPLOREREAGGRESSIVE diagnosis
+----------------------------------------------------------------------------
+Basis for this change:
+
+- Re-read the current testing branch at commit
+  `7e6b6bcfc4efa5c9a50dd6a3915166445f291a01` and the latest status.txt before
+  editing.
+- Reconstructed the three edited source baselines and verified the firmware
+  source/header against the exact current Git blob SHAs before applying the
+  fix:
+  - BluetoothDebugWorkflow.cpp: 68aad83d56c96f71f963c357f99890d12b8b128f
+  - BluetoothDebugWorkflow.h:   5136fa7c9251f7c2d5ee3843d97024915920a210
+  - ArenaView.py:               75d12b53fcead82d223eba7c7a3f2ced5abb4b48
+- The fix is specifically based on the recorded failure in
+  GAPEXPLOREREAGGRESSIVE.rdbg. The recording showed repeated reverse/recovery
+  cycles where the recovery target was almost the same heading the robot had
+  already reached.
+
+Confirmed root cause addressed:
+
+- Normal coverage turns still use the exact navigation heading lattice. This is
+  retained because it prevents lane-to-lane angular error from accumulating.
+- Recovery, U-trap escape and clearance turns no longer use the stale
+  navigationHeadingReferenceDeg_ from the previous forward leg.
+- A new beginRelativeTurnFromCurrent() helper constructs those targets from the
+  current valid BNO055 heading. If the IMU is temporarily unavailable it falls
+  back to the current navigation target rather than the stale forward-leg
+  reference.
+- This directly addresses the recorded cases where the chassis was already at
+  about 266 degrees while recovery repeatedly targeted about 266.4 degrees, and
+  later was already near 354 degrees while the target stayed near 356.4 degrees.
+
+Recovery direction locking:
+
+- startRecovery() now chooses the first escape side once and keeps that choice
+  locked throughout that reverse/turn attempt.
+- NAV_RECOVERY_REVERSE no longer recalculates navigationRecoveryTurnRight_ from
+  whichever raw ultrasound sample happens to arrive immediately before the
+  turn.
+- If a genuine 90-degree recovery exit is still blocked, the next attempt is
+  explicitly forced to the opposite side. The reverse state cannot overwrite
+  that alternation.
+
+Side-ultrasound filtering:
+
+- Recovery/U-trap decisions now use a separate three-sample side-ultrasound
+  filter instead of one raw reading.
+- Samples are added only when the sensor fallCount changes, so the fast main
+  loop cannot count the same echo repeatedly.
+- Only 30-5000 mm samples are accepted.
+- At least two fresh completed echoes are required. Two samples use their mean;
+  three samples use the median.
+- Filtered side data is retained for up to 800 ms. This also gives the boxed-in
+  classification short persistence instead of requiring both side readings to
+  happen to be close on exactly the same raw update.
+- This is intended to reject the isolated approximately 36 mm right-ultrasound
+  transient seen in the failed recording while preserving genuine close walls.
+
+Bounded recovery motion:
+
+- Normal recovery reverse target reduced from 350 mm to 300 mm.
+- Maximum single recovery reverse leg reduced from 800 mm to 450 mm.
+- Consecutive recovery attempts are counted and total reverse distance is
+  accumulated.
+- Maximum ordinary recovery budget is three attempts or 1200 mm total reverse,
+  whichever is reached first.
+- Once that budget is reached the controller commands a 180-degree turn from
+  the CURRENT IMU heading rather than continuing an unbounded reverse/90-degree
+  cycle.
+- If the forced 180-degree heading still reports a wall, the controller does
+  not immediately begin another long reverse loop. It hands control back to
+  wall acquisition on the materially different heading so navigation can
+  re-plan from there.
+
+Existing U-shaped escape / clearance behaviour:
+
+- The front+left+right trapped test now uses the filtered side distances.
+- NAV_ESCAPE_REVERSE uses filtered side-open evidence and its turn is generated
+  from the current IMU heading.
+- Extra clearance turns are also generated relative to current IMU heading.
+- Existing front 8x8 broad-wall detection, physical-width gap detection,
+  Gap Explorer behaviour, obstacle detours, dynamic arena-width sweeps and the
+  exact normal sweep heading lattice are retained.
+
+Arena View navigation tuning fix:
+
+- Clicking RUN NAVIGATION now first calls the same Apply Navigation Tuning path
+  used by the manual APPLY NAVIGATION TUNING button, then sends
+  autonomous_navigation enabled=true.
+- This means the currently visible Algorithm selection and every visible
+  navigation tuning value are sent before autonomy starts.
+- This prevents a recording named/tested as Gap Explorer from silently running
+  the previous Balanced strategy because APPLY was forgotten.
+- Arena View now expects navigation controller version 8.
+
+New diagnostic telemetry:
+
+- system.navigation_controller_version = 8
+- navigation.recovery_logic_version = 2
+- navigation.recovery_attempt
+- navigation.recovery_total_reverse_mm
+- navigation.recovery_force_half_turn
+
+Deliberately NOT changed:
+
+- Arena View's current track_width_mm value/migration has not been changed.
+  The latest recording contains track_width_mm = 40.0, which appears physically
+  implausible for this chassis if it represents drive-wheel centre-to-centre
+  spacing, but the real value must be measured. Do not replace it with a guessed
+  400 mm value. Enter the actual measured centre-to-centre drive-wheel spacing
+  before judging the map geometry during turns.
+
+Verification performed here:
+
+- Python syntax compilation of the final ArenaView.py passed.
+- C++ braces, brackets and parentheses were checked after stripping comments and
+  strings; all were balanced with no negative nesting.
+- Verified the new header members are referenced by the firmware.
+- Verified controller version 8, current-heading recovery helper, filtered side
+  median, three-attempt/1200-mm bound and forced 180-degree path are present.
+- Verified the old recovery pattern that recalculated the side from raw
+  left/right inside NAV_RECOVERY_REVERSE is absent.
+- Verified Arena View applies tuning before emitting the RUN NAVIGATION command.
+- Full PyQt interaction tests were not run in this environment because PyQt6 is
+  not installed here.
+- Full PlatformIO Teensy compilation was not run here because the complete repo
+  toolchain/project is not mounted in this container. Build locally before
+  uploading.
+
+Recommended next test:
+
+1. Measure the real drive-wheel centre-to-centre track width and enter it in
+   Arena View before evaluating map shape.
+2. Build/upload this firmware and verify telemetry reports
+   system.navigation_controller_version = 8.
+3. Select Gap Explorer in Arena View and click RUN NAVIGATION directly. Confirm
+   navigation.strategy becomes 1 in telemetry/recording without separately
+   pressing APPLY NAVIGATION TUNING.
+4. Recreate the previously difficult boxed/internal-wall section with STOP ready.
+5. Watch navigation.phase, navigation.recovery_attempt,
+   navigation.recovery_total_reverse_mm and navigation.target_heading_deg.
+6. Every recovery_turn target should now be about +/-90 degrees from the actual
+   heading at that attempt, rather than approximately equal to it.
+7. If repeated exits remain blocked, the recovery should be bounded and move to
+   the forced 180-degree re-plan instead of accumulating metres of reverse.
+
+2026-09-22 22:12 run analysis and permanent-wall mapping update
+---------------------------------------------------------------
+Newest recording reviewed:
+
+- `Non-Teensy-Files/DataVisualisationAfter/Data/RobotRun_2026-09-22_22-12-08.rdbg`
+- Duration 117.37 seconds. Navigation ran from 2.76 seconds to STOP at 116.24
+  seconds.
+- The broken ultrasound period was deliberately excluded from the algorithm
+  assessment below. Conclusions use navigation state, IMU, encoders, top TOF,
+  8x8 forward data and motor commands.
+- This run correctly applied Conservative wall-safe strategy 2 before starting.
+  It also applied 150 mm front clearance, 100 mm side clearance, 100 mm
+  wall-follow distance, 250 mm lane spacing, 430 mm robot width, 40 mm gap
+  margin, three ignored lower matrix rows and 60-degree matrix FOV.
+
+What improved and what remains:
+
+- Navigation controller version 8's bounded recovery is a major improvement
+  over the previous recording. Only one recovery episode occurred. It reached
+  attempt 2 and about 756.6 mm total recorded reverse, then found a clear
+  current-heading exit. It did not enter the former multi-metre endless reverse
+  loop and did not need its forced half-turn limit.
+- Motion consistency was true in 71 of 80 navigation telemetry samples (88.75
+  percent). The controller, motor commands, encoders and IMU were generally
+  describing the same motion.
+- The remaining weakness is exploration policy, not simply collision sensing.
+  The controller repeatedly cycles through seek-wall, right-angle turn and
+  clearance-turn states. It only completed brief sweep phases, so it does not
+  maintain a durable concept of which free regions have already been searched.
+- The 8x8 reported a broad wall in 35 of 80 samples (43.75 percent). A passable
+  gap was confirmed in only 6 samples (7.5 percent). Conservative strategy is
+  therefore behaving as designed, but it is inherently reluctant to explore
+  uncertain openings and is a poor primary search policy for complete coverage.
+- The recording contains mangled duplicate signal names, although the core
+  navigation signals above remain readable. Three transmit frames/1783 bytes
+  were already counted as dropped before or at the start and did not increase
+  during the run. Main-loop timing remained stable at 40.58-43.65 ms. Preserve
+  the transport diagnosis as a separate issue when interpreting fine timing.
+
+Recommended searching algorithm:
+
+- Replace the top-level reactive wall-seek/sweep loop with frontier-based
+  exploration on a coarse occupancy grid, using A* for global paths and the
+  existing TOF/8x8 collision logic as the local safety/controller layer.
+- A 100 mm planning grid is sufficient for the supplied 2.4 x 4.9 m arena: only
+  about 24 x 49 = 1176 cells, small enough for deterministic A* on the Teensy.
+  Keep the 10 mm GUI grid for display, but downsample it for planning.
+- Maintain three planning states per cell: unknown, confirmed free and occupied.
+  Inflate occupied cells by half the robot width plus a configurable clearance
+  margin before path planning. Never plan through an unknown cell unless the
+  chosen target is its adjacent frontier.
+- A frontier is a confirmed-free cell adjacent to unknown space. Score reachable
+  frontiers by expected new area minus A* travel cost and turn cost. Drive to
+  the best score, rescan, update the grid and repeat. Mark unreachable frontiers
+  temporarily rather than falling back into an unbounded recovery loop.
+- Use IMU heading for turn control, calibrated encoders for translation and the
+  8x8/top TOFs for local wall confirmation. Re-plan immediately when the local
+  sensor layer blocks the next path segment.
+- Once no reachable frontiers remain, run boustrophedon/lawnmower coverage only
+  inside the confirmed reachable free-space mask. This gives orderly close
+  passes without assuming that the entire arena is one unobstructed rectangle.
+- This hybrid is preferred over pure wall following, Bug algorithms or the
+  current fixed sweep state machine because the task requires remembering where
+  the robot has searched, deliberately entering sufficiently wide openings and
+  handling internal obstacles/dead ends without repeatedly reacquiring the same
+  first wall.
+
+Arena painting change implemented:
+
+- Wall geometry now records independent verification tokens. Adjacent 8x8
+  columns in one frame count as one verification, not multiple independent
+  confirmations.
+- A wall locks after agreement from three distinct sensor frames. This is a
+  deliberate compromise: isolated speckle cannot become permanent, while a real
+  wall seen repeatedly becomes a fixed landmark quickly.
+- Once locked, a wall's perpendicular coordinate is frozen. Later agreeing
+  observations may extend its length and increase confidence but cannot slide
+  the whole wall as pose estimates drift.
+- Locked internal walls and locked arena boundaries are never deleted, split or
+  demoted by chassis-path carving. A later outward parallel candidate cannot
+  replace an already locked boundary.
+- Provisional geometry remains correctable. Before three-frame lock it may still
+  be weakened by free-space rays or carved when confirmed chassis translation
+  proves that location traversable.
+- Rendering now distinguishes map maturity: thick solid lines are permanent
+  three-frame-locked landmarks; thin/dashed lines are provisional geometry.
+  Arena status shows the number of locked permanent walls.
+
+Verification:
+
+- `ArenaView.py` passes Python syntax compilation.
+- Focused tests pass for three independent frames causing lock, locked geometry
+  surviving a false odometry crossing, locked coordinates remaining fixed while
+  their tangent span extends, and provisional geometry remaining carveable.
+- The full historical `test_arena_view.py` suite currently contains unrelated
+  failures from older tests that initialise only the retired single
+  `mm_per_count` calibration while current mapping requires separate encoder
+  scales, plus tests that predate the current initial range-confirmation filter.
+  The three new permanence tests pass independently.
+
+Frontier grid navigation option implemented (2026-09-22):
+
+- Added a fourth navigation strategy in the GUI named `Frontier grid + A*`.
+  The three existing reactive strategies remain available and unchanged.
+- Added the `FrontierExplorer` Teensy library. It maintains a 64 x 64 local
+  occupancy grid at 100 mm per cell, centred on the robot's starting pose.
+- Encoder translation and BNO055 heading update the planner pose. Point TOF,
+  left/right ultrasound and all eight horizontal columns of the 8x8 TOF update
+  free and occupied evidence. Each 8x8 column uses a vertical median so one
+  isolated bad pixel does not define an obstacle.
+- Planning traverses confirmed-free cells, inflates occupied cells by half the
+  configured robot width plus the configured gap margin, finds reachable
+  frontiers next to unknown space and builds a shortest grid path to the best
+  frontier. The score favours frontiers exposing more unknown cells while
+  penalising longer travel and unnecessary heading change.
+- The robot follows the resulting cell waypoints with BNO055 heading control at
+  full configured navigation power. A newly blocked forward route invalidates
+  the current path and triggers a re-plan instead of continuing into it.
+- If the initial map does not yet contain a reachable frontier, the robot turns
+  in place to scan. Completion is latched only after the explored map is large
+  enough and no reachable unknown boundary remains; a new Run Navigation
+  command starts a fresh map.
+- Added planner telemetry for local pose, known-cell count, frontier count,
+  path length, re-plan count and completion. The navigation controller version
+  reported to the GUI is now 9.
+- The GUI and firmware both accept navigation strategy value 3. Select
+  `Frontier grid + A*` on Arena View before pressing Run Navigation.
+- Removed the temporary programming-USB boot and one-second heartbeat prints
+  used during the earlier Bluetooth diagnosis.
+
+Verification of the frontier option:
+
+- Teensy 4.0 release firmware compiles successfully. Final build size is
+  150040 bytes of code plus 28024 bytes of data; 289536 bytes of RAM1 remain
+  available for local variables.
+- `ArenaView.py` passes syntax compilation.
+- The three focused permanent-wall regression tests pass after the navigation
+  option was added.
+
+Frontier controller smoothing update (2026-09-22):
+
+- The initial frontier controller was physically erratic because it discarded
+  and regenerated a valid route every second, used each adjacent 100 mm grid
+  cell as a precision target and applied immediate full-power opposite turns
+  around a small heading threshold.
+- A valid route is now held until its frontier is reached or live obstacle data
+  genuinely invalidates it. Sensor-map updates continue while following it.
+- The waypoint follower now uses a 130 mm rolling look-ahead, allowing it to
+  pass through the immediately adjacent grid cell without stopping or making a
+  fresh steering decision every 100 mm.
+- Heading changes now enter at 20 degrees and use the established IMU
+  pulse/coast/settle turn controller. It coasts before reversing turn torque,
+  pulses the required 100 percent motor command near the target and must settle
+  inside 4 degrees before forward travel resumes.
+- The turn state and route state reset cleanly on every new navigation run and
+  whenever a real forward blockage invalidates the path.
+- The smoothed Teensy firmware compiles successfully: 150104 bytes code,
+  28024 bytes data and 289504 bytes RAM1 free for local variables.
+
+Frontier run diagnosis and mapping correction (recordings ending 22:49 and
+22:51 on 2026-09-22):
+
+- The short final recording selected strategy 3 at 7.75 seconds and started at
+  8.32 seconds, but incorrectly announced exploration complete at 19.56
+  seconds. The longer named recording showed the same defect repeatedly, with
+  several runs ending after roughly one to six seconds.
+- This was a planner defect rather than successful coverage. `No reachable
+  frontier right now` was being treated as `the arena is fully explored` after
+  only a small number of sensor rays.
+- Sensor rays were also projected from the chassis centre. The physical forward
+  sensors are about 245 mm ahead of the centre and the side ultrasounds are
+  about 195 mm left and 190 mm right. A wall 170 mm beyond the front sensor was
+  consequently inserted 245 mm too close and obstacle inflation could cover
+  the robot's entire starting free patch.
+- Frontier ray projection now includes those sensor origins before applying
+  sensor angle and measured range. Forward point/8x8 rays originate at about
+  right 25 mm, forward 245 mm; left and right ultrasound rays originate at
+  their respective side positions.
+- Failure to find a current route no longer declares completion. The robot now
+  makes one controlled 45 degree IMU turn, settles, collects a new view and
+  tries planning again. It does not perform an unbounded full-power scan.
+- A close front reading during an intentional scan/route turn is expected and
+  no longer repeatedly cancels that turn. It only invalidates a route while the
+  robot is actually in the forward-follow phase.
+- Occupancy known-cell accounting now correctly decreases if contradictory
+  evidence returns a cell to unknown.
+- Corrected firmware compiles successfully: 150360 bytes code, 28024 bytes
+  data and 289504 bytes RAM1 free for local variables.
+
+Automatic arm sorting added (2026-09-22):
+
+- Added an `Arm sorting` command block with `ARM SORTING ON` and
+  `ARM SORTING OFF` buttons. It requires Debug Mode and Run Robot.
+- Turning sorting on reads Herkulex ID 4 at its current mechanical position and
+  stores that as the software zero. It then commands the sorting gate to -30
+  relative degrees and sets the paired HX12K bumpers OFF (C=130, D=0).
+- The sorting decision uses the configured D21 input's debounced logical
+  `digital.inductive_proximity.detected` value, including its active-low
+  configuration. It does not use the raw electrical level.
+- A new detection must remain continuously true for 500 ms. If it is still
+  detected, the bumpers turn ON (C=0, D=130) and Herkulex 4 moves to +30
+  relative degrees.
+- When detection clears, the bumper deliberately remains ON for another two
+  seconds so the weight can move fully off it. The gate independently remains
+  at +30 degrees for five seconds, then returns to -30. The periodic timer is
+  restarted when detection clears.
+- While nothing is detected, the bumpers pulse ON for one second every 20
+  seconds. The gate remains at -30 degrees during this mode.
+- The automation is non-blocking apart from the short established Herkulex
+  command transaction. The 500 ms confirmation and 20 second period use loop
+  timestamps, so Bluetooth, sensing and navigation continue updating.
+- STOP ROBOT disables the sorting automation and disables the HX12K outputs.
+  Sorting must be explicitly turned on again after a stop.
+- Added recording telemetry: `sorting.enabled`, confirmation pending/confirmed,
+  bumper state, gate target, both remaining hold times and milliseconds to the
+  next periodic pulse.
+- Firmware and embedded command definitions compile successfully. Final build:
+  152408 bytes code, 29048 bytes data and 288480 bytes RAM1 free for local
+  variables.
+
+Reactive exploration option and 8x8 orientation correction (2026-09-22):
+
+- Added navigation strategy 4, shown in Arena View as `Reactive gap wander (no
+  map planning)`. It does not build or consult the Teensy's frontier occupancy
+  grid. The desktop may still show live sensor rays, pose and observed evidence
+  so the operator can see what the robot sees.
+- Normal wandering drives at 100 percent with BNO055 heading hold. Every five
+  to nine seconds it makes a controlled 30 degree exploration turn when both
+  sides are clear, preventing a permanent straight wall-to-wall shuttle.
+- A broad frontal obstacle causes a controlled approximately 85 degree turn
+  toward the clearer side. A confirmed, physically passable off-centre 8x8 gap
+  instead causes a smaller approximately 35 degree correction toward the gap.
+- A single close side ultrasound causes a 25 degree steer away. If front, left
+  and right form a U-shaped trap, the robot reverses until at least one side is
+  clear after 200 mm, with a hard 650 mm reverse cap, then turns toward the
+  clearer exit.
+- Direction ties alternate rather than always selecting clockwise. Turns use
+  the existing IMU pulse/coast/settle controller, and bottom TOFs remain absent
+  from navigation decisions.
+- Added `navigation.wander_avoidance_count` telemetry and explicit
+  `wander_drive`, `wander_turn` and `wander_reverse` phases for recordings.
+- Expanded the navigation strategy parameter range to 0-4 and embedded the new
+  definition in the firmware. Firmware compiles successfully: 153816 bytes
+  code, 30072 bytes data and 287424 bytes RAM1 free for local variables.
+- Corrected the installed 8x8 TOF left/right display orientation. The previous
+  app default applied a mirror; existing saved orientation is inverted once by
+  settings migration version 2 and new settings default to unmirrored.
+- The 8x8 tab and Arena View receive the same corrected orientation. The manual
+  `Flip left/right for robot POV` checkbox remains available for verification
+  or a future physical remount.
+- `ArenaView.py` and `DebugGUI.py` pass Python syntax compilation, and the three
+  focused permanent-wall regression tests still pass.
+
+Outer top long-range TOFs added (2026-09-22):
+
+- Added `top_right_right`, a long-range point TOF on XSHUT6, and
+  `top_left_left`, a long-range point TOF on XSHUT7. This fills all eight
+  supported XSHUT channels while retaining the six existing point sensors.
+- Both sensors initialise through the existing SX1509 XSHUT/address-assignment
+  workflow and publish separate availability, timeout and distance telemetry as
+  `tof.top_right_right.*` and `tof.top_left_left.*`.
+- They are top-layer navigation sensors. XSHUT7 contributes to robot-left
+  clearance and XSHUT6 contributes to robot-right clearance. They are not
+  folded into the straight-ahead median, so seeing an angled side wall does not
+  falsely report a wall directly in front.
+- Balanced, gap, conservative and reactive-wander modes receive the new ranges
+  through their common left/right avoidance field. Reactive wander therefore
+  uses them when choosing the clearest turn and when steering away from a close
+  side.
+- Frontier mode records the two sensors as independent rays from their actual
+  outer positions at default bearings of -45 degrees for XSHUT7 and +45 degrees
+  for XSHUT6. It no longer projects their combined minimum as a false 90 degree
+  ultrasound ray.
+- Added both sensors to the editable Wiring Guide with a one-time migration
+  that preserves all existing custom rows. Arena View creates separate raw
+  readouts and sensor-layout controls for both.
+- Default Arena View geometry is top layer, approximately 180 mm to each side,
+  120 mm forward and +/-45 degrees. These values remain editable and persisted
+  because the precise fitted angles should be measured on the robot.
+- Firmware compiles successfully: 154328 bytes code, 30072 bytes data and
+  287424 bytes RAM1 free for local variables. GUI syntax checks and all seven
+  Wiring Guide tests pass.
+
+Weight detection and visited-area wandering memory (2026-09-22):
+
+- Added firmware weight detection using four matched vertical point-TOF pairs:
+  bottom/top far left, middle left, middle right and far right.
+- A low object is present when the bottom sensor returns 30-1200 mm and its
+  matching top sensor sees at least 150 mm farther. This distinguishes a short
+  weight from a wall visible at both heights.
+- Each sector requires three consecutive fresh 100 ms point-TOF polls (about
+  300 ms) before confirmation. Re-reading one sample in the fast control loop
+  cannot create a false multi-sample confirmation.
+- Added `weight.detected`, `weight.sector_mask`, `weight.nearest_mm` and signed
+  `weight.direction` telemetry. Sector mask bits run far-left through far-right;
+  direction values are -2, -1, +1 and +2.
+- Reactive gap wander biases once toward each newly confirmed weight sighting:
+  about 18 degrees for a middle sector and 35 degrees for an outer sector. Top
+  TOFs and the 8x8 remain authoritative for wall avoidance, so a bottom-only
+  weight is not incorrectly handled as a wall.
+- Added a separate 32 x 32 visited-cell memory at 200 mm resolution for reactive
+  wander. It stores breadcrumbs only, not obstacles or walls. Encoder distance
+  plus BNO055 heading update the local pose.
+- Cells are counted when entered rather than on every control-loop iteration.
+  Re-entering an old cell triggers a 45 degree choice toward the less-visited
+  side. Live clearances still override the preference when retracing is the
+  only safe way out, avoiding a self-imposed trap.
+- Periodic exploration and equal-clearance turn ties also prefer the projected
+  side with fewer prior visits. The breadcrumb grid resets on every new
+  navigation run.
+- Added wander local pose and visited-cell count to recorded telemetry.
+- Firmware compiles successfully: 155864 bytes code, 30072 bytes data and
+  286368 bytes RAM1 free for local variables.

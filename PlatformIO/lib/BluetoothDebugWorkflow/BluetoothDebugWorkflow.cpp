@@ -34,9 +34,6 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
 
 void BluetoothDebugWorkflow::begin()
 {
-    Serial.begin(115200);
-    delay(1500);
-    Serial.println("BOOT: workflow begin");
     // Teensy's default hardware-serial RX storage is too small for the longer
     // JSON motion commands when telemetry transmission temporarily delays the
     // parser. Extra storage prevents complete newline-terminated commands from
@@ -46,10 +43,8 @@ void BluetoothDebugWorkflow::begin()
     // navigation loop while the 115200-baud UART physically shifts them out.
     bluetoothPort_.addMemoryForWrite(bluetoothTxBuffer_, sizeof(bluetoothTxBuffer_));
     bluetoothPort_.begin(BluetoothConfig::BAUD);
-    Serial.println("BOOT: Serial1 ready");
     servos_.begin();
     servos_.torqueOff(0xFE);
-    Serial.println("BOOT: servo buses ready");
     dcMotor203_.begin();
     dcMotor203Second_.begin();
     encoders_.begin();
@@ -64,17 +59,11 @@ void BluetoothDebugWorkflow::begin()
         return;
     }
 
-    Serial.println("BOOT: config parsed");
-
     initialiseDigitalInputs();
     initialiseUltrasoundSensors();
-    Serial.println("BOOT: digital sensors ready");
     initialiseTofSensors();
-    Serial.println("BOOT: point TOF ready");
     const bool tof8x8Ready = tof8x8_.begin();
-    Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
-    Serial.println("BOOT: IMU begin returned");
 
     JsonObject interval = findParameter("debug.telemetry_interval_ms");
     if (!interval.isNull())
@@ -87,19 +76,10 @@ void BluetoothDebugWorkflow::begin()
     link_.log(imuReady ? "INFO" : "WARNING",
               imuReady ? "BNO055 IMU ready" : "BNO055 IMU not detected on I2C0/I2C1");
     sendState();
-    Serial.println("BOOT: workflow ready");
 }
 
 void BluetoothDebugWorkflow::update()
 {
-    static uint32_t lastUsbHeartbeatMs = 0;
-    if (millis() - lastUsbHeartbeatMs >= 1000U)
-    {
-        lastUsbHeartbeatMs = millis();
-        Serial.printf("LOOP: uptime=%lu tx_free=%d dropped=%lu\n",
-                      millis(), bluetoothPort_.availableForWrite(),
-                      link_.droppedMessages());
-    }
     const uint32_t updateStartedUs = micros();
     if (lastUpdateStartedUs_ != 0)
         maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
@@ -108,6 +88,7 @@ void BluetoothDebugWorkflow::update()
     const uint32_t now = millis();
     for (uint8_t i = 0; i < digitalInputCount_; ++i)
         digitalInputs_[i].update(now);
+    updateArmSorting(now);
     if (dcMotor203SecondDeadman_ && dcMotor203SecondActive_ &&
         millis() - lastDcMotor203SecondCommandMs_ > KEYBOARD_DRIVE_TIMEOUT_MS)
     {
@@ -130,6 +111,141 @@ void BluetoothDebugWorkflow::update()
 void BluetoothDebugWorkflow::dispatch(JsonDocument& message, void* context)
 {
     static_cast<BluetoothDebugWorkflow*>(context)->handleMessage(message);
+}
+
+bool BluetoothDebugWorkflow::zeroArmSortingGate()
+{
+    const float currentAngle = servos_.readAngle(ARM_SORTING_HERKULEX_ID, 30);
+    if (isnan(currentAngle)) return false;
+    servoZeroOffsetsDeg_[ARM_SORTING_HERKULEX_ID] = currentAngle;
+    servoZeroed_[ARM_SORTING_HERKULEX_ID] = true;
+    lastServoId_ = ARM_SORTING_HERKULEX_ID;
+    lastServoAngleDeg_ = 0.0f;
+    measuredServoAngleDeg_ = 0.0f;
+    armSortingGateTargetDeg_ = NAN;
+    link_.telemetry("servo.zero_offset_deg", currentAngle);
+    return true;
+}
+
+void BluetoothDebugWorkflow::setArmSortingGate(float relativeAngleDeg)
+{
+    if (!servoZeroed_[ARM_SORTING_HERKULEX_ID]) return;
+    if (!isnan(armSortingGateTargetDeg_) &&
+        fabsf(armSortingGateTargetDeg_ - relativeAngleDeg) < 0.1f) return;
+    const float absoluteAngle = servoZeroOffsetsDeg_[ARM_SORTING_HERKULEX_ID] +
+                                relativeAngleDeg;
+    if (absoluteAngle < HerkulexConfig::MIN_ANGLE_DEG ||
+        absoluteAngle > HerkulexConfig::MAX_ANGLE_DEG)
+    {
+        link_.error("Arm sorting gate target exceeds Herkulex absolute range");
+        return;
+    }
+    servos_.torqueOff(ARM_SORTING_HERKULEX_ID);
+    delay(5);
+    servos_.clearError(ARM_SORTING_HERKULEX_ID);
+    servos_.moveAngle(ARM_SORTING_HERKULEX_ID, absoluteAngle,
+                      HerkulexConfig::SORTING_GATE_MOVE_TIME_MS,
+                      HerkulexTeensy::LED_BLUE);
+    delay(5);
+    servos_.torqueOn(ARM_SORTING_HERKULEX_ID);
+    delay(5);
+    servos_.moveAngle(ARM_SORTING_HERKULEX_ID, absoluteAngle,
+                      HerkulexConfig::SORTING_GATE_MOVE_TIME_MS,
+                      HerkulexTeensy::LED_BLUE);
+    armSortingGateTargetDeg_ = relativeAngleDeg;
+    lastServoId_ = ARM_SORTING_HERKULEX_ID;
+    lastServoAngleDeg_ = relativeAngleDeg;
+    lastMoveStartMs_ = millis();
+    lastMoveDurationMs_ = HerkulexConfig::SORTING_GATE_MOVE_TIME_MS;
+}
+
+void BluetoothDebugWorkflow::setArmSortingBumpers(bool enabled)
+{
+    hx12kC_.setAngle(enabled ? 0.0f : 130.0f);
+    hx12kD_.setAngle(enabled ? 130.0f : 0.0f);
+    armSortingBumperOn_ = enabled;
+}
+
+void BluetoothDebugWorkflow::updateArmSorting(uint32_t now)
+{
+    if (!armSortingEnabled_ || stopped_) return;
+
+    bool sensorFound = false;
+    bool detected = false;
+    for (uint8_t i = 0; i < digitalInputCount_; ++i)
+    {
+        if (strcmp(digitalInputNames_[i], "inductive_proximity") == 0)
+        {
+            sensorFound = true;
+            detected = digitalInputs_[i].detected();
+            break;
+        }
+    }
+    if (!sensorFound) return;
+
+    if (detected)
+    {
+        if (!armSortingHighPending_ && !armSortingHighConfirmed_)
+        {
+            armSortingHighPending_ = true;
+            armSortingHighSinceMs_ = now;
+        }
+        if (armSortingHighPending_ &&
+            now - armSortingHighSinceMs_ >= ARM_SORTING_CONFIRM_MS)
+        {
+            armSortingHighPending_ = false;
+            armSortingHighConfirmed_ = true;
+            armSortingPulseEndsMs_ = 0;
+            armSortingBumperHoldUntilMs_ = 0;
+            armSortingGateHoldUntilMs_ = 0;
+            setArmSortingBumpers(true);
+            setArmSortingGate(30.0f);
+            link_.log("INFO", "Inductive detection confirmed for 0.50 s: gate=30; bumpers ON");
+        }
+        return;
+    }
+
+    armSortingHighPending_ = false;
+    if (armSortingHighConfirmed_)
+    {
+        armSortingHighConfirmed_ = false;
+        armSortingBumperHoldUntilMs_ = now + ARM_SORTING_BUMPER_HOLD_MS;
+        armSortingGateHoldUntilMs_ = now + ARM_SORTING_GATE_HOLD_MS;
+        armSortingNextPulseMs_ = now + ARM_SORTING_PERIOD_MS;
+        link_.log("INFO", "Detection cleared: holding bumper 2 s and gate +30 for 5 s");
+    }
+
+    if (armSortingBumperHoldUntilMs_ != 0 &&
+        static_cast<int32_t>(now - armSortingBumperHoldUntilMs_) >= 0)
+    {
+        armSortingBumperHoldUntilMs_ = 0;
+        setArmSortingBumpers(false);
+    }
+    if (armSortingGateHoldUntilMs_ != 0 &&
+        static_cast<int32_t>(now - armSortingGateHoldUntilMs_) >= 0)
+    {
+        armSortingGateHoldUntilMs_ = 0;
+        setArmSortingGate(-30.0f);
+        link_.log("INFO", "Sorting gate hold complete: gate=-30");
+    }
+
+    if (armSortingPulseEndsMs_ != 0 &&
+        static_cast<int32_t>(now - armSortingPulseEndsMs_) >= 0)
+    {
+        armSortingPulseEndsMs_ = 0;
+        setArmSortingBumpers(false);
+    }
+    if (armSortingPulseEndsMs_ == 0 &&
+        armSortingBumperHoldUntilMs_ == 0 &&
+        armSortingGateHoldUntilMs_ == 0 &&
+        static_cast<int32_t>(now - armSortingNextPulseMs_) >= 0)
+    {
+        setArmSortingGate(-30.0f);
+        setArmSortingBumpers(true);
+        armSortingPulseEndsMs_ = now + ARM_SORTING_PULSE_MS;
+        armSortingNextPulseMs_ = now + ARM_SORTING_PERIOD_MS;
+        link_.log("INFO", "Arm sorting 20 s bumper pulse");
+    }
 }
 
 void BluetoothDebugWorkflow::handleMessage(JsonDocument& message)
@@ -268,6 +384,13 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kB_.disable();
         hx12kC_.disable();
         hx12kD_.disable();
+        armSortingEnabled_ = false;
+        armSortingHighPending_ = false;
+        armSortingHighConfirmed_ = false;
+        armSortingBumperOn_ = false;
+        armSortingPulseEndsMs_ = 0;
+        armSortingBumperHoldUntilMs_ = 0;
+        armSortingGateHoldUntilMs_ = 0;
         stopped_ = true;
         sendState();
         link_.log("WARNING", "STOP received; servo torque disabled");
@@ -540,7 +663,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             return;
         }
         navigationActive_ = true;
-        navigationState_ = NAV_SEEK_WALL;
+        navigationState_ = navigationStrategy_ == 3 ? NAV_FRONTIER_EXPLORE :
+            (navigationStrategy_ == 4 ? NAV_WANDER_DRIVE : NAV_SEEK_WALL);
         navigationMotionStartedMs_ = millis();
         navigationHeadingReferenceDeg_ = imu_.headingDeg();
         navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
@@ -563,12 +687,42 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         navigationDetourLastTriggerCount_ = 0;
         navigationObstacleCount_ = 0;
         navigationRecoveryCount_ = 0;
+        navigationRecoveryAttemptCount_ = 0;
+        navigationRecoveryTotalReverseMm_ = 0.0f;
+        navigationRecoveryForceHalfTurn_ = false;
         navigationClearanceTurnCount_ = 0;
         navigationMotionConsistent_ = true;
+        if (navigationStrategy_ == 3)
+        {
+            frontierExplorer_.begin(encoders_.firstCount(), encoders_.secondCount(), imu_.headingDeg());
+            frontierLastPlanMs_ = 0;
+            frontierLastMapMs_ = 0;
+            frontierTurning_ = false;
+        }
+        if (navigationStrategy_ == 4)
+        {
+            navigationTargetHeadingDeg_ = imu_.headingDeg();
+            wanderNextDecisionMs_ = millis() + 6000U;
+            wanderTurnRight_ = true;
+            wanderAvoidanceCount_ = 0;
+            memset(wanderVisited_, 0, sizeof(wanderVisited_));
+            wanderVisitedCellCount_ = 0;
+            wanderXmm_ = 0.0f;
+            wanderYmm_ = 0.0f;
+            wanderStartHeadingDeg_ = imu_.headingDeg();
+            wanderLastEncoder1_ = encoders_.firstCount();
+            wanderLastEncoder2_ = encoders_.secondCount();
+            wanderCurrentCellIndex_ = -1;
+            wanderLastWeightMask_ = 0;
+        }
         stopped_ = false;
         dcMotor203SecondDeadman_ = false;
         sendState();
-        link_.log("WARNING", "Autonomous navigation started");
+        link_.log("WARNING", navigationStrategy_ == 3
+            ? "Frontier grid and A* navigation started"
+            : (navigationStrategy_ == 4
+                ? "Reactive gap wander started; no stored map used for planning"
+                : "Autonomous navigation started"));
     }
     else if (strcmp(action, "encoder_zero") == 0)
     {
@@ -641,6 +795,50 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kD_.setAngle(enabled ? 130.0f : 0.0f);
         link_.log("INFO", enabled ? "Bumper servos ON: C=0, D=130" :
                                   "Bumper servos OFF: C=130, D=0");
+        sendState();
+    }
+    else if (strcmp(action, "arm_sorting_toggle") == 0)
+    {
+        if (!message["enabled"].is<bool>())
+        {
+            link_.error("Arm sorting command requires enabled=true or false");
+            return;
+        }
+        const bool enabled = message["enabled"].as<bool>();
+        if (enabled)
+        {
+            if (stopped_)
+            {
+                link_.error("Arm sorting requires Run Robot");
+                return;
+            }
+            if (!zeroArmSortingGate())
+            {
+                link_.error("Arm sorting could not read and zero Herkulex 4");
+                return;
+            }
+            armSortingEnabled_ = true;
+            armSortingHighPending_ = false;
+            armSortingHighConfirmed_ = false;
+            armSortingNextPulseMs_ = millis() + ARM_SORTING_PERIOD_MS;
+            armSortingPulseEndsMs_ = 0;
+            armSortingBumperHoldUntilMs_ = 0;
+            armSortingGateHoldUntilMs_ = 0;
+            setArmSortingBumpers(false);
+            setArmSortingGate(-30.0f);
+            link_.log("INFO", "Arm sorting ON: Herkulex 4 zeroed; gate=-30; bumpers OFF");
+        }
+        else
+        {
+            armSortingEnabled_ = false;
+            armSortingHighPending_ = false;
+            armSortingHighConfirmed_ = false;
+            armSortingPulseEndsMs_ = 0;
+            armSortingBumperHoldUntilMs_ = 0;
+            armSortingGateHoldUntilMs_ = 0;
+            setArmSortingBumpers(false);
+            link_.log("INFO", "Arm sorting OFF; bumpers OFF");
+        }
         sendState();
     }
     else if (strcmp(action, "tof_read_all") == 0)
@@ -831,7 +1029,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["system.uptime_s"] = now / 1000.0f;
     data["system.debug_mode"] = debugMode_;
     data["system.stopped"] = stopped_;
-    data["system.navigation_controller_version"] = 7;
+    data["system.navigation_controller_version"] = 9;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
     data["bluetooth.messages_received"] = receivedMessages_;
     data["bluetooth.tx_dropped_messages"] = link_.droppedMessages();
@@ -844,6 +1042,18 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["servo.tracking_fault"] = trackingFault_;
     data["servo.continuous_velocity_active"] = continuousVelocityActive_;
     data["servo.commanded_velocity"] = commandedVelocity_;
+    data["sorting.enabled"] = armSortingEnabled_;
+    data["sorting.inductive_confirm_pending"] = armSortingHighPending_;
+    data["sorting.inductive_confirmed"] = armSortingHighConfirmed_;
+    data["sorting.bumpers_on"] = armSortingBumperOn_;
+    data["sorting.gate_target_deg"] = armSortingGateTargetDeg_;
+    data["sorting.next_periodic_bumper_ms"] = armSortingEnabled_ &&
+        !armSortingHighConfirmed_ ?
+        max(0L, static_cast<long>(armSortingNextPulseMs_ - now)) : 0L;
+    data["sorting.bumper_hold_remaining_ms"] = armSortingBumperHoldUntilMs_ == 0
+        ? 0L : max(0L, static_cast<long>(armSortingBumperHoldUntilMs_ - now));
+    data["sorting.gate_hold_remaining_ms"] = armSortingGateHoldUntilMs_ == 0
+        ? 0L : max(0L, static_cast<long>(armSortingGateHoldUntilMs_ - now));
     data["dc_motor_203.active"] = dcMotor203Active_;
     data["dc_motor_203.channel_a_percent"] = dcMotor203_.channelAPercent();
     data["dc_motor_203.channel_b_percent"] = dcMotor203_.channelBPercent();
@@ -883,6 +1093,10 @@ void BluetoothDebugWorkflow::sendTelemetry()
         case NAV_CLEARANCE_TURN: navigationPhase = "clearance_turn"; break;
         case NAV_RECOVERY_REVERSE: navigationPhase = "recovery_reverse"; break;
         case NAV_RECOVERY_TURN: navigationPhase = "recovery_turn"; break;
+        case NAV_FRONTIER_EXPLORE: navigationPhase = "frontier_explore"; break;
+        case NAV_WANDER_DRIVE: navigationPhase = "wander_drive"; break;
+        case NAV_WANDER_TURN: navigationPhase = "wander_turn"; break;
+        case NAV_WANDER_REVERSE: navigationPhase = "wander_reverse"; break;
         default: break;
     }
     data["navigation.phase"] = navigationPhase;
@@ -915,8 +1129,27 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.obstacle_count"] = navigationObstacleCount_;
     data["navigation.detour_offset_mm"] = navigationDetourOffsetMm_;
     data["navigation.recovery_count"] = navigationRecoveryCount_;
+    data["navigation.recovery_logic_version"] = 2;
+    data["navigation.recovery_attempt"] = navigationRecoveryAttemptCount_;
+    data["navigation.recovery_total_reverse_mm"] = navigationRecoveryTotalReverseMm_;
+    data["navigation.recovery_force_half_turn"] = navigationRecoveryForceHalfTurn_;
     data["navigation.clearance_turn_count"] = navigationClearanceTurnCount_;
     data["navigation.strategy"] = navigationStrategy_;
+    data["navigation.frontier.pose_x_mm"] = frontierExplorer_.xMm();
+    data["navigation.frontier.pose_y_mm"] = frontierExplorer_.yMm();
+    data["navigation.frontier.known_cells"] = frontierExplorer_.knownCells();
+    data["navigation.frontier.frontier_count"] = frontierExplorer_.frontierCount();
+    data["navigation.frontier.path_cells"] = frontierExplorer_.pathLength();
+    data["navigation.frontier.replan_count"] = frontierExplorer_.replanCount();
+    data["navigation.frontier.complete"] = frontierExplorer_.complete();
+    data["navigation.wander_avoidance_count"] = wanderAvoidanceCount_;
+    data["navigation.wander.pose_x_mm"] = wanderXmm_;
+    data["navigation.wander.pose_y_mm"] = wanderYmm_;
+    data["navigation.wander.visited_cells"] = wanderVisitedCellCount_;
+    data["weight.detected"] = weightSectorMask_ != 0;
+    data["weight.sector_mask"] = weightSectorMask_;
+    data["weight.nearest_mm"] = weightNearestMm_;
+    data["weight.direction"] = weightDirection_;
     data["navigation.gap_passable"] = navigationGapPassable_;
     data["navigation.gap_width_mm"] = navigationGapWidthMm_;
     data["navigation.gap_centre_column_x2"] = navigationGapCentreColumnX2_;
@@ -1239,6 +1472,69 @@ void BluetoothDebugWorkflow::readTofSensors()
         tofDistanceMm_[i] = Tof::read(i);
         tofTimedOut_[i] = Tof::timedOut(i);
     }
+    updateWeightDetection();
+}
+
+void BluetoothDebugWorkflow::updateWeightDetection()
+{
+    static const char* BOTTOM_NAMES[4] = {
+        "bottom_left_left", "bottom_mid_left",
+        "bottom_mid_right", "bottom_right_right"
+    };
+    static const char* TOP_NAMES[4] = {
+        "top_left_left", "top_mid_left", "top_mid_right", "top_right_right"
+    };
+    static const int8_t DIRECTIONS[4] = {-2, -1, 1, 2};
+    constexpr uint16_t MAX_WEIGHT_RANGE_MM = 1200;
+    constexpr uint16_t MIN_TOP_BOTTOM_GAP_MM = 150;
+    constexpr uint8_t CONFIRM_POLLS = 3;
+
+    weightSectorMask_ = 0;
+    weightNearestMm_ = 0;
+    weightDirection_ = 0;
+    for (uint8_t sector = 0; sector < 4; ++sector)
+    {
+        int8_t bottomIndex = -1;
+        int8_t topIndex = -1;
+        for (uint8_t i = 0; i < tofSensorCount_; ++i)
+        {
+            if (strcmp(tofSensorNames_[i], BOTTOM_NAMES[sector]) == 0)
+                bottomIndex = static_cast<int8_t>(i);
+            if (strcmp(tofSensorNames_[i], TOP_NAMES[sector]) == 0)
+                topIndex = static_cast<int8_t>(i);
+        }
+        bool lowObject = false;
+        uint16_t bottomMm = 0;
+        if (bottomIndex >= 0 && topIndex >= 0 &&
+            tofAvailable_[bottomIndex] && !tofTimedOut_[bottomIndex] &&
+            tofAvailable_[topIndex] && !tofTimedOut_[topIndex])
+        {
+            const int bottom = tofDistanceMm_[bottomIndex];
+            const int top = tofDistanceMm_[topIndex];
+            if (bottom >= 30 && bottom <= MAX_WEIGHT_RANGE_MM && top >= 30)
+            {
+                bottomMm = static_cast<uint16_t>(bottom);
+                lowObject = top >= bottom + MIN_TOP_BOTTOM_GAP_MM;
+            }
+        }
+        if (lowObject)
+        {
+            if (weightEvidence_[sector] < CONFIRM_POLLS)
+                ++weightEvidence_[sector];
+        }
+        else
+            weightEvidence_[sector] = 0;
+
+        if (weightEvidence_[sector] >= CONFIRM_POLLS)
+        {
+            weightSectorMask_ |= static_cast<uint8_t>(1U << sector);
+            if (weightNearestMm_ == 0 || bottomMm < weightNearestMm_)
+            {
+                weightNearestMm_ = bottomMm;
+                weightDirection_ = DIRECTIONS[sector];
+            }
+        }
+    }
 }
 
 void BluetoothDebugWorkflow::updateMotionAndRangeSensors()
@@ -1365,8 +1661,12 @@ void BluetoothDebugWorkflow::updateNavigation()
     constexpr float OBSTACLE_CLEAR_MARGIN_MM = 220.0f;
     constexpr float OBSTACLE_MAX_OFFSET_MM = 1200.0f;
     constexpr float OBSTACLE_MAX_PASS_MM = 2500.0f;
-    constexpr float RECOVERY_REVERSE_MM = 350.0f;
-    constexpr float RECOVERY_MAX_REVERSE_MM = 800.0f;
+    constexpr float RECOVERY_REVERSE_MM = 300.0f;
+    constexpr float RECOVERY_MAX_REVERSE_MM = 450.0f;
+    constexpr float RECOVERY_TOTAL_REVERSE_LIMIT_MM = 1200.0f;
+    constexpr uint8_t RECOVERY_MAX_ATTEMPTS = 3;
+    constexpr uint16_t RECOVERY_SIDE_OPEN_MM = 350;
+    constexpr uint32_t RECOVERY_SIDE_FILTER_FRESH_MS = 800U;
 
     constexpr float ENCODER_1_MM_PER_COUNT = 0.09094f;
     constexpr float ENCODER_2_MM_PER_COUNT = 0.09592f;
@@ -1380,6 +1680,15 @@ void BluetoothDebugWorkflow::updateNavigation()
     static uint32_t sweepRightLastFallCount = 0;
     static bool sweepReferenceFilterArmed = false;
 
+    // Recovery decisions use a fresh median instead of one raw ultrasound
+    // return. The failed run contained an isolated ~36 mm side reading among
+    // neighbouring readings hundreds of millimetres away.
+    static uint16_t recoverySideSamples[2][3] = {};
+    static uint8_t recoverySideSampleCount[2] = {};
+    static uint8_t recoverySideWriteIndex[2] = {};
+    static uint32_t recoverySideLastFallCount[2] = {};
+    static uint32_t recoverySideLastGoodMs[2] = {};
+
     uint16_t front = 0xFFFF, left = 0xFFFF, right = 0xFFFF;
     auto includeMinimum = [](uint16_t& target, int value, int maximum = 3500) {
         if (value >= 30 && value <= maximum)
@@ -1388,7 +1697,8 @@ void BluetoothDebugWorkflow::updateNavigation()
 
     // Navigation deliberately ignores every bottom point TOF. Those sensors
     // can see one another/chassis hardware and are reserved for weight sensing
-    // and mapping. Only the two top point TOFs feed forward navigation.
+    // and mapping. Middle top sensors feed the forward estimate; the new
+    // far-left/far-right top sensors feed their respective avoidance sides.
     uint16_t frontCandidates[MAX_TOF_SENSORS + 1] = {};
     uint8_t frontCandidateCount = 0;
     for (uint8_t i = 0; i < tofSensorCount_; ++i)
@@ -1398,7 +1708,13 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (strncmp(tofSensorNames_[i], "top_", 4) != 0)
             continue;
         const int value = tofDistanceMm_[i];
-        if (value >= 30 && value <= 3500)
+        if (value < 30 || value > 3500)
+            continue;
+        if (strcmp(tofSensorNames_[i], "top_left_left") == 0)
+            includeMinimum(left, value, 3500);
+        else if (strcmp(tofSensorNames_[i], "top_right_right") == 0)
+            includeMinimum(right, value, 3500);
+        else
             frontCandidates[frontCandidateCount++] = static_cast<uint16_t>(value);
     }
     for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
@@ -1409,6 +1725,54 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (i == 0) includeMinimum(left, ultrasoundSensors_[i].distanceMm(), 5000);
         else includeMinimum(right, ultrasoundSensors_[i].distanceMm(), 5000);
     }
+
+    // Update recovery-side filtering only when a new echo has actually
+    // completed. Re-reading the same echo in the fast navigation loop must not
+    // make a single sample look like three independent measurements.
+    for (uint8_t i = 0; i < ultrasoundSensorCount_ && i < 2; ++i)
+    {
+        const uint32_t fallCount = ultrasoundSensors_[i].fallCount();
+        if (fallCount == recoverySideLastFallCount[i])
+            continue;
+        recoverySideLastFallCount[i] = fallCount;
+        if (!ultrasoundSensors_[i].valid() || ultrasoundSensors_[i].timedOut())
+            continue;
+        const uint16_t sample = ultrasoundSensors_[i].distanceMm();
+        if (sample < 30 || sample > 5000)
+            continue;
+        recoverySideSamples[i][recoverySideWriteIndex[i]] = sample;
+        recoverySideWriteIndex[i] =
+            static_cast<uint8_t>((recoverySideWriteIndex[i] + 1U) % 3U);
+        if (recoverySideSampleCount[i] < 3U)
+            ++recoverySideSampleCount[i];
+        recoverySideLastGoodMs[i] = now;
+    }
+    auto recoverySideMedian = [&](uint8_t index) -> uint16_t {
+        if (index >= 2U || recoverySideSampleCount[index] < 2U ||
+            now - recoverySideLastGoodMs[index] > RECOVERY_SIDE_FILTER_FRESH_MS)
+            return 0xFFFF;
+        uint16_t values[3] = {};
+        const uint8_t count = recoverySideSampleCount[index];
+        for (uint8_t i = 0; i < count; ++i)
+            values[i] = recoverySideSamples[index][i];
+        for (uint8_t i = 1; i < count; ++i)
+        {
+            const uint16_t value = values[i];
+            uint8_t j = i;
+            while (j > 0 && values[j - 1] > value)
+            {
+                values[j] = values[j - 1];
+                --j;
+            }
+            values[j] = value;
+        }
+        if (count == 2U)
+            return static_cast<uint16_t>(
+                (static_cast<uint32_t>(values[0]) + values[1]) / 2U);
+        return values[1];
+    };
+    const uint16_t recoveryLeft = recoverySideMedian(0);
+    const uint16_t recoveryRight = recoverySideMedian(1);
     uint8_t matrixLeftOpenColumns = 0;
     uint8_t matrixRightOpenColumns = 0;
     uint16_t matrixLeftGapMm = 0;
@@ -1736,11 +2100,20 @@ void BluetoothDebugWorkflow::updateNavigation()
         navigationMotionConsistent_ = true;
     };
     auto beginRightAngleTurn = [&](bool rightTurn, NavigationState state) {
-        // Always turn from the exact heading of the current leg, not from the
-        // slightly imperfect measured heading at the transition. Otherwise a
-        // few degrees of turn tolerance accumulate on every sweep lane.
+        // Normal coverage turns stay on the exact heading lattice so small
+        // turn errors cannot accumulate from lane to lane.
         beginHeadingTurn(
             navigationHeadingReferenceDeg_ + (rightTurn ? 90.0f : -90.0f), state);
+    };
+    auto beginRelativeTurnFromCurrent = [&](bool rightTurn, float angleDeg,
+                                            NavigationState state) {
+        // Recovery must not use navigationHeadingReferenceDeg_. The failed run
+        // repeatedly produced a target almost equal to the heading already
+        // reached, causing reverse -> near-zero turn -> reverse loops.
+        const float currentHeading = lastImuSampleValid_
+            ? imu_.headingDeg() : navigationTargetHeadingDeg_;
+        beginHeadingTurn(
+            currentHeading + (rightTurn ? angleDeg : -angleDeg), state);
     };
     auto runHeadingTurn = [&]() {
         const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
@@ -1812,6 +2185,373 @@ void BluetoothDebugWorkflow::updateNavigation()
             static_cast<int16_t>(lroundf(basePower - correction)), 75, 100);
         setDrive(-channelAPower, -channelBPower);
     };
+
+    // Strategy 4 deliberately has no occupancy grid or global map. It reacts
+    // only to the current sensor field, while the desktop Arena View remains
+    // free to draw the live rays and pose for the operator.
+    if (navigationStrategy_ == 4)
+    {
+        const int32_t wanderDelta1 = encoders_.firstCount() - wanderLastEncoder1_;
+        const int32_t wanderDelta2 = encoders_.secondCount() - wanderLastEncoder2_;
+        wanderLastEncoder1_ = encoders_.firstCount();
+        wanderLastEncoder2_ = encoders_.secondCount();
+        const float wanderDistanceMm =
+            ((-wanderDelta1 * ENCODER_1_MM_PER_COUNT) +
+             (wanderDelta2 * ENCODER_2_MM_PER_COUNT)) * 0.5f;
+        const float wanderRelativeHeading =
+            (imu_.headingDeg() - wanderStartHeadingDeg_) * DEG_TO_RAD;
+        wanderXmm_ += wanderDistanceMm * sinf(wanderRelativeHeading);
+        wanderYmm_ += wanderDistanceMm * cosf(wanderRelativeHeading);
+
+        auto visitedIndexAt = [&](float xMm, float yMm) -> int16_t {
+            const int x = WANDER_VISITED_SIZE / 2 +
+                static_cast<int>(lroundf(xMm / WANDER_VISITED_CELL_MM));
+            const int y = WANDER_VISITED_SIZE / 2 +
+                static_cast<int>(lroundf(yMm / WANDER_VISITED_CELL_MM));
+            if (x < 0 || y < 0 || x >= WANDER_VISITED_SIZE || y >= WANDER_VISITED_SIZE)
+                return -1;
+            return static_cast<int16_t>(y * WANDER_VISITED_SIZE + x);
+        };
+        const int16_t currentVisitedIndex = visitedIndexAt(wanderXmm_, wanderYmm_);
+        bool enteredVisitedCell = false;
+        if (currentVisitedIndex >= 0 && currentVisitedIndex != wanderCurrentCellIndex_)
+        {
+            enteredVisitedCell = wanderVisited_[currentVisitedIndex] != 0;
+            if (wanderVisited_[currentVisitedIndex] == 0) ++wanderVisitedCellCount_;
+            if (wanderVisited_[currentVisitedIndex] < 255)
+                ++wanderVisited_[currentVisitedIndex];
+            wanderCurrentCellIndex_ = currentVisitedIndex;
+        }
+        auto visitsToward = [&](float relativeAngleDeg) -> uint8_t {
+            const float angle = wanderRelativeHeading + relativeAngleDeg * DEG_TO_RAD;
+            const int16_t target = visitedIndexAt(
+                wanderXmm_ + 700.0f * sinf(angle),
+                wanderYmm_ + 700.0f * cosf(angle));
+            return target < 0 ? 255 : wanderVisited_[target];
+        };
+        auto beginWanderTurn = [&](bool turnRight, float angleDeg) {
+            wanderTurnRight_ = turnRight;
+            navigationTargetHeadingDeg_ = normaliseHeading(
+                imu_.headingDeg() + (turnRight ? angleDeg : -angleDeg));
+            navigationState_ = NAV_WANDER_TURN;
+            navigationTurnSettledSinceMs_ = 0;
+            navigationTurnPulseStartedMs_ = now;
+            navigationTurnCoastUntilMs_ = 0;
+            navigationTurnDirection_ = 0;
+        };
+        auto reverseDistanceMm = [&]() {
+            const float first = fabsf(
+                (encoders_.firstCount() - wanderReverseStartEncoder1_) *
+                ENCODER_1_MM_PER_COUNT);
+            const float second = fabsf(
+                (encoders_.secondCount() - wanderReverseStartEncoder2_) *
+                ENCODER_2_MM_PER_COUNT);
+            return (first + second) * 0.5f;
+        };
+        auto chooseOpenRight = [&]() {
+            // Prefer a physically confirmed 8x8 gap. Otherwise compare both
+            // side ranges; alternate ties so the robot does not settle into a
+            // permanent clockwise or anticlockwise circuit.
+            if (navigationGapPassable_ && navigationGapCentreColumnX2_ != 0)
+                return navigationGapCentreColumnX2_ > 0;
+            if (left != 0xFFFF && right != 0xFFFF &&
+                abs(static_cast<int>(right) - static_cast<int>(left)) > 100)
+                return right > left;
+            if (leftBlocked != rightBlocked) return !rightBlocked;
+            const uint8_t leftVisits = visitsToward(-55.0f);
+            const uint8_t rightVisits = visitsToward(55.0f);
+            if (leftVisits != rightVisits) return rightVisits < leftVisits;
+            wanderTurnRight_ = !wanderTurnRight_;
+            return wanderTurnRight_;
+        };
+
+        switch (navigationState_)
+        {
+            case NAV_WANDER_REVERSE:
+            {
+                // Reverse until at least one side of a U-shaped trap clears;
+                // cap the manoeuvre so a failed side sensor cannot cause an
+                // endless reverse.
+                setDrive(100, 100);
+                const float backedMm = reverseDistanceMm();
+                const bool leftClear = left == 0xFFFF || left > 350;
+                const bool rightClear = right == 0xFFFF || right > 350;
+                if ((backedMm >= 200.0f && (leftClear || rightClear)) ||
+                    backedMm >= 650.0f)
+                {
+                    setDrive(0, 0);
+                    beginWanderTurn(chooseOpenRight(), 90.0f);
+                }
+                return;
+            }
+
+            case NAV_WANDER_TURN:
+                if (runHeadingTurn())
+                {
+                    navigationState_ = NAV_WANDER_DRIVE;
+                    navigationTargetHeadingDeg_ = imu_.headingDeg();
+                    wanderNextDecisionMs_ = now + 5000U + (now % 4000U);
+                }
+                return;
+
+            default:
+                navigationState_ = NAV_WANDER_DRIVE;
+                break;
+        }
+
+        const bool boxedIn = frontBlocked &&
+            left != 0xFFFF && right != 0xFFFF && left < 350 && right < 350;
+        if (boxedIn)
+        {
+            navigationState_ = NAV_WANDER_REVERSE;
+            wanderReverseStartEncoder1_ = encoders_.firstCount();
+            wanderReverseStartEncoder2_ = encoders_.secondCount();
+            ++wanderAvoidanceCount_;
+            setDrive(100, 100);
+            link_.log("WARNING", "Reactive wander found a U-shaped trap; reversing to a clear side");
+            return;
+        }
+
+        if (frontBlocked)
+        {
+            ++wanderAvoidanceCount_;
+            // Use a smaller deflection when the matrix has identified a real
+            // passable off-centre gap; use a right-angle avoidance turn for a
+            // broad wall or when no forward gap is known.
+            const bool turnRight = chooseOpenRight();
+            const float turnDeg = navigationGapPassable_ ? 35.0f : 85.0f;
+            setDrive(0, 0);
+            beginWanderTurn(turnRight, turnDeg);
+            return;
+        }
+
+        if (leftBlocked != rightBlocked)
+        {
+            ++wanderAvoidanceCount_;
+            // Ultrasounds face sideways: steer away before the chassis reaches
+            // the wall, without committing to a full 90 degree corner turn.
+            beginWanderTurn(leftBlocked, 25.0f);
+            return;
+        }
+
+        // A bottom-only return is a low object rather than a wall. Bias the
+        // wander heading toward a newly confirmed weight sector once, while
+        // leaving the top sensors in charge of collision avoidance.
+        if (weightSectorMask_ != 0 && weightSectorMask_ != wanderLastWeightMask_)
+        {
+            wanderLastWeightMask_ = weightSectorMask_;
+            const bool targetRight = weightDirection_ > 0;
+            const float targetTurnDeg = abs(weightDirection_) >= 2 ? 35.0f : 18.0f;
+            beginWanderTurn(targetRight, targetTurnDeg);
+            return;
+        }
+        if (weightSectorMask_ == 0) wanderLastWeightMask_ = 0;
+
+        // Crossing into a previously visited 200 mm cell causes an immediate
+        // preference for the less-visited side. The live obstacle layer can
+        // still force the only physically open route when retracing is needed.
+        if (enteredVisitedCell)
+        {
+            beginWanderTurn(chooseOpenRight(), 45.0f);
+            wanderNextDecisionMs_ = now + 5000U;
+            return;
+        }
+
+        // Periodic gentle heading changes make this an explorer rather than a
+        // straight-line wall shuttle. They are suppressed beside close walls.
+        if (static_cast<int32_t>(now - wanderNextDecisionMs_) >= 0 &&
+            !leftBlocked && !rightBlocked)
+        {
+            const bool turnRight = chooseOpenRight();
+            beginWanderTurn(turnRight, 30.0f);
+            return;
+        }
+
+        driveOnHeading(navigationTargetHeadingDeg_, 100);
+        return;
+    }
+
+    // Strategy 3 is a map-driven explorer.  The existing three reactive
+    // strategies remain completely unchanged below this early return.
+    if (navigationStrategy_ == 3)
+    {
+        // Completion is latched until the operator explicitly starts a new
+        // run.  Otherwise this branch would re-enter exploration and emit the
+        // completion log on every planning interval.
+        if (navigationState_ == NAV_COMPLETE && frontierExplorer_.complete())
+        {
+            setDrive(0, 0);
+            return;
+        }
+        navigationState_ = NAV_FRONTIER_EXPLORE;
+        frontierExplorer_.updatePose(
+            encoders_.firstCount(), encoders_.secondCount(), imu_.headingDeg());
+
+        if (now - frontierLastMapMs_ >= 100U)
+        {
+            frontierLastMapMs_ = now;
+            if (front != 0xFFFF)
+                frontierExplorer_.observeRay(
+                    front, 0.0f, front < 3500 || navigationMatrixBroadWall_,
+                    25.0f, 245.0f);
+            // Side ultrasounds and angled outer TOFs have different origins
+            // and bearings; preserve those instead of projecting the combined
+            // left/right minimum as one false ray.
+            for (uint8_t i = 0; i < ultrasoundSensorCount_ && i < 2; ++i)
+            {
+                if (!ultrasoundSensors_[i].valid() || ultrasoundSensors_[i].timedOut())
+                    continue;
+                const uint16_t distance = ultrasoundSensors_[i].distanceMm();
+                frontierExplorer_.observeRay(
+                    distance, i == 0 ? -90.0f : 90.0f, distance < 3000,
+                    i == 0 ? -195.0f : 190.0f, 0.0f);
+            }
+            for (uint8_t i = 0; i < tofSensorCount_; ++i)
+            {
+                if (!tofAvailable_[i] || tofTimedOut_[i] ||
+                    tofDistanceMm_[i] < 30 || tofDistanceMm_[i] > 3500)
+                    continue;
+                if (strcmp(tofSensorNames_[i], "top_left_left") == 0)
+                    frontierExplorer_.observeRay(
+                        static_cast<uint16_t>(tofDistanceMm_[i]), -45.0f, true,
+                        -180.0f, 120.0f);
+                else if (strcmp(tofSensorNames_[i], "top_right_right") == 0)
+                    frontierExplorer_.observeRay(
+                        static_cast<uint16_t>(tofDistanceMm_[i]), 45.0f, true,
+                        180.0f, 120.0f);
+            }
+
+            // Preserve the 8x8's angular information instead of collapsing it
+            // to one forward ray.  A vertical median rejects isolated pixels.
+            if (tof8x8_.available() && tof8x8_.lastReadSucceeded())
+            {
+                const uint8_t rows = 8U - min(
+                    navigationMatrixFloorRows_, static_cast<uint8_t>(4U));
+                for (uint8_t col = 0; col < 8; ++col)
+                {
+                    uint16_t values[8] = {};
+                    uint8_t count = 0;
+                    for (uint8_t row = 0; row < rows; ++row)
+                    {
+                        const uint16_t value = tof8x8_.distanceMm(row, col);
+                        if (value >= 30 && value <= 3500) values[count++] = value;
+                    }
+                    if (count < 3) continue;
+                    for (uint8_t i = 1; i < count; ++i)
+                    {
+                        const uint16_t value = values[i];
+                        uint8_t j = i;
+                        while (j > 0 && values[j - 1] > value)
+                        {
+                            values[j] = values[j - 1];
+                            --j;
+                        }
+                        values[j] = value;
+                    }
+                    const uint16_t distance = values[count / 2];
+                    const float angle = ((static_cast<float>(col) - 3.5f) / 8.0f) *
+                                        navigationMatrixFovDeg_;
+                    frontierExplorer_.observeRay(distance, angle, distance < 3000,
+                                                 25.0f, 245.0f);
+                }
+            }
+        }
+
+        // Aim beyond the immediately adjacent 100 mm cell.  Treating every
+        // grid cell as a precision stop made the chassis twitch from one tiny
+        // correction to the next; this gives it a useful rolling look-ahead.
+        while (frontierExplorer_.hasWaypoint() &&
+               frontierExplorer_.waypointReached(130.0f)) {}
+        // A close wall seen while intentionally rotating is expected. Only
+        // invalidate a route when the chassis is in its forward-follow phase.
+        if (frontBlocked && frontierExplorer_.hasWaypoint() && !frontierTurning_)
+        {
+            frontierExplorer_.invalidatePath();
+            frontierTurning_ = false;
+            setDrive(0, 0);
+        }
+
+        // Continue a route-search scan on every control cycle. Planning itself
+        // is deliberately rate limited, but motor control must not be.
+        if (!frontierExplorer_.hasWaypoint() && frontierTurning_)
+        {
+            if (runHeadingTurn())
+            {
+                frontierTurning_ = false;
+                frontierLastPlanMs_ = now;
+            }
+            return;
+        }
+
+        // Keep a valid route.  Replanning once per second changed the chosen
+        // frontier underneath the controller and was the main source of rapid
+        // left/right reversals.  Replan only after arrival or a real blockage.
+        if (!frontierExplorer_.hasWaypoint() && now - frontierLastPlanMs_ >= 350U)
+        {
+            frontierLastPlanMs_ = now;
+            frontierTurning_ = false;
+            if (!frontierExplorer_.plan(navigationRobotWidthMm_, navigationGapMarginMm_))
+            {
+                if (frontierExplorer_.complete())
+                {
+                    navigationState_ = NAV_COMPLETE;
+                    setDrive(0, 0);
+                    link_.log("INFO", "Frontier exploration complete; no reachable unknown boundary remains");
+                    return;
+                }
+                // A missing route is not completion. Scan one controlled 45
+                // degree sector, settle on it, collect another map slice and
+                // retry. This avoids the former unbounded full-power spin.
+                if (!frontierTurning_)
+                {
+                    navigationTargetHeadingDeg_ = normaliseHeading(
+                        imu_.headingDeg() + 45.0f);
+                    frontierTurning_ = true;
+                    navigationTurnSettledSinceMs_ = 0;
+                    navigationTurnPulseStartedMs_ = now;
+                    navigationTurnCoastUntilMs_ = 0;
+                    navigationTurnDirection_ = 0;
+                }
+                if (runHeadingTurn())
+                {
+                    frontierTurning_ = false;
+                    frontierLastPlanMs_ = now;
+                }
+                return;
+            }
+        }
+
+        if (!frontierExplorer_.hasWaypoint())
+        {
+            setDrive(0, 0);
+            return;
+        }
+
+        navigationTargetHeadingDeg_ = frontierExplorer_.waypointHeadingDeg();
+        const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
+        // Enter a controlled turn only for a meaningful heading error.  The
+        // shared turn controller pulses the 100% command near the target,
+        // coasts before reversing torque and requires the heading to settle.
+        // The separate entry/exit thresholds prevent threshold chatter.
+        if (!frontierTurning_ && fabsf(error) > 20.0f)
+        {
+            frontierTurning_ = true;
+            navigationTurnSettledSinceMs_ = 0;
+            navigationTurnPulseStartedMs_ = now;
+            navigationTurnCoastUntilMs_ = 0;
+            navigationTurnDirection_ = 0;
+        }
+        if (frontierTurning_)
+        {
+            if (runHeadingTurn()) frontierTurning_ = false;
+        }
+        else
+        {
+            driveOnHeading(navigationTargetHeadingDeg_, 100);
+        }
+        return;
+    }
+
     auto beginForwardLeg = [&](float exactHeading) {
         navigationHeadingReferenceDeg_ = normaliseHeading(exactHeading);
         navigationMotionStartedMs_ = now;
@@ -1877,15 +2617,21 @@ void BluetoothDebugWorkflow::updateNavigation()
     auto startRecovery = [&](const char* reason) {
         setDrive(0, 0);
         ++navigationRecoveryCount_;
+        navigationRecoveryAttemptCount_ = 0;
+        navigationRecoveryTotalReverseMm_ = 0.0f;
+        navigationRecoveryForceHalfTurn_ = false;
         navigationClearanceTurnCount_ = 0;
         navigationRecoveryStartEncoder1_ = encoders_.firstCount();
         navigationRecoveryStartEncoder2_ = encoders_.secondCount();
 
-        const bool leftKnown = left != 0xFFFF;
-        const bool rightKnown = right != 0xFFFF;
+        // Choose the escape side once from FILTERED ultrasound and lock it for
+        // this attempt. NAV_RECOVERY_REVERSE is not allowed to overwrite the
+        // decision with whichever raw sample happens to arrive before turning.
+        const bool leftKnown = recoveryLeft != 0xFFFF;
+        const bool rightKnown = recoveryRight != 0xFFFF;
         if (leftKnown || rightKnown)
             navigationRecoveryTurnRight_ = rightKnown &&
-                (!leftKnown || right >= left);
+                (!leftKnown || recoveryRight >= recoveryLeft);
         else
             navigationRecoveryTurnRight_ =
                 (navigationRecoveryCount_ & 1U) != 0U;
@@ -1893,7 +2639,6 @@ void BluetoothDebugWorkflow::updateNavigation()
         navigationState_ = NAV_RECOVERY_REVERSE;
         navigationMotionStartedMs_ = now;
         navigationMotionConsistent_ = true;
-
         navigationDetourOffsetMm_ = 0.0f;
         navigationDetourEdgeCleared_ = false;
         navigationDetourObstacleSeen_ = false;
@@ -1916,15 +2661,19 @@ void BluetoothDebugWorkflow::updateNavigation()
             return false;
         }
 
-        const bool leftClose = left != 0xFFFF && left < 350;
-        const bool rightClose = right != 0xFFFF && right < 350;
+        const bool leftClose =
+            recoveryLeft != 0xFFFF && recoveryLeft < RECOVERY_SIDE_OPEN_MM;
+        const bool rightClose =
+            recoveryRight != 0xFFFF && recoveryRight < RECOVERY_SIDE_OPEN_MM;
         if (leftClose && rightClose)
         {
             navigationClearanceTurnCount_ = 0;
             navigationState_ = NAV_ESCAPE_REVERSE;
             navigationEscapeStartEncoder1_ = encoders_.firstCount();
             navigationEscapeStartEncoder2_ = encoders_.secondCount();
-            navigationEscapeTurnRight_ = right >= left;
+            navigationEscapeTurnRight_ =
+                recoveryRight != 0xFFFF &&
+                (recoveryLeft == 0xFFFF || recoveryRight >= recoveryLeft);
             navigationMotionStartedMs_ = now;
             navigationMotionConsistent_ = true;
             setDrive(100, 100);
@@ -1940,10 +2689,10 @@ void BluetoothDebugWorkflow::updateNavigation()
         }
 
         ++navigationClearanceTurnCount_;
-        const bool turnRight = right != 0xFFFF &&
-            (left == 0xFFFF || right >= left);
+        const bool turnRight = recoveryRight != 0xFFFF &&
+            (recoveryLeft == 0xFFFF || recoveryRight >= recoveryLeft);
         setDrive(0, 0);
-        beginRightAngleTurn(turnRight, NAV_CLEARANCE_TURN);
+        beginRelativeTurnFromCurrent(turnRight, 90.0f, NAV_CLEARANCE_TURN);
         link_.log(
             "WARNING",
             "Turn ended facing a wall; trying a bounded clearance turn");
@@ -1993,15 +2742,19 @@ void BluetoothDebugWorkflow::updateNavigation()
     // chassis has physical clearance to rotate. Bottom TOFs remain excluded.
     const bool forwardNavigationState = navigationState_ == NAV_SEEK_WALL ||
         navigationState_ == NAV_FOLLOW_WALL || navigationState_ == NAV_SWEEP;
-    const bool uTrapLeftClose = left != 0xFFFF && left < 350;
-    const bool uTrapRightClose = right != 0xFFFF && right < 350;
+    const bool uTrapLeftClose =
+        recoveryLeft != 0xFFFF && recoveryLeft < RECOVERY_SIDE_OPEN_MM;
+    const bool uTrapRightClose =
+        recoveryRight != 0xFFFF && recoveryRight < RECOVERY_SIDE_OPEN_MM;
     if (forwardNavigationState && frontBlocked &&
         uTrapLeftClose && uTrapRightClose)
     {
         navigationState_ = NAV_ESCAPE_REVERSE;
         navigationEscapeStartEncoder1_ = encoders_.firstCount();
         navigationEscapeStartEncoder2_ = encoders_.secondCount();
-        navigationEscapeTurnRight_ = right >= left;
+        navigationEscapeTurnRight_ =
+            recoveryRight != 0xFFFF &&
+            (recoveryLeft == 0xFFFF || recoveryRight >= recoveryLeft);
         navigationMotionStartedMs_ = now;
         navigationMotionConsistent_ = true;
         setDrive(100, 100);
@@ -2229,8 +2982,10 @@ void BluetoothDebugWorkflow::updateNavigation()
         {
             const float reversedMm = encoderDistanceFrom(
                 navigationEscapeStartEncoder1_, navigationEscapeStartEncoder2_);
-            const bool leftOpen = left != 0xFFFF && left >= 350;
-            const bool rightOpen = right != 0xFFFF && right >= 350;
+            const bool leftOpen =
+                recoveryLeft != 0xFFFF && recoveryLeft >= RECOVERY_SIDE_OPEN_MM;
+            const bool rightOpen =
+                recoveryRight != 0xFFFF && recoveryRight >= RECOVERY_SIDE_OPEN_MM;
             if ((reversedMm >= 350.0f && (leftOpen || rightOpen)) ||
                 reversedMm >= 900.0f)
             {
@@ -2238,7 +2993,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (leftOpen || rightOpen)
                     navigationEscapeTurnRight_ = rightOpen &&
                         (!leftOpen || right >= left);
-                beginRightAngleTurn(navigationEscapeTurnRight_, NAV_ESCAPE_TURN);
+                beginRelativeTurnFromCurrent(
+                    navigationEscapeTurnRight_, 90.0f, NAV_ESCAPE_TURN);
             }
             else
                 setDrive(100, 100);
@@ -2488,19 +3244,43 @@ void BluetoothDebugWorkflow::updateNavigation()
             const float reversedMm = encoderDistanceFrom(
                 navigationRecoveryStartEncoder1_,
                 navigationRecoveryStartEncoder2_);
-            const bool sideOpen =
-                (left != 0xFFFF && left >= 350) ||
-                (right != 0xFFFF && right >= 350);
+            const bool leftOpen =
+                recoveryLeft != 0xFFFF && recoveryLeft >= RECOVERY_SIDE_OPEN_MM;
+            const bool rightOpen =
+                recoveryRight != 0xFFFF && recoveryRight >= RECOVERY_SIDE_OPEN_MM;
+            const bool sideOpen = leftOpen || rightOpen;
 
             if ((reversedMm >= RECOVERY_REVERSE_MM && sideOpen) ||
                 reversedMm >= RECOVERY_MAX_REVERSE_MM)
             {
                 setDrive(0, 0);
-                if (left != 0xFFFF || right != 0xFFFF)
-                    navigationRecoveryTurnRight_ = right != 0xFFFF &&
-                        (left == 0xFFFF || right >= left);
-                beginRightAngleTurn(
-                    navigationRecoveryTurnRight_, NAV_RECOVERY_TURN);
+                navigationRecoveryTotalReverseMm_ += reversedMm;
+                if (navigationRecoveryAttemptCount_ < 255U)
+                    ++navigationRecoveryAttemptCount_;
+
+                navigationRecoveryForceHalfTurn_ =
+                    navigationRecoveryAttemptCount_ >= RECOVERY_MAX_ATTEMPTS ||
+                    navigationRecoveryTotalReverseMm_ >=
+                        RECOVERY_TOTAL_REVERSE_LIMIT_MM;
+
+                if (navigationRecoveryForceHalfTurn_)
+                {
+                    // A bounded hard exit points the chassis toward a region it
+                    // has already physically occupied, rather than accumulating
+                    // arbitrarily more reverse distance.
+                    beginRelativeTurnFromCurrent(
+                        true, 180.0f, NAV_RECOVERY_TURN);
+                    link_.log(
+                        "WARNING",
+                        "Recovery budget reached; forcing current-heading 180-degree replan");
+                }
+                else
+                {
+                    // The side choice was made before this reverse leg and is
+                    // intentionally not recalculated here.
+                    beginRelativeTurnFromCurrent(
+                        navigationRecoveryTurnRight_, 90.0f, NAV_RECOVERY_TURN);
+                }
             }
             else
                 setDrive(100, 100);
@@ -2512,8 +3292,35 @@ void BluetoothDebugWorkflow::updateNavigation()
             {
                 if (frontBlocked)
                 {
+                    if (navigationRecoveryForceHalfTurn_)
+                    {
+                        // The hard exit has consumed the allowed recovery budget.
+                        // Do not begin another long reverse/turn loop; restart
+                        // wall acquisition from this materially different heading.
+                        navigationState_ = NAV_SEEK_WALL;
+                        navigationLaneIndex_ = 0;
+                        navigationSweepProgressMm_ = 0.0f;
+                        navigationExpectedSweepLengthMm_ = 0.0f;
+                        navigationExpectedSweepLengthValid_ = false;
+                        navigationSweepLeftReferenceValid_ = false;
+                        navigationSweepRightReferenceValid_ = false;
+                        navigationRecoveryAttemptCount_ = 0;
+                        navigationRecoveryTotalReverseMm_ = 0.0f;
+                        navigationRecoveryForceHalfTurn_ = false;
+                        beginForwardLeg(
+                            lastImuSampleValid_
+                                ? imu_.headingDeg()
+                                : navigationTargetHeadingDeg_);
+                        link_.log(
+                            "WARNING",
+                            "Forced recovery heading still sees a wall; replanning from new heading without more reverse");
+                        break;
+                    }
+
                     navigationRecoveryStartEncoder1_ = encoders_.firstCount();
                     navigationRecoveryStartEncoder2_ = encoders_.secondCount();
+                    // A failed 90-degree route forces the next attempt to the
+                    // opposite side. The reverse state cannot overwrite this.
                     navigationRecoveryTurnRight_ = !navigationRecoveryTurnRight_;
                     navigationState_ = NAV_RECOVERY_REVERSE;
                     navigationMotionStartedMs_ = now;
@@ -2521,11 +3328,14 @@ void BluetoothDebugWorkflow::updateNavigation()
                     setDrive(100, 100);
                     link_.log(
                         "WARNING",
-                        "Recovery heading still blocked; backing away again");
+                        "Recovery heading blocked; bounded back-off before opposite current-heading turn");
                     break;
                 }
 
                 navigationClearanceTurnCount_ = 0;
+                navigationRecoveryAttemptCount_ = 0;
+                navigationRecoveryTotalReverseMm_ = 0.0f;
+                navigationRecoveryForceHalfTurn_ = false;
                 navigationState_ = NAV_SEEK_WALL;
                 navigationLaneIndex_ = 0;
                 navigationSweepProgressMm_ = 0.0f;
@@ -2536,7 +3346,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                 beginForwardLeg(navigationTargetHeadingDeg_);
                 link_.log(
                     "INFO",
-                    "Recovery found a clear heading; reacquiring arena coverage");
+                    "Recovery found a clear current-heading exit; reacquiring arena coverage");
             }
             break;
 

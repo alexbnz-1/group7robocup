@@ -8,6 +8,7 @@
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
+#include <FrontierExplorer.h>
 #include <RobotDebug.h>
 #include <Tof.h>
 #include <Tof8x8.h>
@@ -42,6 +43,7 @@ private:
     Hx12kServo hx12kD_;
     RobotDebug link_;
     Tof8x8 tof8x8_;
+    FrontierExplorer frontierExplorer_;
     JsonDocument config_;
 
     bool debugMode_ = false;
@@ -112,7 +114,11 @@ private:
         NAV_ESCAPE_TURN = 18,
         NAV_CLEARANCE_TURN = 19,
         NAV_RECOVERY_REVERSE = 20,
-        NAV_RECOVERY_TURN = 21
+        NAV_RECOVERY_TURN = 21,
+        NAV_FRONTIER_EXPLORE = 22,
+        NAV_WANDER_DRIVE = 23,
+        NAV_WANDER_TURN = 24,
+        NAV_WANDER_REVERSE = 25
     };
     bool navigationActive_ = false;
     uint8_t navigationState_ = 0;
@@ -173,6 +179,9 @@ private:
     int32_t navigationRecoveryStartEncoder2_ = 0;
     bool navigationRecoveryTurnRight_ = true;
     uint16_t navigationRecoveryCount_ = 0;
+    uint8_t navigationRecoveryAttemptCount_ = 0;
+    float navigationRecoveryTotalReverseMm_ = 0.0f;
+    bool navigationRecoveryForceHalfTurn_ = false;
     uint8_t navigationClearanceTurnCount_ = 0;
     uint8_t navigationStrategy_ = 0;
     uint16_t navigationFrontAvoidMm_ = 300;
@@ -191,6 +200,51 @@ private:
     uint16_t navigationGapWidthMm_ = 0;
 
     bool navigationMotionConsistent_ = true;
+    uint32_t frontierLastPlanMs_ = 0;
+    uint32_t frontierLastMapMs_ = 0;
+    bool frontierTurning_ = false;
+    uint32_t wanderNextDecisionMs_ = 0;
+    int32_t wanderReverseStartEncoder1_ = 0;
+    int32_t wanderReverseStartEncoder2_ = 0;
+    bool wanderTurnRight_ = true;
+    uint16_t wanderAvoidanceCount_ = 0;
+    static constexpr uint8_t WANDER_VISITED_SIZE = 32;
+    static constexpr uint16_t WANDER_VISITED_CELL_MM = 200;
+    uint8_t wanderVisited_[WANDER_VISITED_SIZE * WANDER_VISITED_SIZE] = {};
+    uint16_t wanderVisitedCellCount_ = 0;
+    float wanderXmm_ = 0.0f;
+    float wanderYmm_ = 0.0f;
+    float wanderStartHeadingDeg_ = 0.0f;
+    int32_t wanderLastEncoder1_ = 0;
+    int32_t wanderLastEncoder2_ = 0;
+    int16_t wanderCurrentCellIndex_ = -1;
+    uint8_t wanderLastWeightMask_ = 0;
+
+    // Bottom-only point-TOF returns identify low weights: matching bottom and
+    // top sensors are compared at each fresh 100 ms range poll.
+    uint8_t weightEvidence_[4] = {};
+    uint8_t weightSectorMask_ = 0;
+    uint16_t weightNearestMm_ = 0;
+    int8_t weightDirection_ = 0;
+
+    // Automatic arm sorting uses the debounced logical `detected` value from
+    // the configured D21 inductive input (including its active-low setting).
+    bool armSortingEnabled_ = false;
+    bool armSortingHighPending_ = false;
+    bool armSortingHighConfirmed_ = false;
+    bool armSortingBumperOn_ = false;
+    float armSortingGateTargetDeg_ = NAN;
+    uint32_t armSortingHighSinceMs_ = 0;
+    uint32_t armSortingNextPulseMs_ = 0;
+    uint32_t armSortingPulseEndsMs_ = 0;
+    uint32_t armSortingBumperHoldUntilMs_ = 0;
+    uint32_t armSortingGateHoldUntilMs_ = 0;
+    static constexpr uint8_t ARM_SORTING_HERKULEX_ID = 4;
+    static constexpr uint32_t ARM_SORTING_CONFIRM_MS = 500;
+    static constexpr uint32_t ARM_SORTING_PERIOD_MS = 20000;
+    static constexpr uint32_t ARM_SORTING_PULSE_MS = 1000;
+    static constexpr uint32_t ARM_SORTING_BUMPER_HOLD_MS = 2000;
+    static constexpr uint32_t ARM_SORTING_GATE_HOLD_MS = 5000;
 
     static void dispatch(JsonDocument& message, void* context);
     void handleMessage(JsonDocument& message);
@@ -207,10 +261,15 @@ private:
     void updateNavigation();
     void stopNavigation(const char* reason = nullptr);
     void readTofSensors();
+    void updateWeightDetection();
     void updateTof8x8();
     void sendTof8x8Frame();
     void updateAutomaticServoRead();
     void updateTrackingState(float absoluteAngle);
+    void updateArmSorting(uint32_t now);
+    bool zeroArmSortingGate();
+    void setArmSortingGate(float relativeAngleDeg);
+    void setArmSortingBumpers(bool enabled);
     JsonObject findParameter(const char* name);
     JsonObject findCommand(const char* name);
 };

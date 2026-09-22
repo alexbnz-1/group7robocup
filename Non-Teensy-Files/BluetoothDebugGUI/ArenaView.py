@@ -44,7 +44,7 @@ class ArenaModel:
         self.left_angle_deg = 90.0
         self.matrix_fov_deg = 60.0  # user-adjustable estimate, not a sensor spec
         self.matrix_floor_rows = 2
-        self.matrix_mirrored = True
+        self.matrix_mirrored = False
         self.sensor_specs = [
             {"name": "front", "angle": 0.0, "x": 0.0, "y": 0.0, "port": "XSHUT1"},
             {"name": "left", "angle": 90.0, "x": 0.0, "y": 0.0, "port": "XSHUT2"},
@@ -481,7 +481,12 @@ class ArenaModel:
     @staticmethod
     def _make_wall_track(orientation, coordinate, tangent, observations=0,
                          sources=None, boundary=None, kind="internal",
-                         boundary_blocked=False):
+                         boundary_blocked=False, verification_tokens=None,
+                         locked=False):
+        verification_tokens = deque(
+            (() if verification_tokens is None else verification_tokens),
+            maxlen=24,
+        )
         return {
             "boundary": boundary,
             "kind": kind,
@@ -492,11 +497,37 @@ class ArenaModel:
             "maximum": tangent,
             "observations": observations,
             "sources": set() if sources is None else set(sources),
+            # Geometry is immutable after three independent sensor frames
+            # agree.  Raw hit count is insufficient because adjacent 8x8
+            # columns from one frame can all support the same plane.
+            "verification_tokens": verification_tokens,
+            "locked": bool(locked or len(set(verification_tokens)) >= 3),
             # A line physically crossed by the chassis must not immediately be
             # promoted back into an arena boundary simply because its surviving
             # pieces are long.
             "boundary_blocked": bool(boundary_blocked),
         }
+
+    def _wall_verification_token(self, source):
+        """Identify the independent sensor frame supporting a wall hit."""
+        if source == "8x8" and self.last_matrix_frame is not None:
+            return ("matrix", self.last_matrix_frame)
+        if self._frame_time is not None:
+            return ("telemetry", self._frame_time)
+        # Direct/synthetic observations still need independent identities.
+        return ("observation", self.wall_evidence_serial)
+
+    @staticmethod
+    def _add_wall_verification(track, tokens):
+        existing = track.setdefault("verification_tokens", deque(maxlen=24))
+        if not isinstance(existing, deque):
+            existing = deque(existing, maxlen=24)
+            track["verification_tokens"] = existing
+        for token in tokens or ():
+            if token not in existing:
+                existing.append(token)
+        if len(set(existing)) >= 3:
+            track["locked"] = True
 
     @staticmethod
     def _wall_geometry(target, world_angle):
@@ -599,6 +630,7 @@ class ArenaModel:
                 "cells": set(),
                 "last_seen": serial,
                 "promoted": False,
+                "verification_tokens": deque(maxlen=24),
             }
             self.wall_evidence_clusters.append(cluster)
 
@@ -612,6 +644,9 @@ class ArenaModel:
         cluster["sources"].add(source)
         cluster["cells"].add(cell)
         cluster["last_seen"] = serial
+        token = self._wall_verification_token(source)
+        if token not in cluster["verification_tokens"]:
+            cluster["verification_tokens"].append(token)
 
         # A point TOF needs several temporally-confirmed observations. A coherent
         # 8x8 surface can accumulate the same score faster because adjacent matrix
@@ -631,6 +666,7 @@ class ArenaModel:
             observations=max(3, int(round(cluster["score"]))),
             sources=cluster["sources"],
             minimum=cluster["minimum"], maximum=cluster["maximum"],
+            verification_tokens=cluster["verification_tokens"],
         )
         # Persistent geometry now owns this evidence; discard the temporary
         # cluster so it cannot grow without bound or be counted twice.
@@ -640,7 +676,8 @@ class ArenaModel:
     def _merge_internal_wall_observation(self, orientation, coordinate, tangent,
                                          source, observations=1, sources=None,
                                          minimum=None, maximum=None,
-                                         boundary_blocked=False):
+                                         boundary_blocked=False,
+                                         verification_tokens=None):
         """Merge confirmed non-boundary evidence into stable internal segments."""
         minimum = tangent if minimum is None else minimum
         maximum = tangent if maximum is None else maximum
@@ -661,15 +698,17 @@ class ArenaModel:
                     boundary_matches,
                     key=lambda item: abs(item["coordinate"] - coordinate)
                 )
-                wall["coordinates"].append(coordinate)
-                ordered = sorted(wall["coordinates"])
-                wall["coordinate"] = ordered[len(ordered) // 2]
+                if not wall.get("locked", False):
+                    wall["coordinates"].append(coordinate)
+                    ordered = sorted(wall["coordinates"])
+                    wall["coordinate"] = ordered[len(ordered) // 2]
                 wall["minimum"] = min(wall["minimum"], minimum)
                 wall["maximum"] = max(wall["maximum"], maximum)
                 wall["observations"] += observations
                 wall["sources"].add(source)
                 if sources:
                     wall["sources"].update(sources)
+                self._add_wall_verification(wall, verification_tokens)
                 return wall
 
         nearby = [
@@ -692,18 +731,21 @@ class ArenaModel:
             track = self._make_wall_track(
                 orientation, coordinate, tangent, kind="internal",
                 boundary_blocked=boundary_blocked,
+                verification_tokens=verification_tokens,
             )
             self.internal_wall_tracks.append(track)
 
-        track["coordinates"].append(coordinate)
-        ordered = sorted(track["coordinates"])
-        track["coordinate"] = ordered[len(ordered) // 2]
+        if not track.get("locked", False):
+            track["coordinates"].append(coordinate)
+            ordered = sorted(track["coordinates"])
+            track["coordinate"] = ordered[len(ordered) // 2]
         track["minimum"] = min(track["minimum"], minimum)
         track["maximum"] = max(track["maximum"], maximum)
         track["observations"] += observations
         track["sources"].add(source)
         if sources:
             track["sources"].update(sources)
+        self._add_wall_verification(track, verification_tokens)
         track["boundary_blocked"] = (
             track.get("boundary_blocked", False) or boundary_blocked
         )
@@ -730,13 +772,27 @@ class ArenaModel:
                     )
                     if gap > 350.0:
                         continue
-                    first["coordinates"].extend(second["coordinates"])
-                    ordered = sorted(first["coordinates"])
-                    first["coordinate"] = ordered[len(ordered) // 2]
+                    if second.get("locked", False) and not first.get("locked", False):
+                        first["coordinate"] = second["coordinate"]
+                        first["coordinates"] = deque(
+                            second.get("coordinates", [second["coordinate"]]),
+                            maxlen=41,
+                        )
+                    elif not first.get("locked", False):
+                        first["coordinates"].extend(second["coordinates"])
+                        ordered = sorted(first["coordinates"])
+                        first["coordinate"] = ordered[len(ordered) // 2]
                     first["minimum"] = min(first["minimum"], second["minimum"])
                     first["maximum"] = max(first["maximum"], second["maximum"])
                     first["observations"] += second["observations"]
                     first["sources"].update(second["sources"])
+                    self._add_wall_verification(
+                        first, second.get("verification_tokens", ())
+                    )
+                    first["locked"] = (
+                        first.get("locked", False) or
+                        second.get("locked", False)
+                    )
                     first["boundary_blocked"] = (
                         first.get("boundary_blocked", False) or
                         second.get("boundary_blocked", False)
@@ -798,10 +854,22 @@ class ArenaModel:
                     existing["maximum"] = max(existing["maximum"], track["maximum"])
                     existing["observations"] += track["observations"]
                     existing["sources"].update(track["sources"])
+                    self._add_wall_verification(
+                        existing, track.get("verification_tokens", ())
+                    )
+                    existing["locked"] = (
+                        existing.get("locked", False) or
+                        track.get("locked", False)
+                    )
                     self.internal_wall_tracks.remove(track)
                     continue
                 if not self._wall_is_more_outward(
                         boundary, track["coordinate"], existing["coordinate"]):
+                    continue
+                # A verified physical wall is a permanent landmark. Pose drift
+                # may later project a parallel candidate farther outward, but
+                # it must not erase or replace the already locked boundary.
+                if existing.get("locked", False):
                     continue
                 # A stronger/farther long wall replaces the earlier boundary.
                 # Demote the old line directly and block immediate re-promotion;
@@ -899,6 +967,9 @@ class ArenaModel:
 
         rebuilt_internal = []
         for track in self.internal_wall_tracks:
+            if track.get("locked", False):
+                rebuilt_internal.append(track)
+                continue
             tangent = crossing_tangent(track)
             if (tangent is None or
                     tangent < track["minimum"] - 220.0 or
@@ -912,6 +983,8 @@ class ArenaModel:
                     observations=track["observations"],
                     sources=track["sources"], kind="internal",
                     boundary_blocked=True,
+                    verification_tokens=track.get("verification_tokens", ()),
+                    locked=track.get("locked", False),
                 )
                 piece["minimum"] = minimum
                 piece["maximum"] = maximum
@@ -921,6 +994,9 @@ class ArenaModel:
 
         rebuilt_boundaries = []
         for track in self.wall_tracks:
+            if track.get("locked", False):
+                rebuilt_boundaries.append(track)
+                continue
             tangent = crossing_tangent(track)
             if (tangent is None or
                     tangent < track["minimum"] - 220.0 or
@@ -935,12 +1011,14 @@ class ArenaModel:
                     sources=track["sources"],
                     minimum=minimum, maximum=maximum,
                     boundary_blocked=True,
+                    verification_tokens=track.get("verification_tokens", ()),
                 )
         self.wall_tracks = rebuilt_boundaries
 
     def _record_wall_observation(self, target, ray_angle_deg, source,
                                  observations=1, sources=None,
-                                 minimum=None, maximum=None):
+                                 minimum=None, maximum=None,
+                                 verification_tokens=None):
         """Store only fused wall evidence; external classification happens later."""
         world_angle = self.theta + math.radians(ray_angle_deg)
         orientation, coordinate, tangent = self._wall_geometry(target, world_angle)
@@ -948,6 +1026,7 @@ class ArenaModel:
             orientation, coordinate, tangent, source,
             observations=observations, sources=sources,
             minimum=minimum, maximum=maximum,
+            verification_tokens=verification_tokens,
         )
 
     def _add_observation(self, distance_mm, angle_deg, source, lateral_mm=0.0,
@@ -1277,18 +1356,23 @@ class ArenaCanvas(QWidget):
         p.setPen(QColor("#667489"))
         p.drawText(
             20, 23,
-            "DISCOVERED MAP — fused: solid red = arena boundary; "
-            "dashed orange = confirmed internal wall"
+            "DISCOVERED MAP — thick solid = locked after 3 sensor frames; "
+            "thin/dashed = provisional geometry"
         )
 
         # Confirmed walls are drawn above the raw occupancy squares. Unlike
         # individual ray endpoints these landmarks remain fixed and extend as
         # later observations agree with the same physical wall.
-        p.setPen(QPen(QColor("#ef4444"), 5, Qt.PenStyle.SolidLine,
-                      Qt.PenCapStyle.RoundCap))
         for wall in self.model.wall_tracks:
             if wall["observations"] < 3:
                 continue
+            locked = wall.get("locked", False)
+            p.setPen(QPen(
+                QColor("#ef4444" if locked else "#f87171"),
+                6 if locked else 3,
+                Qt.PenStyle.SolidLine if locked else Qt.PenStyle.DotLine,
+                Qt.PenCapStyle.RoundCap,
+            ))
             minimum, maximum = self.model.wall_segment(wall)
             if wall["orientation"] == "horizontal":
                 start = screen(minimum, wall["coordinate"])
@@ -1298,11 +1382,16 @@ class ArenaCanvas(QWidget):
                 end = screen(wall["coordinate"], maximum)
             p.drawLine(start, end)
 
-        p.setPen(QPen(QColor("#f97316"), 4, Qt.PenStyle.DashLine,
-                      Qt.PenCapStyle.RoundCap))
         for wall in self.model.internal_wall_tracks:
             if wall["observations"] < 3:
                 continue
+            locked = wall.get("locked", False)
+            p.setPen(QPen(
+                QColor("#f97316" if locked else "#fb923c"),
+                5 if locked else 3,
+                Qt.PenStyle.SolidLine if locked else Qt.PenStyle.DashLine,
+                Qt.PenCapStyle.RoundCap,
+            ))
             minimum, maximum = self.model.wall_segment(wall)
             if wall["orientation"] == "horizontal":
                 start = screen(minimum, wall["coordinate"])
@@ -1488,7 +1577,7 @@ class ArenaView(QWidget):
         self.settings = settings
         self.model = ArenaModel()
         self.sensor_unmatched = []
-        self.model.matrix_mirrored = str(settings.value("sensor/mirror_8x8", "true")).lower() == "true"
+        self.model.matrix_mirrored = str(settings.value("sensor/mirror_8x8", "false")).lower() == "true"
         layout = QHBoxLayout(self)
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -1512,8 +1601,7 @@ class ArenaView(QWidget):
                     "font-weight: bold; padding: 7px 14px; }"
                 )
             self.run_navigation_button.clicked.connect(
-                lambda: self.command_requested.emit(
-                    "autonomous_navigation", {"enabled": True})
+                self._run_navigation_with_tuning
             )
             self.stop_navigation_button.clicked.connect(
                 lambda: self.command_requested.emit(
@@ -1646,10 +1734,11 @@ class ArenaView(QWidget):
         grid = QGridLayout(page)
         self.navigation_strategy = QComboBox()
         self.navigation_strategy.addItems([
-            "Balanced coverage", "Gap explorer", "Conservative wall-safe"
+            "Balanced coverage", "Gap explorer", "Conservative wall-safe",
+            "Frontier grid + A*", "Reactive gap wander (no map planning)"
         ])
         self.navigation_strategy.setCurrentIndex(max(0, min(
-            2, int(self.settings.value("navigation/strategy", 0)))))
+            4, int(self.settings.value("navigation/strategy", 0)))))
         grid.addWidget(QLabel("Algorithm"), 0, 0)
         grid.addWidget(self.navigation_strategy, 0, 1)
         definitions = [
@@ -1680,6 +1769,16 @@ class ArenaView(QWidget):
         apply_button.clicked.connect(self._apply_navigation_tuning)
         grid.addWidget(apply_button, 5, 0, 1, 6)
         self.navigation_tuning_tabs.addTab(page, "Navigation tuning")
+
+    def _run_navigation_with_tuning(self):
+        # Make RUN NAVIGATION transactional from the operator's perspective:
+        # first push every visible tuning control, then start autonomy. This
+        # prevents a recording labelled Gap Explorer from silently running the
+        # previous Balanced strategy.
+        self._apply_navigation_tuning()
+        self.command_requested.emit(
+            "autonomous_navigation", {"enabled": True}
+        )
 
     def _apply_navigation_tuning(self):
         strategy = self.navigation_strategy.currentIndex()
@@ -1911,18 +2010,22 @@ class ArenaView(QWidget):
             configured_ports.add(port)
             label = by_port.get(port, str(sensor.get("label", name)))
             lower = label.lower()
-            lateral = -100 if "left" in lower else (180 if "right right" in lower else 100 if "right" in lower else 0)
+            lateral = (-180 if "left left" in lower else -100 if "left" in lower
+                       else 180 if "right right" in lower else 100 if "right" in lower else 0)
             forward = 120  # top/bottom describes height, not forward/back position
             layer_default = "bottom" if "bottom" in lower else "top"
             layer = str(self.settings.value(f"arena/sensors/{name}/layer", layer_default)).lower()
             if layer not in ("top", "bottom"):
                 layer = layer_default
+            angle_default = (-45 if "left left" in lower
+                             else 45 if "right right" in lower else 0)
             spec = {"name": name, "port": port, "label": label,
-                    "angle": 0.0, "x": float(lateral), "y": float(forward), "layer": layer}
+                    "angle": float(angle_default), "x": float(lateral),
+                    "y": float(forward), "layer": layer}
             sensor_form.addRow(QLabel(f"{label} ({port}, {sensor.get('type', '?')})"))
             controls = {}
             for field, caption, default in (
-                ("angle", "Angle (°)", 0),
+                ("angle", "Angle (°)", angle_default),
                 ("x", "Right offset (mm)", lateral),
                 ("y", "Forward offset (mm)", forward),
             ):
@@ -2155,9 +2258,9 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 7):
+        if ("system.uptime_s" in m.latest and controller_version != 9):
             firmware_warning += (
-                "Navigation controller v7 is not running; upload the current clean build. "
+                "Navigation controller v9 is not running; upload the current clean build. "
             )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
@@ -2188,6 +2291,8 @@ class ArenaView(QWidget):
             f"Known grid squares: {len(m.cells)}; boundaries/internal: "
             f"{sum(w['observations'] >= 3 for w in m.wall_tracks)}/"
             f"{sum(w['observations'] >= 3 for w in m.internal_wall_tracks)}; "
+            f"locked permanent walls: "
+            f"{sum(w.get('locked', False) for w in m.wall_tracks + m.internal_wall_tracks)}; "
             f"pending wall clusters: "
             f"{sum(not w.get('promoted') for w in m.wall_evidence_clusters)}; "
             f"possible-weight squares: "

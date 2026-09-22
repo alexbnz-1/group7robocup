@@ -63,6 +63,18 @@
       "label": "Bottom far-left short-range TOF",
       "type": "short",
       "port": "XSHUT4"
+    },
+    {
+      "name": "top_right_right",
+      "label": "Top far-right long-range TOF",
+      "type": "long",
+      "port": "XSHUT6"
+    },
+    {
+      "name": "top_left_left",
+      "label": "Top far-left long-range TOF",
+      "type": "long",
+      "port": "XSHUT7"
     }
 
   ],
@@ -78,7 +90,7 @@
       "max": 2000,
       "step": 50
     },
-    {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative)","datatype":"int","value":0,"min":0,"max":2,"step":1},
+    {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative, 3 frontier A*, 4 reactive wander)","datatype":"int","value":0,"min":0,"max":4,"step":1},
     {"name":"navigation.front_avoid_mm","label":"Navigation front stop","datatype":"int","unit":"mm","value":300,"min":100,"max":1000,"step":25},
     {"name":"navigation.side_avoid_mm","label":"Navigation side clearance","datatype":"int","unit":"mm","value":200,"min":80,"max":800,"step":25},
     {"name":"navigation.wall_follow_mm","label":"Wall-follow distance","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
@@ -255,6 +267,19 @@
       "buttons": [
         {"label": "BUMPERS ON", "arguments": {"enabled": true}},
         {"label": "BUMPERS OFF", "arguments": {"enabled": false}}
+      ]
+    },
+    {
+      "name": "arm_sorting",
+      "label": "Arm sorting",
+      "category": "Sorting",
+      "description": "On enable, zeroes Herkulex 4 and sets the bumpers OFF. A 0.50 s confirmed inductive detection selects gate +30 degrees and holds the bumpers ON. After detection clears, the bumper stays ON for 2 seconds and the gate stays at +30 for 5 seconds before returning to -30. With no detection the bumpers pulse for one second every 20 seconds.",
+      "action": "arm_sorting_toggle",
+      "debug_mode_required": true,
+      "args": [],
+      "buttons": [
+        {"label": "ARM SORTING ON", "arguments": {"enabled": true}},
+        {"label": "ARM SORTING OFF", "arguments": {"enabled": false}}
       ]
     },
     {

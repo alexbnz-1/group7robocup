@@ -46,6 +46,8 @@ DEFAULT_ENTRIES = [
     {"kind": "Sensor", "device": "TOF Short Bottom Mid Right", "connector": "XSHUT0", "pins": "I2C0 / XSHUT0", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Short Bottom Right Right", "connector": "XSHUT3", "pins": "I2C0 / XSHUT3", "notes": "Configured in debug_config.json"},
     {"kind": "Sensor", "device": "TOF Short Bottom Left Left", "connector": "XSHUT4", "pins": "I2C0 / XSHUT4", "notes": "Configured in debug_config.json"},
+    {"kind": "Sensor", "device": "TOF Long Top Right Right", "connector": "XSHUT6", "pins": "I2C0 / XSHUT6", "notes": "Long-range angled navigation sensor"},
+    {"kind": "Sensor", "device": "TOF Long Top Left Left", "connector": "XSHUT7", "pins": "I2C0 / XSHUT7", "notes": "Long-range angled navigation sensor"},
     {"kind": "Sensor", "device": "SEN0628 8×8 TOF", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x33"},
     {"kind": "Sensor", "device": "BNO055 IMU", "connector": "Raw I2C1", "pins": "3V / G / SC / SD", "notes": "Wire1, I2C address 0x28/0x29"},
 ]
@@ -251,6 +253,18 @@ class WiringGuide(QWidget):
                 self.settings.setValue(
                     "wiring_guide/ultrasound_left_right_names_migrated", True
                 )
+                self.settings.sync()
+
+            # Add the two outer top long-range sensors after the established
+            # hardware migrations, preserving the stable order of older rows.
+            if not self.settings.value("wiring_guide/xshut6_xshut7_migrated", False, type=bool):
+                existing_ports = {entry["connector"].strip().upper() for entry in cleaned}
+                for port in ("XSHUT6", "XSHUT7"):
+                    if port not in existing_ports:
+                        cleaned.append(next(entry.copy() for entry in DEFAULT_ENTRIES
+                                            if entry["connector"] == port))
+                self.settings.setValue(self.SETTINGS_KEY, json.dumps(cleaned, ensure_ascii=False))
+                self.settings.setValue("wiring_guide/xshut6_xshut7_migrated", True)
                 self.settings.sync()
 
             return cleaned

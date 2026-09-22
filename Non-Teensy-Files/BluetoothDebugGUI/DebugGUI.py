@@ -1335,10 +1335,19 @@ class RobotDebugGUI(QMainWindow):
         controls.addWidget(self.tof8x8_view_mode)
 
         self.tof8x8_mirror = QCheckBox("Flip left/right for robot POV")
-        self.tof8x8_mirror.setChecked(
-            str(self.settings.value("sensor/mirror_8x8", "true")).lower() == "true"
-        )
+        mirrored = str(self.settings.value("sensor/mirror_8x8", "false")).lower() == "true"
+        # The installed robot's sensor is the opposite orientation to the
+        # original assumption. Invert the saved choice once so existing users
+        # immediately see robot-left on the left without losing the manual
+        # override checkbox.
+        if int(self.settings.value("sensor/8x8_orientation_version", 0)) < 2:
+            mirrored = (not mirrored) if self.settings.contains("sensor/mirror_8x8") else False
+            self.settings.setValue("sensor/mirror_8x8", mirrored)
+            self.settings.setValue("sensor/8x8_orientation_version", 2)
+        self.tof8x8_mirror.setChecked(mirrored)
         self.tof8x8_mirror.toggled.connect(self._set_tof8x8_mirror)
+        if hasattr(self, "arena_view"):
+            self.arena_view.set_matrix_mirrored(mirrored)
         controls.addWidget(self.tof8x8_mirror)
 
         self.tof8x8_auto_range = QCheckBox("Auto colour range")

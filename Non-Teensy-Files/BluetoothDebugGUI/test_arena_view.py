@@ -220,6 +220,54 @@ class ArenaModelTests(unittest.TestCase):
         self.assertEqual(confirmed[0]["orientation"], "horizontal")
         self.assertAlmostEqual(confirmed[0]["coordinate"], 500, delta=10)
 
+    def test_three_independent_frames_lock_wall_permanently(self):
+        for frame in (1, 2, 3):
+            self.map._merge_internal_wall_observation(
+                "horizontal", 500 + frame, frame * 20, "8x8",
+                observations=2,
+                verification_tokens={("matrix", frame)},
+            )
+        self.assertEqual(len(self.map.internal_wall_tracks), 1)
+        wall = self.map.internal_wall_tracks[0]
+        self.assertTrue(wall["locked"])
+        fixed_coordinate = wall["coordinate"]
+        self.map._merge_internal_wall_observation(
+            "horizontal", fixed_coordinate + 100, 300, "8x8",
+            observations=2,
+            verification_tokens={("matrix", 4)},
+        )
+        self.assertEqual(wall["coordinate"], fixed_coordinate)
+        self.assertGreaterEqual(wall["maximum"], 300)
+
+    def test_locked_verified_wall_survives_false_odometry_crossing(self):
+        wall = self.map._make_wall_track(
+            "horizontal", 500, 0, observations=8,
+            sources={"8x8"}, kind="internal",
+            verification_tokens={("matrix", 1), ("matrix", 2), ("matrix", 3)},
+        )
+        wall["minimum"] = -800
+        wall["maximum"] = 800
+        self.assertTrue(wall["locked"])
+        self.map.internal_wall_tracks = [wall]
+        self.map._clear_traversed_wall_geometry(0, 0, 0, 1000)
+        self.assertEqual(self.map.internal_wall_tracks, [wall])
+        self.assertEqual((wall["minimum"], wall["maximum"]), (-800, 800))
+
+    def test_provisional_wall_can_still_be_carved_by_confirmed_traversal(self):
+        wall = self.map._make_wall_track(
+            "horizontal", 500, 0, observations=4,
+            sources={"top"}, kind="internal",
+            verification_tokens={("telemetry", 1), ("telemetry", 2)},
+        )
+        wall["minimum"] = -800
+        wall["maximum"] = 800
+        self.assertFalse(wall["locked"])
+        self.map.internal_wall_tracks = [wall]
+        self.map._clear_traversed_wall_geometry(0, 0, 0, 1000)
+        self.assertEqual(len(self.map.internal_wall_tracks), 2)
+        self.assertTrue(all(piece.get("boundary_blocked")
+                            for piece in self.map.internal_wall_tracks))
+
     def test_bottom_sensor_never_becomes_a_wall(self):
         self.map.sensor_specs = [
             {"name": "lower", "angle": 0, "x": 0, "y": 0,
