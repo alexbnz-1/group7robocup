@@ -542,6 +542,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         navigationDetourClearSamples_ = 0;
         navigationDetourLastTriggerCount_ = 0;
         navigationObstacleCount_ = 0;
+        navigationRecoveryCount_ = 0;
+        navigationClearanceTurnCount_ = 0;
         navigationMotionConsistent_ = true;
         stopped_ = false;
         dcMotor203SecondDeadman_ = false;
@@ -784,7 +786,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["system.uptime_s"] = now / 1000.0f;
     data["system.debug_mode"] = debugMode_;
     data["system.stopped"] = stopped_;
-    data["system.navigation_controller_version"] = 6;
+    data["system.navigation_controller_version"] = 7;
     data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
     data["bluetooth.messages_received"] = receivedMessages_;
     data["servo.last_id"] = lastServoId_;
@@ -832,6 +834,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         case NAV_ESCAPE_REVERSE: navigationPhase = "escape_reverse"; break;
         case NAV_ESCAPE_TURN: navigationPhase = "escape_turn"; break;
         case NAV_CLEARANCE_TURN: navigationPhase = "clearance_turn"; break;
+        case NAV_RECOVERY_REVERSE: navigationPhase = "recovery_reverse"; break;
+        case NAV_RECOVERY_TURN: navigationPhase = "recovery_turn"; break;
         default: break;
     }
     data["navigation.phase"] = navigationPhase;
@@ -863,6 +867,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
         (navigationDetourRight_ ? 1 : -1) : 0;
     data["navigation.obstacle_count"] = navigationObstacleCount_;
     data["navigation.detour_offset_mm"] = navigationDetourOffsetMm_;
+    data["navigation.recovery_count"] = navigationRecoveryCount_;
+    data["navigation.clearance_turn_count"] = navigationClearanceTurnCount_;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
     data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
@@ -1263,6 +1269,7 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     navigationDetourEdgeCleared_ = false;
     navigationDetourObstacleSeen_ = false;
     navigationDetourClearSamples_ = 0;
+    navigationClearanceTurnCount_ = 0;
     if (reason != nullptr)
         link_.log("INFO", reason);
 }
@@ -1303,6 +1310,8 @@ void BluetoothDebugWorkflow::updateNavigation()
     constexpr float OBSTACLE_CLEAR_MARGIN_MM = 220.0f;
     constexpr float OBSTACLE_MAX_OFFSET_MM = 1200.0f;
     constexpr float OBSTACLE_MAX_PASS_MM = 2500.0f;
+    constexpr float RECOVERY_REVERSE_MM = 350.0f;
+    constexpr float RECOVERY_MAX_REVERSE_MM = 800.0f;
 
     constexpr float ENCODER_1_MM_PER_COUNT = 0.09094f;
     constexpr float ENCODER_2_MM_PER_COUNT = 0.09592f;
@@ -1739,14 +1748,53 @@ void BluetoothDebugWorkflow::updateNavigation()
             navigationDetourClearSamples_ = 0;
         return false;
     };
+    auto startRecovery = [&](const char* reason) {
+        setDrive(0, 0);
+        ++navigationRecoveryCount_;
+        navigationClearanceTurnCount_ = 0;
+        navigationRecoveryStartEncoder1_ = encoders_.firstCount();
+        navigationRecoveryStartEncoder2_ = encoders_.secondCount();
+
+        const bool leftKnown = left != 0xFFFF;
+        const bool rightKnown = right != 0xFFFF;
+        if (leftKnown || rightKnown)
+            navigationRecoveryTurnRight_ = rightKnown &&
+                (!leftKnown || right >= left);
+        else
+            navigationRecoveryTurnRight_ =
+                (navigationRecoveryCount_ & 1U) != 0U;
+
+        navigationState_ = NAV_RECOVERY_REVERSE;
+        navigationMotionStartedMs_ = now;
+        navigationMotionConsistent_ = true;
+
+        navigationDetourOffsetMm_ = 0.0f;
+        navigationDetourEdgeCleared_ = false;
+        navigationDetourObstacleSeen_ = false;
+        navigationDetourClearSamples_ = 0;
+        navigationSweepLateralErrorMm_ = 0;
+        navigationSweepLeftReferenceValid_ = false;
+        navigationSweepRightReferenceValid_ = false;
+        navigationExpectedSweepLengthMm_ = 0.0f;
+        navigationExpectedSweepLengthValid_ = false;
+
+        setDrive(100, 100);
+        if (reason != nullptr)
+            link_.log("WARNING", reason);
+    };
+
     auto avoidBlockedTurnExit = [&]() -> bool {
         if (!frontBlocked)
+        {
+            navigationClearanceTurnCount_ = 0;
             return false;
+        }
 
         const bool leftClose = left != 0xFFFF && left < 350;
         const bool rightClose = right != 0xFFFF && right < 350;
         if (leftClose && rightClose)
         {
+            navigationClearanceTurnCount_ = 0;
             navigationState_ = NAV_ESCAPE_REVERSE;
             navigationEscapeStartEncoder1_ = encoders_.firstCount();
             navigationEscapeStartEncoder2_ = encoders_.secondCount();
@@ -1758,15 +1806,21 @@ void BluetoothDebugWorkflow::updateNavigation()
             return true;
         }
 
-        // Never enter a forward state while a wall is still directly ahead.
-        // Turn another quarter-turn toward the side with the most measured
-        // room, then reassess. Repeated blocked exits naturally keep turning
-        // until a clear heading is actually visible.
+        if (navigationClearanceTurnCount_ >= 2)
+        {
+            startRecovery(
+                "Repeated blocked turn exits; backing away and replanning");
+            return true;
+        }
+
+        ++navigationClearanceTurnCount_;
         const bool turnRight = right != 0xFFFF &&
             (left == 0xFFFF || right >= left);
         setDrive(0, 0);
         beginRightAngleTurn(turnRight, NAV_CLEARANCE_TURN);
-        link_.log("WARNING", "Turn ended facing a wall; turning again before moving");
+        link_.log(
+            "WARNING",
+            "Turn ended facing a wall; trying a bounded clearance turn");
         return true;
     };
 
@@ -1957,8 +2011,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 if (unexpectedObstacle)
                 {
                     setDrive(0, 0);
-                    stopNavigation(
-                        "Unexpected obstacle detected but no safe detour side is available");
+                    startRecovery(
+                    "Unexpected obstacle has no safe immediate detour; backing away to recover");
                     break;
                 }
 
@@ -2085,8 +2139,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 navigationDetourStartEncoder1_, navigationDetourStartEncoder2_);
             if (frontBlocked && !navigationDetourEdgeCleared_)
             {
-                stopNavigation(
-                    "Obstacle detour aborted: lateral route blocked before obstacle edge");
+                startRecovery(
+                    "Detour lateral route blocked; backing away to recover");
                 break;
             }
 
@@ -2100,8 +2154,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (totalOffsetMm >= OBSTACLE_MAX_OFFSET_MM &&
                 !navigationDetourEdgeCleared_)
             {
-                stopNavigation(
-                    "Obstacle detour aborted: obstacle edge not found within lateral limit");
+                startRecovery(
+                    "Detour edge not found within lateral limit; backing away to recover");
                 break;
             }
 
@@ -2143,8 +2197,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 navigationDetourPhaseStartEncoder2_);
             if (frontBlocked)
             {
-                stopNavigation(
-                    "Obstacle detour aborted: forward bypass path is blocked");
+                startRecovery(
+                    "Detour forward path blocked; backing away to recover");
                 break;
             }
 
@@ -2158,8 +2212,8 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (passDistanceMm >= OBSTACLE_MAX_PASS_MM &&
                 !navigationDetourEdgeCleared_)
             {
-                stopNavigation(
-                    "Obstacle detour aborted: obstacle did not end within forward limit");
+                startRecovery(
+                    "Obstacle extends beyond detour limit; backing away to recover");
                 break;
             }
 
@@ -2200,8 +2254,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 navigationDetourPhaseStartEncoder2_);
             if (frontBlocked && returnedMm + 40.0f < navigationDetourOffsetMm_)
             {
-                stopNavigation(
-                    "Obstacle detour aborted: return path to sweep lane is blocked");
+                startRecovery(
+                    "Detour return path blocked; backing away to recover");
                 break;
             }
             if (returnedMm >= navigationDetourOffsetMm_)
@@ -2285,14 +2339,69 @@ void BluetoothDebugWorkflow::updateNavigation()
             }
             break;
 
+        case NAV_RECOVERY_REVERSE:
+        {
+            const float reversedMm = encoderDistanceFrom(
+                navigationRecoveryStartEncoder1_,
+                navigationRecoveryStartEncoder2_);
+            const bool sideOpen =
+                (left != 0xFFFF && left >= 350) ||
+                (right != 0xFFFF && right >= 350);
+
+            if ((reversedMm >= RECOVERY_REVERSE_MM && sideOpen) ||
+                reversedMm >= RECOVERY_MAX_REVERSE_MM)
+            {
+                setDrive(0, 0);
+                if (left != 0xFFFF || right != 0xFFFF)
+                    navigationRecoveryTurnRight_ = right != 0xFFFF &&
+                        (left == 0xFFFF || right >= left);
+                beginRightAngleTurn(
+                    navigationRecoveryTurnRight_, NAV_RECOVERY_TURN);
+            }
+            else
+                setDrive(100, 100);
+            break;
+        }
+
+        case NAV_RECOVERY_TURN:
+            if (runHeadingTurn())
+            {
+                if (frontBlocked)
+                {
+                    navigationRecoveryStartEncoder1_ = encoders_.firstCount();
+                    navigationRecoveryStartEncoder2_ = encoders_.secondCount();
+                    navigationRecoveryTurnRight_ = !navigationRecoveryTurnRight_;
+                    navigationState_ = NAV_RECOVERY_REVERSE;
+                    navigationMotionStartedMs_ = now;
+                    navigationMotionConsistent_ = true;
+                    setDrive(100, 100);
+                    link_.log(
+                        "WARNING",
+                        "Recovery heading still blocked; backing away again");
+                    break;
+                }
+
+                navigationClearanceTurnCount_ = 0;
+                navigationState_ = NAV_SEEK_WALL;
+                navigationLaneIndex_ = 0;
+                navigationSweepProgressMm_ = 0.0f;
+                navigationExpectedSweepLengthMm_ = 0.0f;
+                navigationExpectedSweepLengthValid_ = false;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log(
+                    "INFO",
+                    "Recovery found a clear heading; reacquiring arena coverage");
+            }
+            break;
+
         case NAV_CLEARANCE_TURN:
             if (runHeadingTurn())
             {
                 if (avoidBlockedTurnExit())
                     break;
-                // The unexpected extra turn invalidates the old sweep lane.
-                // Reacquire a wall on the newly verified clear heading rather
-                // than trying to continue stale geometry.
+                navigationClearanceTurnCount_ = 0;
                 navigationState_ = NAV_SEEK_WALL;
                 navigationLaneIndex_ = 0;
                 navigationSweepProgressMm_ = 0.0f;

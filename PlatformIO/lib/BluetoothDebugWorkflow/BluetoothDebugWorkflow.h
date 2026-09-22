@@ -105,7 +105,9 @@ private:
         NAV_OBSTACLE_TURN_IN = 16,
         NAV_ESCAPE_REVERSE = 17,
         NAV_ESCAPE_TURN = 18,
-        NAV_CLEARANCE_TURN = 19
+        NAV_CLEARANCE_TURN = 19,
+        NAV_RECOVERY_REVERSE = 20,
+        NAV_RECOVERY_TURN = 21
     };
     bool navigationActive_ = false;
     uint8_t navigationState_ = 0;
@@ -158,6 +160,15 @@ private:
     int32_t navigationEscapeStartEncoder1_ = 0;
     int32_t navigationEscapeStartEncoder2_ = 0;
     bool navigationEscapeTurnRight_ = true;
+
+    // Generic non-aborting recovery. Failed local plans back away before
+    // choosing a new heading, so navigation keeps exploring instead of
+    // disabling itself or chaining endless in-place quarter-turns.
+    int32_t navigationRecoveryStartEncoder1_ = 0;
+    int32_t navigationRecoveryStartEncoder2_ = 0;
+    bool navigationRecoveryTurnRight_ = true;
+    uint16_t navigationRecoveryCount_ = 0;
+    uint8_t navigationClearanceTurnCount_ = 0;
 
     bool navigationMotionConsistent_ = true;
 

@@ -3796,3 +3796,152 @@ Verification:
 - No Teensy programming port was connected after the build. Only COM3 and COM4
   computer Bluetooth ports were visible, so controller version 6 has not yet
   been uploaded to the robot.
+
+
+===============================================================================
+60. NON-ABORTING NAVIGATION RECOVERY AND SELF-CORRECTING INTERNAL WALL MAP
+===============================================================================
+
+This change is based on the current `testing` branch at commit
+`d8216d4de23f8864e39983f9ce27c74f9b1b8c94`
+("Better smoother navigation code, just got stuck in a loop at one point. But
+way better"). GitHub was read only while preparing these files.
+
+Affected files:
+
+- PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp
+- PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h
+- Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py
+
+No pin allocation, debug_config.json setting, Bluetooth command format, sensor
+driver or recording format was changed.
+
+Navigation controller version:
+
+- `system.navigation_controller_version` is now 7.
+- New telemetry phases are `recovery_reverse` and `recovery_turn`.
+- New diagnostic telemetry:
+  - `navigation.recovery_count`
+  - `navigation.clearance_turn_count`
+
+Non-aborting recovery:
+
+- Failed obstacle-detour conditions no longer call `stopNavigation()`.
+- These conditions now enter a generic recovery path while autonomous
+  navigation remains enabled:
+  - no immediately safe detour side;
+  - lateral detour path blocked;
+  - obstacle edge not found within the lateral search limit;
+  - forward bypass path blocked;
+  - obstacle extends beyond the forward detour limit;
+  - return path to the original sweep lane blocked.
+- Recovery first reverses away from the failed local plan.
+- The normal recovery back-off is 350 mm once at least one side has opened.
+- A recovery reverse is bounded at 800 mm before a new heading is attempted.
+- The new turn is chosen toward the side ultrasound reporting the most room.
+  If neither side is available, successive recoveries alternate direction.
+- If the new recovery heading is still blocked, the robot does not immediately
+  chain another in-place turn. It reverses again first, flips the intended turn
+  direction, then reassesses.
+- Once a clear recovery heading exists, stale sweep/detour geometry is
+  invalidated and the robot returns to `seek_wall` so it can reacquire the
+  arena and continue exploring rather than aborting autonomy.
+
+End-of-run / repeated-spin correction:
+
+- `NAV_CLEARANCE_TURN` is now explicitly counted.
+- At most two blocked extra quarter-turn exits are allowed without translation.
+- If those turns still end facing a wall, the controller enters
+  `recovery_reverse` instead of continuing to rotate in a circle.
+- A clear turn exit resets the clearance-turn count.
+- Existing STOP, Debug Mode and global stopped-state safety behaviour is
+  unchanged; those conditions can still intentionally stop navigation.
+
+Internal-wall mapping:
+
+- Arena View now keeps two distinct persistent geometry collections:
+  - outer arena boundaries;
+  - internal walls/obstacles.
+- Confirmed outer boundaries remain solid red.
+- Confirmed internal walls are drawn as dashed orange segments.
+- Internal wall tracks require at least three agreeing wall observations before
+  they are shown persistently.
+- A range return substantially inside an already-established farther boundary
+  is retained as internal-wall evidence instead of being discarded.
+- If a farther coherent wall is later observed in the same cardinal direction,
+  it can replace the earlier boundary candidate. The earlier candidate is
+  demoted to internal-wall evidence rather than silently lost.
+- The status line now reports the number of confirmed internal wall tracks.
+
+Map self-correction from physical traversal:
+
+- The existing encoder/IMU agreement gate is retained. If encoders report
+  movement but the IMU has not confirmed the movement bout, virtual x/y does
+  not advance.
+- Wall self-correction is performed only after that existing translation gate
+  has accepted the chassis movement.
+- The confirmed robot path marks an approximately 210 mm-radius corridor as
+  strong free-space evidence.
+- If the confirmed path crosses a mapped internal wall, approximately a
+  440 mm-wide corridor is carved out of that wall.
+- A short false wall can therefore disappear completely.
+- A real wall containing a traversable opening is split into the remaining
+  segments on either side instead of the complete wall being deleted.
+- If the robot physically crosses geometry previously labelled as an outer
+  arena boundary, that boundary label is removed. Any surviving side pieces
+  are retained as internal geometry and a later farther observation can
+  establish the true arena boundary.
+- Possible-weight votes inside a physically traversed corridor are also cleared.
+
+Behaviour retained:
+
+- Dynamic ultrasound-determined sweep width remains in place.
+- Nominal sweep spacing remains 200 mm.
+- Existing 8x8/top-TOF forward obstacle detection remains in place.
+- Existing rectangular local obstacle detour remains in place.
+- Existing near-contact 8x8 broad-wall handling and U-trap escape remain.
+- Existing BNO055/encoder map-motion cross-check and point-turn/wall-slip
+  suppression remain.
+- Existing Arena View controls, raw sensor panels, replay support and telemetry
+  remain.
+
+Verification performed while preparing this change:
+
+- The source baselines were checked against the current GitHub blob SHAs before
+  modification:
+  - BluetoothDebugWorkflow.cpp:
+    `c265d65dfc6d042b0400b970562b8c7e0462fa4e`
+  - BluetoothDebugWorkflow.h:
+    `8dfc6d942445ffdd19ba8d1f9d66987ab0fe0714`
+  - ArenaView.py:
+    `aef26c046f83fc6986c555151174b656b909f766`
+- `python -m py_compile ArenaView.py` passes.
+- ArenaModel logic tests pass for:
+  - nearer wall retained as internal geometry;
+  - farther wall replacing an earlier false boundary;
+  - physical traversal splitting an internal wall around the proven corridor;
+  - physical traversal invalidating a false outer boundary while preserving
+    untraversed pieces as internal geometry.
+- C++ structural checks pass for balanced brackets/braces/parentheses, the new
+  recovery states and telemetry, and removal of all obstacle-detour abort
+  messages.
+- Inside `updateNavigation()`, the only remaining `stopNavigation()` call is the
+  existing global safety exit when Debug Mode is unavailable or the robot is
+  globally stopped.
+- A PlatformIO/Teensy build was not run in this environment because the project
+  toolchain/repository checkout is not available here.
+- The full PyQt GUI regression suite was not run here because PyQt6 is not
+  installed in this environment.
+
+Required local verification:
+
+1. Build the firmware:
+   `C:\Users\alex\.platformio\penv\Scripts\platformio.exe run`
+2. Upload it and confirm Arena View reports navigation controller version 7.
+3. Test a deliberately blocked turn and verify phase changes from
+   `clearance_turn` to `recovery_reverse` rather than spinning indefinitely.
+4. Test an internal wall/box and verify it is drawn dashed orange while the
+   outer arena remains solid red.
+5. Drive through a deliberately false mapped wall location and verify the
+   crossed section is removed/split while unrelated wall sections remain.
+6. Keep the physical STOP control ready during the first autonomous trial.

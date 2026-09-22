@@ -96,6 +96,10 @@ class ArenaModel:
         # ranging sensors. Tracks are retained for the whole run and extended
         # as the robot sees more of the same wall.
         self.wall_tracks = []
+        # Internal geometry is separate from the four outer arena boundaries.
+        # Repeated observations can make it persistent, while confirmed chassis
+        # motion can later shorten/delete geometry proven to be traversable.
+        self.internal_wall_tracks = []
 
     def _filtered_distance(self, name, distance, confirm_initial=False):
         """Reject one-frame range jumps, then lightly median-filter accepted data."""
@@ -316,6 +320,7 @@ class ArenaModel:
         )
 
         previous_theta = self.theta
+        previous_x, previous_y = self.x, self.y
         clockwise_delta = None
         if heading_ready and self._last_heading is not None:
             # Wrap through 0/360 without a spurious full revolution.
@@ -431,6 +436,12 @@ class ArenaModel:
                 radius = ds / dtheta
                 self.x += radius * (math.sin(self.theta) - math.sin(previous_theta))
                 self.y -= radius * (math.cos(self.theta) - math.cos(previous_theta))
+            # This runs only after the encoder/IMU checks accepted the
+            # translation. Physical chassis occupancy therefore outranks old
+            # range hits that claimed a wall occupied the same corridor.
+            self._clear_traversed_wall_geometry(
+                previous_x, previous_y, self.x, self.y
+            )
             if (not self.trail or
                     math.hypot(self.x - self.trail[-1][0],
                                self.y - self.trail[-1][1]) >= 15):
@@ -447,8 +458,173 @@ class ArenaModel:
                   origin_y + distance_mm * math.sin(angle))
         return target
 
+    @staticmethod
+    def _wall_is_more_outward(boundary, candidate, current):
+        if boundary in ("north", "east"):
+            return candidate > current
+        return candidate < current
+
+    @staticmethod
+    def _make_wall_track(orientation, coordinate, tangent, observations=0,
+                         sources=None, boundary=None, kind="internal"):
+        return {
+            "boundary": boundary,
+            "kind": kind,
+            "orientation": orientation,
+            "coordinate": coordinate,
+            "coordinates": deque([coordinate], maxlen=31),
+            "minimum": tangent,
+            "maximum": tangent,
+            "observations": observations,
+            "sources": set() if sources is None else set(sources),
+        }
+
+    def _merge_internal_wall_observation(self, orientation, coordinate, tangent,
+                                         source, observations=1, sources=None,
+                                         minimum=None, maximum=None):
+        """Merge non-boundary returns into persistent internal wall segments."""
+        nearby = [
+            track for track in self.internal_wall_tracks
+            if track["orientation"] == orientation
+            and abs(track["coordinate"] - coordinate) <= 150.0
+            and tangent >= track["minimum"] - 250.0
+            and tangent <= track["maximum"] + 250.0
+        ]
+        if nearby:
+            track = min(
+                nearby,
+                key=lambda item: (
+                    abs(item["coordinate"] - coordinate) +
+                    max(0.0, item["minimum"] - tangent,
+                        tangent - item["maximum"])
+                )
+            )
+        else:
+            track = self._make_wall_track(
+                orientation, coordinate, tangent, kind="internal"
+            )
+            self.internal_wall_tracks.append(track)
+
+        track["coordinates"].append(coordinate)
+        ordered = sorted(track["coordinates"])
+        track["coordinate"] = ordered[len(ordered) // 2]
+        track["minimum"] = min(
+            track["minimum"], tangent if minimum is None else minimum
+        )
+        track["maximum"] = max(
+            track["maximum"], tangent if maximum is None else maximum
+        )
+        track["observations"] += observations
+        track["sources"].add(source)
+        if sources:
+            track["sources"].update(sources)
+        return track
+
+    @staticmethod
+    def _carve_wall_track(track, crossing_tangent, half_width=220.0):
+        """Return wall pieces left after the chassis proves a corridor is open."""
+        clear_min = crossing_tangent - half_width
+        clear_max = crossing_tangent + half_width
+        pieces = []
+        if track["minimum"] < clear_min - 60.0:
+            pieces.append(
+                (track["minimum"], min(track["maximum"], clear_min))
+            )
+        if track["maximum"] > clear_max + 60.0:
+            pieces.append(
+                (max(track["minimum"], clear_max), track["maximum"])
+            )
+        return pieces
+
+    def _clear_traversed_wall_geometry(self, x0, y0, x1, y1):
+        """Use confirmed chassis motion to erase contradictory wall evidence."""
+        distance = math.hypot(x1 - x0, y1 - y0)
+        if distance < 2.0:
+            return
+
+        free_radius_mm = 210.0
+        step_mm = max(5.0, self.cell_size_mm)
+        samples = max(1, math.ceil(distance / step_mm))
+        cell_radius = max(1, math.ceil(free_radius_mm / self.cell_size_mm))
+        for index in range(samples + 1):
+            fraction = index / samples
+            px = x0 + (x1 - x0) * fraction
+            py = y0 + (y1 - y0) * fraction
+            centre_col, centre_row = self._cell(px, py)
+            for dc in range(-cell_radius, cell_radius + 1):
+                for dr in range(-cell_radius, cell_radius + 1):
+                    cx = (centre_col + dc + 0.5) * self.cell_size_mm
+                    cy = (centre_row + dr + 0.5) * self.cell_size_mm
+                    if math.hypot(cx - px, cy - py) > free_radius_mm:
+                        continue
+                    cell = (centre_col + dc, centre_row + dr)
+                    self.cells[cell] = min(-5, self.cells.get(cell, 0) - 3)
+                    self.weight_votes.pop(cell, None)
+
+        def crossing_tangent(track):
+            coordinate = track["coordinate"]
+            if track["orientation"] == "horizontal":
+                delta = y1 - y0
+                if abs(delta) < 1e-6:
+                    return None
+                if (y0 - coordinate) * (y1 - coordinate) > 0:
+                    return None
+                fraction = (coordinate - y0) / delta
+                if not 0.0 <= fraction <= 1.0:
+                    return None
+                return x0 + (x1 - x0) * fraction
+
+            delta = x1 - x0
+            if abs(delta) < 1e-6:
+                return None
+            if (x0 - coordinate) * (x1 - coordinate) > 0:
+                return None
+            fraction = (coordinate - x0) / delta
+            if not 0.0 <= fraction <= 1.0:
+                return None
+            return y0 + (y1 - y0) * fraction
+
+        rebuilt_internal = []
+        for track in self.internal_wall_tracks:
+            tangent = crossing_tangent(track)
+            if (tangent is None or
+                    tangent < track["minimum"] - 220.0 or
+                    tangent > track["maximum"] + 220.0):
+                rebuilt_internal.append(track)
+                continue
+            for minimum, maximum in self._carve_wall_track(track, tangent):
+                piece = self._make_wall_track(
+                    track["orientation"], track["coordinate"],
+                    (minimum + maximum) * 0.5,
+                    observations=track["observations"],
+                    sources=track["sources"], kind="internal",
+                )
+                piece["minimum"] = minimum
+                piece["maximum"] = maximum
+                piece["coordinates"] = deque(track["coordinates"], maxlen=31)
+                rebuilt_internal.append(piece)
+        self.internal_wall_tracks = rebuilt_internal
+
+        rebuilt_boundaries = []
+        for track in self.wall_tracks:
+            tangent = crossing_tangent(track)
+            if (tangent is None or
+                    tangent < track["minimum"] - 220.0 or
+                    tangent > track["maximum"] + 220.0):
+                rebuilt_boundaries.append(track)
+                continue
+            for minimum, maximum in self._carve_wall_track(track, tangent):
+                self._merge_internal_wall_observation(
+                    track["orientation"], track["coordinate"],
+                    (minimum + maximum) * 0.5, "traversed-boundary",
+                    observations=max(1, track["observations"]),
+                    sources=track["sources"],
+                    minimum=minimum, maximum=maximum,
+                )
+        self.wall_tracks = rebuilt_boundaries
+
     def _record_wall_observation(self, target, ray_angle_deg, source):
-        """Cluster repeat returns into persistent axis-aligned wall segments."""
+        """Classify stable returns as arena-boundary or internal-wall evidence."""
         world_angle = self.theta + math.radians(ray_angle_deg)
         ray_x = math.cos(world_angle)
         ray_y = math.sin(world_angle)
@@ -462,39 +638,48 @@ class ArenaModel:
         coordinate = target[1] if horizontal else target[0]
         tangent = target[0] if horizontal else target[1]
 
-        # The arena is rectangular: there is only one boundary in each
-        # cardinal outward direction. This prevents pose drift from spawning
-        # a stack of parallel copies of a wall that was already discovered.
-        nearest = next(
+        outer = next(
             (track for track in self.wall_tracks
              if track["boundary"] == boundary), None
         )
-
-        if nearest is None:
-            nearest = {
-                "boundary": boundary,
-                "orientation": orientation,
-                "coordinate": coordinate,
-                "coordinates": deque([coordinate], maxlen=31),
-                "minimum": tangent,
-                "maximum": tangent,
-                "observations": 0,
-                "sources": set(),
-            }
-            self.wall_tracks.append(nearest)
-        elif abs(nearest["coordinate"] - coordinate) > 180.0:
-            # Once this boundary exists, a return far from it is an internal
-            # object or accumulated pose error. It must not relocate the wall.
+        if outer is None:
+            outer = self._make_wall_track(
+                orientation, coordinate, tangent,
+                boundary=boundary, kind="boundary"
+            )
+            self.wall_tracks.append(outer)
+        elif abs(outer["coordinate"] - coordinate) <= 180.0:
+            pass
+        elif self._wall_is_more_outward(
+                boundary, coordinate, outer["coordinate"]):
+            self._merge_internal_wall_observation(
+                outer["orientation"], outer["coordinate"],
+                (outer["minimum"] + outer["maximum"]) * 0.5,
+                "demoted-boundary",
+                observations=max(1, outer["observations"]),
+                sources=outer["sources"],
+                minimum=outer["minimum"], maximum=outer["maximum"],
+            )
+            self.wall_tracks.remove(outer)
+            outer = self._make_wall_track(
+                orientation, coordinate, tangent,
+                boundary=boundary, kind="boundary"
+            )
+            self.wall_tracks.append(outer)
+        else:
+            self._merge_internal_wall_observation(
+                orientation, coordinate, tangent, source
+            )
             return
 
-        nearest["coordinates"].append(coordinate)
-        if nearest["observations"] < 3:
-            ordered = sorted(nearest["coordinates"])
-            nearest["coordinate"] = ordered[len(ordered) // 2]
-        nearest["minimum"] = min(nearest["minimum"], tangent)
-        nearest["maximum"] = max(nearest["maximum"], tangent)
-        nearest["observations"] += 1
-        nearest["sources"].add(source)
+        outer["coordinates"].append(coordinate)
+        if outer["observations"] < 3:
+            ordered = sorted(outer["coordinates"])
+            outer["coordinate"] = ordered[len(ordered) // 2]
+        outer["minimum"] = min(outer["minimum"], tangent)
+        outer["maximum"] = max(outer["maximum"], tangent)
+        outer["observations"] += 1
+        outer["sources"].add(source)
 
     def _add_observation(self, distance_mm, angle_deg, source, lateral_mm=0.0,
                          forward_mm=0.0, wall_candidate=False):
@@ -523,7 +708,14 @@ class ArenaModel:
             self.cells[endpoint] = min(8, self.cells.get(endpoint, 0) + 3)
 
     def wall_segment(self, wall):
-        """Return a visible segment, joining confirmed boundary intersections."""
+        """Return a visible segment for outer or internal wall geometry."""
+        if wall.get("kind") == "internal":
+            minimum, maximum = wall["minimum"], wall["maximum"]
+            if maximum - minimum < 120.0:
+                centre = (minimum + maximum) * 0.5
+                return centre - 60.0, centre + 60.0
+            return minimum, maximum
+
         if wall["orientation"] == "horizontal":
             perpendicular = sorted(
                 item["coordinate"] for item in self.wall_tracks
@@ -696,7 +888,8 @@ class ArenaCanvas(QWidget):
         if self.model.cells:
             xs.extend(column * cell_size for column, _row in self.model.cells)
             ys.extend(row * cell_size for _column, row in self.model.cells)
-        for wall in self.model.wall_tracks:
+        for wall in (
+                self.model.wall_tracks + self.model.internal_wall_tracks):
             if wall["observations"] < 3:
                 continue
             minimum, maximum = self.model.wall_segment(wall)
@@ -769,7 +962,11 @@ class ArenaCanvas(QWidget):
                 p.drawRect(QRectF(screen(x, y + cell_size), screen(x + cell_size, y)).normalized())
         p.setClipping(False)
         p.setPen(QColor("#667489"))
-        p.drawText(20, 23, "DISCOVERED MAP — solid red lines are remembered arena walls")
+        p.drawText(
+            20, 23,
+            "DISCOVERED MAP — solid red = arena boundary; "
+            "dashed orange = internal wall"
+        )
 
         # Confirmed walls are drawn above the raw occupancy squares. Unlike
         # individual ray endpoints these landmarks remain fixed and extend as
@@ -777,6 +974,20 @@ class ArenaCanvas(QWidget):
         p.setPen(QPen(QColor("#ef4444"), 5, Qt.PenStyle.SolidLine,
                       Qt.PenCapStyle.RoundCap))
         for wall in self.model.wall_tracks:
+            if wall["observations"] < 3:
+                continue
+            minimum, maximum = self.model.wall_segment(wall)
+            if wall["orientation"] == "horizontal":
+                start = screen(minimum, wall["coordinate"])
+                end = screen(maximum, wall["coordinate"])
+            else:
+                start = screen(wall["coordinate"], minimum)
+                end = screen(wall["coordinate"], maximum)
+            p.drawLine(start, end)
+
+        p.setPen(QPen(QColor("#f97316"), 4, Qt.PenStyle.DashLine,
+                      Qt.PenCapStyle.RoundCap))
+        for wall in self.model.internal_wall_tracks:
             if wall["observations"] < 3:
                 continue
             minimum, maximum = self.model.wall_segment(wall)
@@ -1573,9 +1784,9 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 6):
+        if ("system.uptime_s" in m.latest and controller_version != 7):
             firmware_warning += (
-                "Navigation controller v6 is not running; upload the current clean build. "
+                "Navigation controller v7 is not running; upload the current clean build. "
             )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
@@ -1603,6 +1814,8 @@ class ArenaView(QWidget):
             f"Point TOF online: {online}/{len(m.sensor_specs)}; "
             f"ultrasound valid: {ultrasound_valid}/{len(m.ultrasound_specs)}; "
             f"8x8: {'ready' if m.last_matrix_available and m.last_matrix_valid else 'waiting/invalid'}. "
-            f"Known grid squares: {len(m.cells)}; possible-weight squares: "
+            f"Known grid squares: {len(m.cells)}; internal walls: "
+            f"{sum(w['observations'] >= 3 for w in m.internal_wall_tracks)}; "
+            f"possible-weight squares: "
             f"{sum(v >= 2 for v in m.weight_votes.values())}.{missing}"
         )
