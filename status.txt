@@ -4993,3 +4993,268 @@ Weight detection and visited-area wandering memory (2026-09-22):
 - Added wander local pose and visited-cell count to recorded telemetry.
 - Firmware compiles successfully: 155864 bytes code, 30072 bytes data and
   286368 bytes RAM1 free for local variables.
+
+
+
+
+2026-09-22 pre-laid mission strategy and graphical arena planner
+----------------------------------------------------------------
+Baseline and scope:
+
+- Built on the current testing-branch navigation/GUI work plus the recovery-v8
+  handoff, preserving the current gap-explorer tuning, sensor-fusion mapper,
+  non-aborting recovery changes, Bluetooth transport changes and raw sensor UI.
+- Navigation controller telemetry version is now 9.
+- Files changed in this handoff:
+  - PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp
+  - PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h
+  - Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py
+- No GitHub write, commit or push was performed.
+
+New strategy 3: Pre-laid mission
+
+- Arena View now exposes a fourth navigation strategy named Pre-laid mission.
+- The operator lays out the mission before starting the robot. RUN NAVIGATION
+  first applies the visible navigation tuning, plans the route, uploads the
+  route to the Teensy and only then starts autonomous navigation.
+- Firmware accepts two built-in GUI protocol commands without requiring new
+  debug_config command definitions:
+  - mission_plan_set
+  - mission_plan_clear
+- A mission plan contains the selected start position and start heading, a
+  compact waypoint polyline, flags identifying real-weight visit waypoints and
+  the roaming strategy to use after all real weights have been visited.
+- A maximum of 64 uploaded mission waypoints is enforced in both the GUI and
+  firmware so the command remains bounded for the Bluetooth receive buffer.
+
+Graphical pre-laid arena editor:
+
+- A dedicated Pre-laid mission tab now sits beside the live discovered map.
+- The pre-laid arena is a fixed horizontal rectangle, 4900 mm wide by 2400 mm
+  high by default.
+- Two fixed home bases are drawn on the left short side:
+  - green home base at the top-left;
+  - blue home base at the bottom-left.
+- The operator selects My home as Green or Blue. The other home base is drawn
+  with a red dashed overlay and labelled NO-GO ZONE. The path planner treats
+  that whole base plus robot clearance as forbidden space.
+- The operator can place and drag:
+  - the robot start position;
+  - real weight locations;
+  - dummy weight locations;
+  - walls;
+  - ramps;
+  - tubes.
+- Walls and ramps can be rotated 90 degrees with Rotate selected.
+- Selected non-start items can be deleted.
+- Start heading is selectable as East, South, West or North.
+- The whole editable layout is persisted in QSettings under
+  navigation/mission_layout so it survives GUI restarts.
+
+Path planning and obstacle handling:
+
+- PLAN ROUTE runs an A* grid planner in arena coordinates.
+- Robot radius is derived from the visible robot-width tuning value and the
+  planner safety inflation follows the visible gap-margin value.
+- The arena border, opponent home base, walls, ramps, tubes and dummy weights
+  are inflated by the robot footprint/safety margin and treated as no-go
+  geometry.
+- Real weights are goals, not obstacles.
+- The planner repeatedly evaluates the remaining real weights and chooses the
+  reachable next target with the lowest A* path cost, producing a complete
+  route through every real weight.
+- Grid paths are line-of-sight simplified before upload. This keeps waypoint
+  count low while retaining obstacle clearance.
+- If a start or real weight cannot be reached safely, the GUI refuses to upload
+  the mission and displays a ROUTE ERROR instead of producing a dangerous path.
+- Dummy weights are never marked as visit targets; they only influence path
+  clearance.
+- The planned route is drawn in cyan. Real-weight visit waypoints are numbered
+  on the route so the planned visit order is visible before the run.
+
+Robot path following / self correction:
+
+- When strategy 3 starts, the Teensy aligns the user-selected arena start
+  heading to the current valid BNO055 heading. It will hold the motors stopped
+  until a valid IMU sample exists.
+- Mission coordinates use +X to the right/east, +Y downward/south and clockwise
+  positive heading, matching the graphical editor and BNO055 yaw convention.
+- The Teensy maintains its own mission pose from calibrated encoder travel plus
+  BNO055 heading. Encoder 1 uses the currently established inverted sign and
+  encoder 2 the forward sign from the straight-run calibration.
+- For every update it recomputes the bearing from the estimated robot pose to
+  the active waypoint. This means the robot does not merely replay fixed motor
+  timings: lateral/heading error causes the requested heading to change and the
+  robot steers back toward the planned polyline.
+- Heading errors above 18 degrees use a point turn. Smaller errors use the
+  existing proportional differential driveOnHeading controller. Speed is
+  reduced near the waypoint.
+- Transit waypoints use a 120 mm arrival radius. Real-weight visit waypoints use
+  a tighter 100 mm arrival radius.
+- Live forward ranging remains a safety layer over the pre-laid map. If the
+  robot sees an unexpected blocked path and no confirmed matrix opening, it
+  holds position without aborting the mission. Once the live path clears it
+  resumes and again aims at the active waypoint.
+
+Mission completion and roaming handoff:
+
+- Arena View includes an After weights selector with Balanced, Gap explorer and
+  Conservative as fallback roaming modes.
+- Every uploaded waypoint corresponding to a real weight carries a target flag.
+- Firmware counts visited real-weight targets. As soon as every real weight has
+  been visited, it stops the mission follower, switches navigation.strategy to
+  the selected fallback roaming mode, enters seek_wall and continues with the
+  existing autonomous coverage behaviour.
+- The mission tab displays the live firmware mission pose and heading over the
+  pre-laid arena while a run is active.
+- Live status shows weights visited/total, waypoint progress and whether live
+  ranging is currently holding the route.
+
+New telemetry:
+
+- mission.plan_valid
+- mission.active
+- mission.waypoint_index
+- mission.waypoint_count
+- mission.targets_visited
+- mission.target_count
+- mission.pose_x_mm
+- mission.pose_y_mm
+- mission.heading_deg
+- mission.blocked
+- system.navigation_controller_version = 9
+
+Verification performed in this environment:
+
+- ArenaView.py passes Python py_compile.
+- The non-Qt MissionLayout/A* planner was executed directly with a synthetic
+  horizontal arena containing two real weights, one dummy weight and a wall.
+  It produced a valid obstacle-avoiding route containing exactly two target
+  visit waypoints.
+- A synthetic target inside unreachable border clearance correctly caused the
+  planner to reject the mission.
+- Home-base switching was checked: Green home makes Blue the no-go zone and
+  Blue home makes Green the no-go zone.
+- Firmware/header brace and parenthesis counts are balanced and the controller
+  version, mission state and mission command paths are present.
+- PlatformIO is not installed in the generation environment, so an actual
+  Teensy compile and physical mission run are still required.
+
+Required verification before a physical mission:
+
+1. Run the normal PlatformIO Teensy build and upload controller v9.
+2. Measure/set the real drive-wheel centre-to-centre track width before trusting
+   the drawn live/discovered map. This handoff deliberately does not guess a
+   replacement for the currently stored 40 mm value.
+3. In the Pre-laid mission tab select the correct home colour, drag the start to
+   the real starting position and set the actual starting cardinal heading.
+4. Place at least one real weight plus any dummy weights/walls/ramps/tubes, then
+   press PLAN ROUTE and visually inspect every cyan segment before running.
+5. Keep STOP ready for the first physical test. Begin with one or two weights
+   and a simple wall before testing a dense obstacle layout.
+6. During the run verify mission.pose_x_mm / mission.pose_y_mm and the cyan live
+   robot marker broadly agree with the physical chassis. Odometry calibration
+   errors will directly affect waypoint following.
+7. Confirm the final real weight changes mission.targets_visited to target_count
+   and that navigation then changes to the selected fallback roaming mode.
+
+
+
+2026-09-22 Pre-laid Mission Planner v10: placement guides, wall dimensions and live weight visibility
+---------------------------------------------------------------------------------------------------
+
+Base used:
+
+- This change was applied on top of the previously delivered/working pre-laid
+  mission v9 files, not on top of the older GitHub testing navigation source.
+- The existing v9 mission upload protocol, A* planner, waypoint follower,
+  live-obstacle hold behaviour, opponent-home no-go zone and fallback roaming
+  behaviour were retained.
+
+Mission Planner display/editor changes:
+
+- The pre-laid editor is now presented as its own `Mission Planner` sub-tab in
+  Arena View. Selecting it hides the live-map tuning panel, raw TOF panel and
+  right-side Arena inspector so the planner gets the full Arena View working
+  area.
+- The Mission Planner canvas now supports:
+  - mouse-wheel zoom;
+  - middle-button or right-button drag to pan;
+  - left-drag to move START, weights, dummy weights, walls, ramps and tubes;
+  - a Reset view button;
+  - live cursor x/y coordinates in arena millimetres.
+- Seven evenly-spaced dashed vertical placement reference lines are drawn across
+  the 4900 mm long arena. The lines divide the long dimension into eight equal
+  bays and are labelled L1..L7 with their x-coordinate. They are graphical
+  placement guides only and do not affect path planning.
+
+Obstacle dimensions and A* behaviour:
+
+- A selected wall/ramp/tube now has editable dimensions in the Mission Planner
+  inspector.
+- Wall and ramp dimensions are independently editable as length and
+  thickness/depth. Range limits are 50..4000 mm for length and 50..2400 mm for
+  thickness/depth.
+- Tube size is edited as its diameter; its two stored dimensions stay equal.
+- Wall/ramp rotation by 90 degrees is retained.
+- Obstacle dimensions are saved in the persisted mission layout.
+- Changing an obstacle dimension invalidates the previous route. If a route was
+  already present, the GUI immediately replans it.
+- The existing A* occupancy test already uses each obstacle's real rectangle or
+  tube radius. It also inflates walls/ramps/tubes, dummy weights, the arena
+  border and the opponent home by robot radius + configured safety margin.
+  Therefore the displayed route now explicitly recalculates around different
+  wall lengths/thicknesses rather than treating every wall as a fixed-size icon.
+- Synthetic planner verification passed with a resized 180 x 800 mm wall and a
+  tube between START and two real weight targets. The returned route deviated
+  around the inflated wall rather than crossing it.
+
+Live weight-visibility confirmation:
+
+- Navigation controller telemetry version is now 10.
+- Firmware now publishes:
+  - `weight.detected`
+  - `weight.sector_mask`
+  - `weight.nearest_mm`
+  - `weight.direction`
+- Weight visibility is calculated from four matched bottom/top point-TOF pairs:
+  far-left, mid-left, mid-right and far-right.
+- A sector becomes a weight candidate when its bottom TOF sees an object from
+  30..1200 mm and the matching top TOF sees at least 150 mm farther away.
+- A sector must satisfy that condition for three fresh 100 ms point-TOF polls
+  before it becomes visible. Re-reading one sample in the fast loop cannot
+  produce a three-sample confirmation.
+- Direction telemetry values are -2 far-left, -1 mid-left, +1 mid-right and +2
+  far-right. The nearest confirmed sector supplies `weight.nearest_mm`.
+- Mission Planner displays an always-visible status card:
+  - WEIGHT VISIBLE with range/direction/active sectors; or
+  - NO WEIGHT CURRENTLY VISIBLE.
+- While mission pose telemetry is available, the planner also draws the four
+  weight-sensor sector rays from the live robot pose. Active sectors are green.
+- If a visible sector geometrically agrees with a planned real weight, that
+  planned weight receives a green highlight ring. This is an operator aid only;
+  it does not silently move or reclassify a planned weight.
+
+Files changed:
+
+- `PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp`
+- `PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h`
+- `Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py`
+
+Verification completed here:
+
+- `ArenaView.py` passes Python `py_compile`.
+- MissionLayout was extracted and exercised independently of PyQt6.
+- A* successfully planned around a resized wall/tube layout and retained seven
+  placement reference lines.
+- C++ and header brace/parenthesis counts are balanced.
+- Expected v10 firmware tokens and weight-detection function/members are present.
+
+Not verified here:
+
+- PyQt6 is not installed in this environment, so the complete GUI regression
+  suite could not be run.
+- PlatformIO/Teensy toolchain is not installed here, so firmware v10 was not
+  compiled in this environment.
+- Physical weight visibility should be checked against the actual fitted outer
+  and middle TOF angles before relying on the green planned-weight highlight.

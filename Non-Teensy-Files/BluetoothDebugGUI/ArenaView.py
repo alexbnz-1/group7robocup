@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import json
 import re
+import heapq
 from collections import deque
 from pathlib import Path
 
@@ -44,7 +45,7 @@ class ArenaModel:
         self.left_angle_deg = 90.0
         self.matrix_fov_deg = 60.0  # user-adjustable estimate, not a sensor spec
         self.matrix_floor_rows = 2
-        self.matrix_mirrored = False
+        self.matrix_mirrored = True
         self.sensor_specs = [
             {"name": "front", "angle": 0.0, "x": 0.0, "y": 0.0, "port": "XSHUT1"},
             {"name": "left", "angle": 90.0, "x": 0.0, "y": 0.0, "port": "XSHUT2"},
@@ -481,12 +482,7 @@ class ArenaModel:
     @staticmethod
     def _make_wall_track(orientation, coordinate, tangent, observations=0,
                          sources=None, boundary=None, kind="internal",
-                         boundary_blocked=False, verification_tokens=None,
-                         locked=False):
-        verification_tokens = deque(
-            (() if verification_tokens is None else verification_tokens),
-            maxlen=24,
-        )
+                         boundary_blocked=False):
         return {
             "boundary": boundary,
             "kind": kind,
@@ -497,37 +493,11 @@ class ArenaModel:
             "maximum": tangent,
             "observations": observations,
             "sources": set() if sources is None else set(sources),
-            # Geometry is immutable after three independent sensor frames
-            # agree.  Raw hit count is insufficient because adjacent 8x8
-            # columns from one frame can all support the same plane.
-            "verification_tokens": verification_tokens,
-            "locked": bool(locked or len(set(verification_tokens)) >= 3),
             # A line physically crossed by the chassis must not immediately be
             # promoted back into an arena boundary simply because its surviving
             # pieces are long.
             "boundary_blocked": bool(boundary_blocked),
         }
-
-    def _wall_verification_token(self, source):
-        """Identify the independent sensor frame supporting a wall hit."""
-        if source == "8x8" and self.last_matrix_frame is not None:
-            return ("matrix", self.last_matrix_frame)
-        if self._frame_time is not None:
-            return ("telemetry", self._frame_time)
-        # Direct/synthetic observations still need independent identities.
-        return ("observation", self.wall_evidence_serial)
-
-    @staticmethod
-    def _add_wall_verification(track, tokens):
-        existing = track.setdefault("verification_tokens", deque(maxlen=24))
-        if not isinstance(existing, deque):
-            existing = deque(existing, maxlen=24)
-            track["verification_tokens"] = existing
-        for token in tokens or ():
-            if token not in existing:
-                existing.append(token)
-        if len(set(existing)) >= 3:
-            track["locked"] = True
 
     @staticmethod
     def _wall_geometry(target, world_angle):
@@ -630,7 +600,6 @@ class ArenaModel:
                 "cells": set(),
                 "last_seen": serial,
                 "promoted": False,
-                "verification_tokens": deque(maxlen=24),
             }
             self.wall_evidence_clusters.append(cluster)
 
@@ -644,9 +613,6 @@ class ArenaModel:
         cluster["sources"].add(source)
         cluster["cells"].add(cell)
         cluster["last_seen"] = serial
-        token = self._wall_verification_token(source)
-        if token not in cluster["verification_tokens"]:
-            cluster["verification_tokens"].append(token)
 
         # A point TOF needs several temporally-confirmed observations. A coherent
         # 8x8 surface can accumulate the same score faster because adjacent matrix
@@ -666,7 +632,6 @@ class ArenaModel:
             observations=max(3, int(round(cluster["score"]))),
             sources=cluster["sources"],
             minimum=cluster["minimum"], maximum=cluster["maximum"],
-            verification_tokens=cluster["verification_tokens"],
         )
         # Persistent geometry now owns this evidence; discard the temporary
         # cluster so it cannot grow without bound or be counted twice.
@@ -676,8 +641,7 @@ class ArenaModel:
     def _merge_internal_wall_observation(self, orientation, coordinate, tangent,
                                          source, observations=1, sources=None,
                                          minimum=None, maximum=None,
-                                         boundary_blocked=False,
-                                         verification_tokens=None):
+                                         boundary_blocked=False):
         """Merge confirmed non-boundary evidence into stable internal segments."""
         minimum = tangent if minimum is None else minimum
         maximum = tangent if maximum is None else maximum
@@ -698,17 +662,15 @@ class ArenaModel:
                     boundary_matches,
                     key=lambda item: abs(item["coordinate"] - coordinate)
                 )
-                if not wall.get("locked", False):
-                    wall["coordinates"].append(coordinate)
-                    ordered = sorted(wall["coordinates"])
-                    wall["coordinate"] = ordered[len(ordered) // 2]
+                wall["coordinates"].append(coordinate)
+                ordered = sorted(wall["coordinates"])
+                wall["coordinate"] = ordered[len(ordered) // 2]
                 wall["minimum"] = min(wall["minimum"], minimum)
                 wall["maximum"] = max(wall["maximum"], maximum)
                 wall["observations"] += observations
                 wall["sources"].add(source)
                 if sources:
                     wall["sources"].update(sources)
-                self._add_wall_verification(wall, verification_tokens)
                 return wall
 
         nearby = [
@@ -731,21 +693,18 @@ class ArenaModel:
             track = self._make_wall_track(
                 orientation, coordinate, tangent, kind="internal",
                 boundary_blocked=boundary_blocked,
-                verification_tokens=verification_tokens,
             )
             self.internal_wall_tracks.append(track)
 
-        if not track.get("locked", False):
-            track["coordinates"].append(coordinate)
-            ordered = sorted(track["coordinates"])
-            track["coordinate"] = ordered[len(ordered) // 2]
+        track["coordinates"].append(coordinate)
+        ordered = sorted(track["coordinates"])
+        track["coordinate"] = ordered[len(ordered) // 2]
         track["minimum"] = min(track["minimum"], minimum)
         track["maximum"] = max(track["maximum"], maximum)
         track["observations"] += observations
         track["sources"].add(source)
         if sources:
             track["sources"].update(sources)
-        self._add_wall_verification(track, verification_tokens)
         track["boundary_blocked"] = (
             track.get("boundary_blocked", False) or boundary_blocked
         )
@@ -772,27 +731,13 @@ class ArenaModel:
                     )
                     if gap > 350.0:
                         continue
-                    if second.get("locked", False) and not first.get("locked", False):
-                        first["coordinate"] = second["coordinate"]
-                        first["coordinates"] = deque(
-                            second.get("coordinates", [second["coordinate"]]),
-                            maxlen=41,
-                        )
-                    elif not first.get("locked", False):
-                        first["coordinates"].extend(second["coordinates"])
-                        ordered = sorted(first["coordinates"])
-                        first["coordinate"] = ordered[len(ordered) // 2]
+                    first["coordinates"].extend(second["coordinates"])
+                    ordered = sorted(first["coordinates"])
+                    first["coordinate"] = ordered[len(ordered) // 2]
                     first["minimum"] = min(first["minimum"], second["minimum"])
                     first["maximum"] = max(first["maximum"], second["maximum"])
                     first["observations"] += second["observations"]
                     first["sources"].update(second["sources"])
-                    self._add_wall_verification(
-                        first, second.get("verification_tokens", ())
-                    )
-                    first["locked"] = (
-                        first.get("locked", False) or
-                        second.get("locked", False)
-                    )
                     first["boundary_blocked"] = (
                         first.get("boundary_blocked", False) or
                         second.get("boundary_blocked", False)
@@ -854,22 +799,10 @@ class ArenaModel:
                     existing["maximum"] = max(existing["maximum"], track["maximum"])
                     existing["observations"] += track["observations"]
                     existing["sources"].update(track["sources"])
-                    self._add_wall_verification(
-                        existing, track.get("verification_tokens", ())
-                    )
-                    existing["locked"] = (
-                        existing.get("locked", False) or
-                        track.get("locked", False)
-                    )
                     self.internal_wall_tracks.remove(track)
                     continue
                 if not self._wall_is_more_outward(
                         boundary, track["coordinate"], existing["coordinate"]):
-                    continue
-                # A verified physical wall is a permanent landmark. Pose drift
-                # may later project a parallel candidate farther outward, but
-                # it must not erase or replace the already locked boundary.
-                if existing.get("locked", False):
                     continue
                 # A stronger/farther long wall replaces the earlier boundary.
                 # Demote the old line directly and block immediate re-promotion;
@@ -967,9 +900,6 @@ class ArenaModel:
 
         rebuilt_internal = []
         for track in self.internal_wall_tracks:
-            if track.get("locked", False):
-                rebuilt_internal.append(track)
-                continue
             tangent = crossing_tangent(track)
             if (tangent is None or
                     tangent < track["minimum"] - 220.0 or
@@ -983,8 +913,6 @@ class ArenaModel:
                     observations=track["observations"],
                     sources=track["sources"], kind="internal",
                     boundary_blocked=True,
-                    verification_tokens=track.get("verification_tokens", ()),
-                    locked=track.get("locked", False),
                 )
                 piece["minimum"] = minimum
                 piece["maximum"] = maximum
@@ -994,9 +922,6 @@ class ArenaModel:
 
         rebuilt_boundaries = []
         for track in self.wall_tracks:
-            if track.get("locked", False):
-                rebuilt_boundaries.append(track)
-                continue
             tangent = crossing_tangent(track)
             if (tangent is None or
                     tangent < track["minimum"] - 220.0 or
@@ -1011,14 +936,12 @@ class ArenaModel:
                     sources=track["sources"],
                     minimum=minimum, maximum=maximum,
                     boundary_blocked=True,
-                    verification_tokens=track.get("verification_tokens", ()),
                 )
         self.wall_tracks = rebuilt_boundaries
 
     def _record_wall_observation(self, target, ray_angle_deg, source,
                                  observations=1, sources=None,
-                                 minimum=None, maximum=None,
-                                 verification_tokens=None):
+                                 minimum=None, maximum=None):
         """Store only fused wall evidence; external classification happens later."""
         world_angle = self.theta + math.radians(ray_angle_deg)
         orientation, coordinate, tangent = self._wall_geometry(target, world_angle)
@@ -1026,7 +949,6 @@ class ArenaModel:
             orientation, coordinate, tangent, source,
             observations=observations, sources=sources,
             minimum=minimum, maximum=maximum,
-            verification_tokens=verification_tokens,
         )
 
     def _add_observation(self, distance_mm, angle_deg, source, lateral_mm=0.0,
@@ -1226,6 +1148,679 @@ class ArenaModel:
             )
 
 
+
+class MissionLayout:
+    """Editable pre-laid arena and grid/A* mission planner."""
+
+    WIDTH_MM = 4900.0
+    HEIGHT_MM = 2400.0
+    HOME_WIDTH_MM = 650.0
+    HOME_HEIGHT_MM = 650.0
+    ROBOT_RADIUS_MM = 215.0
+    SAFETY_MARGIN_MM = 90.0
+    GRID_MM = 100.0
+    MAX_ROUTE_POINTS = 64
+    REFERENCE_LINE_COUNT = 7
+
+    DEFAULT_SIZES = {
+        "wall": (700.0, 110.0),
+        "ramp": (700.0, 380.0),
+        "tube": (320.0, 320.0),
+    }
+
+    def __init__(self):
+        self.my_home = "green"
+        self.fallback_strategy = 0
+        self.start = {"x": 325.0, "y": 325.0, "heading_deg": 0.0}
+        self.weights = []
+        self.obstacles = []
+        self.route = []
+        self.route_error = ""
+        self._next_id = 1
+
+    def _id(self):
+        value = self._next_id
+        self._next_id += 1
+        return value
+
+    def home_rect(self, colour):
+        if colour == "green":
+            return (0.0, 0.0, self.HOME_WIDTH_MM, self.HOME_HEIGHT_MM)
+        return (0.0, self.HEIGHT_MM - self.HOME_HEIGHT_MM,
+                self.HOME_WIDTH_MM, self.HEIGHT_MM)
+
+    def no_go_home(self):
+        return self.home_rect("blue" if self.my_home == "green" else "green")
+
+    def add_weight(self, x, y, dummy=False):
+        item = {"id": self._id(), "x": float(x), "y": float(y),
+                "dummy": bool(dummy)}
+        self.weights.append(item)
+        self.route = []
+        return item
+
+    def add_obstacle(self, kind, x, y):
+        if kind not in self.DEFAULT_SIZES:
+            raise ValueError(kind)
+        width, height = self.DEFAULT_SIZES[kind]
+        item = {"id": self._id(), "kind": kind, "x": float(x), "y": float(y),
+                "w": width, "h": height, "rotation": 0}
+        self.obstacles.append(item)
+        self.route = []
+        return item
+
+    def move_item(self, item_id, x, y):
+        if item_id == "start":
+            self.start["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
+            self.start["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
+            self.route = []
+            return True
+        for collection in (self.weights, self.obstacles):
+            for item in collection:
+                if item["id"] == item_id:
+                    item["x"] = max(0.0, min(self.WIDTH_MM, float(x)))
+                    item["y"] = max(0.0, min(self.HEIGHT_MM, float(y)))
+                    self.route = []
+                    return True
+        return False
+
+    def delete_item(self, item_id):
+        for collection in (self.weights, self.obstacles):
+            for index, item in enumerate(collection):
+                if item["id"] == item_id:
+                    del collection[index]
+                    self.route = []
+                    return True
+        return False
+
+    def rotate_item(self, item_id):
+        for item in self.obstacles:
+            if item["id"] == item_id and item["kind"] in ("wall", "ramp"):
+                item["rotation"] = (int(item.get("rotation", 0)) + 90) % 180
+                self.route = []
+                return True
+        return False
+
+    def set_obstacle_size(self, item_id, width_mm, height_mm):
+        for item in self.obstacles:
+            if item["id"] != item_id:
+                continue
+            width = max(50.0, min(4000.0, float(width_mm)))
+            height = max(50.0, min(2400.0, float(height_mm)))
+            item["w"] = width
+            item["h"] = width if item["kind"] == "tube" else height
+            self.route = []
+            return True
+        return False
+
+    @staticmethod
+    def _inflate_rect(rect, amount):
+        x0, y0, x1, y1 = rect
+        return (x0 - amount, y0 - amount, x1 + amount, y1 + amount)
+
+    @staticmethod
+    def _inside_rect(x, y, rect):
+        x0, y0, x1, y1 = rect
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _obstacle_rect(self, item):
+        width, height = item["w"], item["h"]
+        if int(item.get("rotation", 0)) % 180 == 90:
+            width, height = height, width
+        return (item["x"] - width / 2, item["y"] - height / 2,
+                item["x"] + width / 2, item["y"] + height / 2)
+
+    def blocked(self, x, y, extra=0.0):
+        clearance = self.ROBOT_RADIUS_MM + self.SAFETY_MARGIN_MM + extra
+        if (x < clearance or y < clearance or
+                x > self.WIDTH_MM - clearance or
+                y > self.HEIGHT_MM - clearance):
+            return True
+        if self._inside_rect(x, y, self._inflate_rect(self.no_go_home(), clearance)):
+            return True
+        for item in self.obstacles:
+            if item["kind"] == "tube":
+                radius = item["w"] / 2 + clearance
+                if math.hypot(x - item["x"], y - item["y"]) <= radius:
+                    return True
+            elif self._inside_rect(x, y, self._inflate_rect(
+                    self._obstacle_rect(item), clearance)):
+                return True
+        for item in self.weights:
+            if not item["dummy"]:
+                continue
+            if math.hypot(x - item["x"], y - item["y"]) <= 120.0 + clearance:
+                return True
+        return False
+
+    def _segment_clear(self, first, second):
+        x0, y0 = first
+        x1, y1 = second
+        distance = math.hypot(x1 - x0, y1 - y0)
+        samples = max(1, math.ceil(distance / 45.0))
+        for index in range(samples + 1):
+            t = index / samples
+            if self.blocked(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t):
+                return False
+        return True
+
+    def _nearest_free_grid(self, point):
+        spacing = self.GRID_MM
+        gx = int(round(point[0] / spacing))
+        gy = int(round(point[1] / spacing))
+        if not self.blocked(gx * spacing, gy * spacing):
+            return gx, gy
+        for radius in range(1, 8):
+            candidates = []
+            for dx in range(-radius, radius + 1):
+                for dy in (-radius, radius):
+                    candidates.append((gx + dx, gy + dy))
+            for dy in range(-radius + 1, radius):
+                for dx in (-radius, radius):
+                    candidates.append((gx + dx, gy + dy))
+            candidates.sort(key=lambda p: math.hypot(
+                p[0] * spacing - point[0], p[1] * spacing - point[1]))
+            for candidate in candidates:
+                x, y = candidate[0] * spacing, candidate[1] * spacing
+                if 0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM and not self.blocked(x, y):
+                    return candidate
+        return None
+
+    def _astar(self, start, goal):
+        start_cell = self._nearest_free_grid(start)
+        goal_cell = self._nearest_free_grid(goal)
+        if start_cell is None or goal_cell is None:
+            return None
+        spacing = self.GRID_MM
+        neighbours = [
+            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+            (-1, -1, math.sqrt(2)), (-1, 1, math.sqrt(2)),
+            (1, -1, math.sqrt(2)), (1, 1, math.sqrt(2)),
+        ]
+        queue = [(0.0, start_cell)]
+        g_score = {start_cell: 0.0}
+        parent = {}
+        closed = set()
+        while queue:
+            _priority, current = heapq.heappop(queue)
+            if current in closed:
+                continue
+            if current == goal_cell:
+                break
+            closed.add(current)
+            for dx, dy, cost in neighbours:
+                nxt = (current[0] + dx, current[1] + dy)
+                x, y = nxt[0] * spacing, nxt[1] * spacing
+                if not (0 <= x <= self.WIDTH_MM and 0 <= y <= self.HEIGHT_MM):
+                    continue
+                if self.blocked(x, y):
+                    continue
+                tentative = g_score[current] + cost
+                if tentative >= g_score.get(nxt, float("inf")):
+                    continue
+                g_score[nxt] = tentative
+                parent[nxt] = current
+                heuristic = math.hypot(goal_cell[0] - nxt[0], goal_cell[1] - nxt[1])
+                heapq.heappush(queue, (tentative + heuristic, nxt))
+        if goal_cell not in g_score:
+            return None
+        cells = [goal_cell]
+        while cells[-1] != start_cell:
+            cells.append(parent[cells[-1]])
+        cells.reverse()
+        path = [(cell[0] * spacing, cell[1] * spacing) for cell in cells]
+        if self._segment_clear(start, path[0]):
+            path[0] = (float(start[0]), float(start[1]))
+        if self._segment_clear(path[-1], goal):
+            path[-1] = (float(goal[0]), float(goal[1]))
+        return self._smooth(path)
+
+    def _smooth(self, path):
+        if not path:
+            return []
+        result = [path[0]]
+        anchor = 0
+        while anchor < len(path) - 1:
+            furthest = anchor + 1
+            for candidate in range(len(path) - 1, anchor, -1):
+                if self._segment_clear(path[anchor], path[candidate]):
+                    furthest = candidate
+                    break
+            result.append(path[furthest])
+            anchor = furthest
+        return result
+
+    @staticmethod
+    def _path_length(path):
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                   for a, b in zip(path, path[1:]))
+
+    def plan(self):
+        self.route = []
+        self.route_error = ""
+        real_weights = [item for item in self.weights if not item["dummy"]]
+        if not real_weights:
+            self.route_error = "Add at least one real weight location."
+            return False
+        current = (self.start["x"], self.start["y"])
+        if self.blocked(*current):
+            self.route_error = "Start position is inside a border/no-go/obstacle clearance."
+            return False
+        remaining = list(real_weights)
+        route = []
+        while remaining:
+            options = []
+            for item in remaining:
+                weight = (item["x"], item["y"])
+                visit = weight
+                if self.blocked(*visit):
+                    free_cell = self._nearest_free_grid(weight)
+                    if free_cell is None:
+                        continue
+                    visit = (free_cell[0] * self.GRID_MM,
+                             free_cell[1] * self.GRID_MM)
+                    # Firmware treats a real target as visited at <=100 mm. A
+                    # farther approach point would falsely mark an unreachable
+                    # weight as collected.
+                    if math.hypot(visit[0] - weight[0],
+                                  visit[1] - weight[1]) > 80.0:
+                        continue
+                path = self._astar(current, visit)
+                if path:
+                    options.append((self._path_length(path), item, path, visit))
+            if not options:
+                self.route_error = "At least one real weight is unreachable with the current obstacles/no-go zone."
+                return False
+            _cost, chosen, path, visit = min(options, key=lambda value: value[0])
+            for point in path[1:]:
+                route.append({"x": point[0], "y": point[1], "target": False})
+            if not route or math.hypot(route[-1]["x"] - visit[0],
+                                       route[-1]["y"] - visit[1]) > 1.0:
+                route.append({"x": visit[0], "y": visit[1], "target": True})
+            else:
+                route[-1]["target"] = True
+                route[-1]["x"], route[-1]["y"] = visit
+            current = visit
+            remaining.remove(chosen)
+        if len(route) > self.MAX_ROUTE_POINTS:
+            self.route_error = f"Planned route has {len(route)} points; simplify the layout to <= {self.MAX_ROUTE_POINTS}."
+            return False
+        self.route = route
+        return True
+
+    def command_payload(self):
+        points = []
+        for point in self.route:
+            points.extend([int(round(point["x"])), int(round(point["y"])),
+                           1 if point.get("target") else 0])
+        return {
+            "start_x_mm": int(round(self.start["x"])),
+            "start_y_mm": int(round(self.start["y"])),
+            "start_heading_deg": int(round(self.start["heading_deg"])) % 360,
+            "fallback_strategy": int(self.fallback_strategy),
+            "points": points,
+        }
+
+    def to_dict(self):
+        return {
+            "my_home": self.my_home,
+            "fallback_strategy": self.fallback_strategy,
+            "start": self.start,
+            "weights": self.weights,
+            "obstacles": self.obstacles,
+            "next_id": self._next_id,
+        }
+
+    def load_dict(self, data):
+        if not isinstance(data, dict):
+            return
+        if data.get("my_home") in ("green", "blue"):
+            self.my_home = data["my_home"]
+        self.fallback_strategy = max(0, min(2, int(data.get("fallback_strategy", 0))))
+        start = data.get("start", {})
+        self.start = {
+            "x": float(start.get("x", 325.0)),
+            "y": float(start.get("y", 325.0)),
+            "heading_deg": float(start.get("heading_deg", 0.0)) % 360.0,
+        }
+        self.weights = [dict(item) for item in data.get("weights", []) if isinstance(item, dict)]
+        self.obstacles = [dict(item) for item in data.get("obstacles", []) if isinstance(item, dict)]
+        self._next_id = max(int(data.get("next_id", 1)),
+                            1 + max([0] + [int(item.get("id", 0)) for item in self.weights + self.obstacles]))
+        self.route = []
+
+
+class MissionLayoutCanvas(QWidget):
+    layout_changed = pyqtSignal()
+    selection_changed = pyqtSignal(object)
+    cursor_moved = pyqtSignal(float, float)
+
+    def __init__(self, layout_model, live_model, parent=None):
+        super().__init__(parent)
+        self.layout_model = layout_model
+        self.live_model = live_model
+        self.setMinimumSize(760, 430)
+        self.setMouseTracking(True)
+        self.add_mode = None
+        self.selected_id = "start"
+        self._dragging = False
+        self._panning = False
+        self._pan_at = None
+        self.zoom = 1.0
+        self.pan = QPointF(0.0, 0.0)
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.pan = QPointF(0.0, 0.0)
+        self.update()
+
+    def set_add_mode(self, mode):
+        self.add_mode = mode
+        self.update()
+
+    def _transform(self):
+        margin = 48.0
+        base_scale = min(
+            max(0.001, (self.width() - 2 * margin) / self.layout_model.WIDTH_MM),
+            max(0.001, (self.height() - 2 * margin) / self.layout_model.HEIGHT_MM),
+        )
+        scale = base_scale * self.zoom
+        ox = (self.width() - self.layout_model.WIDTH_MM * scale) / 2 + self.pan.x()
+        oy = (self.height() - self.layout_model.HEIGHT_MM * scale) / 2 + self.pan.y()
+        return scale, ox, oy
+
+    def _screen(self, x, y):
+        scale, ox, oy = self._transform()
+        return QPointF(ox + x * scale, oy + y * scale)
+
+    def _world(self, point):
+        scale, ox, oy = self._transform()
+        return ((point.x() - ox) / scale, (point.y() - oy) / scale)
+
+    def wheelEvent(self, event):
+        before = self._world(event.position())
+        old_zoom = self.zoom
+        self.zoom = min(8.0, max(0.75, old_zoom *
+                        (1.20 if event.angleDelta().y() > 0 else 1 / 1.20)))
+        if abs(self.zoom - old_zoom) < 1e-9:
+            return
+        after = self._screen(*before)
+        self.pan += event.position() - after
+        self.update()
+
+    def _nearest_item(self, position):
+        candidates = [("start", self.layout_model.start["x"], self.layout_model.start["y"])]
+        candidates += [(item["id"], item["x"], item["y"])
+                       for item in self.layout_model.weights]
+        candidates += [(item["id"], item["x"], item["y"])
+                       for item in self.layout_model.obstacles]
+        if not candidates:
+            return None
+        ident, x, y = min(
+            candidates,
+            key=lambda item: (position - self._screen(item[1], item[2])).manhattanLength(),
+        )
+        return ident if (position - self._screen(x, y)).manhattanLength() <= 40 else None
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._panning = True
+            self._pan_at = event.position()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = self._world(event.position())
+        x = max(0.0, min(self.layout_model.WIDTH_MM, x))
+        y = max(0.0, min(self.layout_model.HEIGHT_MM, y))
+        if self.add_mode:
+            if self.add_mode == "start":
+                self.layout_model.move_item("start", x, y)
+                self.selected_id = "start"
+            elif self.add_mode == "weight":
+                self.selected_id = self.layout_model.add_weight(x, y, False)["id"]
+            elif self.add_mode == "dummy":
+                self.selected_id = self.layout_model.add_weight(x, y, True)["id"]
+            else:
+                self.selected_id = self.layout_model.add_obstacle(self.add_mode, x, y)["id"]
+            self.add_mode = None
+            self.selection_changed.emit(self.selected_id)
+            self.layout_changed.emit()
+            self.update()
+            return
+        selected = self._nearest_item(event.position())
+        if selected is not None:
+            self.selected_id = selected
+            self._dragging = True
+            self.selection_changed.emit(selected)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        x, y = self._world(event.position())
+        self.cursor_moved.emit(x, y)
+        if self._panning and self._pan_at is not None:
+            self.pan += event.position() - self._pan_at
+            self._pan_at = event.position()
+            self.update()
+            return
+        if not self._dragging or self.selected_id is None:
+            return
+        x = max(0.0, min(self.layout_model.WIDTH_MM, x))
+        y = max(0.0, min(self.layout_model.HEIGHT_MM, y))
+        self.layout_model.move_item(self.selected_id, x, y)
+        self.layout_changed.emit()
+        self.update()
+
+    def mouseReleaseEvent(self, _event):
+        self._dragging = False
+        self._panning = False
+        self._pan_at = None
+
+    def delete_selected(self):
+        if self.selected_id == "start":
+            return
+        if self.layout_model.delete_item(self.selected_id):
+            self.selected_id = None
+            self.selection_changed.emit(None)
+            self.layout_changed.emit()
+            self.update()
+
+    def rotate_selected(self):
+        if self.layout_model.rotate_item(self.selected_id):
+            self.layout_changed.emit()
+            self.selection_changed.emit(self.selected_id)
+            self.update()
+
+    @staticmethod
+    def _signed_angle_delta(target_deg, current_deg):
+        return (target_deg - current_deg + 180.0) % 360.0 - 180.0
+
+    def _likely_visible_planned_weight(self):
+        if self.live_model.latest.get("weight.detected") is not True:
+            return None
+        robot_x = _number(self.live_model.latest.get("mission.pose_x_mm"))
+        robot_y = _number(self.live_model.latest.get("mission.pose_y_mm"))
+        robot_heading = _number(self.live_model.latest.get("mission.heading_deg"))
+        nearest_mm = _number(self.live_model.latest.get("weight.nearest_mm"))
+        direction = int(_number(self.live_model.latest.get("weight.direction")) or 0)
+        if None in (robot_x, robot_y, robot_heading):
+            return None
+        sector_centre = {-2: -38.0, -1: -13.0, 1: 13.0, 2: 38.0}.get(direction, 0.0)
+        best = None
+        for item in self.layout_model.weights:
+            if item.get("dummy"):
+                continue
+            dx = item["x"] - robot_x
+            dy = item["y"] - robot_y
+            distance = math.hypot(dx, dy)
+            if distance > 1450.0:
+                continue
+            bearing = math.degrees(math.atan2(dy, dx)) % 360.0
+            error = abs(self._signed_angle_delta(bearing, robot_heading) - sector_centre)
+            if error > 28.0:
+                continue
+            range_error = abs(distance - nearest_mm) if nearest_mm not in (None, 0) else 0.0
+            score = error * 12.0 + range_error
+            if best is None or score < best[0]:
+                best = (score, item)
+        return None if best is None else best[1]
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor("#111827"))
+        model = self.layout_model
+        scale, ox, oy = self._transform()
+        arena = QRectF(ox, oy, model.WIDTH_MM * scale, model.HEIGHT_MM * scale)
+        p.setPen(QPen(QColor("#f8fafc"), 4))
+        p.setBrush(QColor("#182231"))
+        p.drawRect(arena)
+
+        def rect_world(rect):
+            x0, y0, x1, y1 = rect
+            return QRectF(self._screen(x0, y0), self._screen(x1, y1)).normalized()
+
+        # Seven placement references split 4.9 m into eight equal bays.
+        p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
+        for index in range(1, model.REFERENCE_LINE_COUNT + 1):
+            x = model.WIDTH_MM * index / (model.REFERENCE_LINE_COUNT + 1)
+            top = self._screen(x, 0.0)
+            bottom = self._screen(x, model.HEIGHT_MM)
+            p.drawLine(top, bottom)
+            p.setPen(QColor("#94a3b8"))
+            p.drawText(QRectF(top.x() - 48, top.y() + 3, 96, 20),
+                       Qt.AlignmentFlag.AlignCenter,
+                       f"L{index}  {x:.0f} mm")
+            p.setPen(QPen(QColor(148, 163, 184, 120), 1, Qt.PenStyle.DashLine))
+
+        for colour, fill, text in (("green", "#166534", "GREEN HOME"),
+                                   ("blue", "#1d4ed8", "BLUE HOME")):
+            rect = rect_world(model.home_rect(colour))
+            p.setPen(QPen(QColor("#86efac" if colour == "green" else "#93c5fd"), 2))
+            p.setBrush(QColor(fill))
+            p.drawRect(rect)
+            p.setPen(QColor("#f8fafc"))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            if colour != model.my_home:
+                p.setPen(QPen(QColor("#ef4444"), 3, Qt.PenStyle.DashLine))
+                p.setBrush(QColor(127, 29, 29, 90))
+                p.drawRect(rect)
+                p.drawText(rect.adjusted(0, 22, 0, 0),
+                           Qt.AlignmentFlag.AlignCenter, "NO-GO ZONE")
+
+        if model.route:
+            points = ([self._screen(model.start["x"], model.start["y"])] +
+                      [self._screen(point["x"], point["y"])
+                       for point in model.route])
+            p.setPen(QPen(QColor("#22d3ee"), 4, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPolyline(QPolygonF(points))
+            visit_number = 0
+            for point in model.route:
+                if not point.get("target"):
+                    continue
+                visit_number += 1
+                centre = self._screen(point["x"], point["y"])
+                p.setPen(QPen(QColor("#f8fafc"), 2))
+                p.setBrush(QColor("#0891b2"))
+                p.drawEllipse(centre, 9, 9)
+                p.drawText(QRectF(centre.x() - 12, centre.y() - 25, 24, 18),
+                           Qt.AlignmentFlag.AlignCenter, str(visit_number))
+
+        for item in model.obstacles:
+            selected = item["id"] == self.selected_id
+            colour = {"wall": "#9ca3af", "ramp": "#f59e0b", "tube": "#a78bfa"}[item["kind"]]
+            p.setPen(QPen(QColor("#ffffff" if selected else colour), 3 if selected else 2))
+            p.setBrush(QColor(colour))
+            if item["kind"] == "tube":
+                radius = item["w"] / 2 * scale
+                p.drawEllipse(self._screen(item["x"], item["y"]), radius, radius)
+            else:
+                x0, y0, x1, y1 = model._obstacle_rect(item)
+                p.drawRect(rect_world((x0, y0, x1, y1)))
+            centre = self._screen(item["x"], item["y"])
+            p.setPen(QColor("#111827"))
+            size_text = (f"Ø{item['w']:.0f}" if item["kind"] == "tube" else
+                         f"{item['w']:.0f}×{item['h']:.0f}")
+            p.drawText(QRectF(centre.x() - 80, centre.y() - 17, 160, 34),
+                       Qt.AlignmentFlag.AlignCenter,
+                       f"{item['kind'].upper()}\n{size_text} mm")
+
+        likely_weight = self._likely_visible_planned_weight()
+        for index, item in enumerate(model.weights, 1):
+            centre = self._screen(item["x"], item["y"])
+            selected = item["id"] == self.selected_id
+            colour = QColor("#6b7280" if item["dummy"] else "#facc15")
+            if item is likely_weight:
+                p.setPen(QPen(QColor("#22c55e"), 6))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(centre, 20, 20)
+            p.setPen(QPen(QColor("#ffffff") if selected else colour, 3 if selected else 2))
+            p.setBrush(colour)
+            radius = 14 if item["dummy"] else 12
+            p.drawEllipse(centre, radius, radius)
+            p.setPen(QColor("#111827"))
+            p.drawText(QRectF(centre.x() - 16, centre.y() - 9, 32, 18),
+                       Qt.AlignmentFlag.AlignCenter,
+                       "D" if item["dummy"] else str(index))
+
+        start = self._screen(model.start["x"], model.start["y"])
+        heading = math.radians(model.start["heading_deg"])
+        nose = QPointF(start.x() + 24 * math.cos(heading),
+                       start.y() + 24 * math.sin(heading))
+        p.setPen(QPen(QColor("#67e8f9"), 3))
+        p.setBrush(QColor("#0891b2"))
+        p.drawEllipse(start, 11, 11)
+        p.drawLine(start, nose)
+        p.drawText(QRectF(start.x() + 13, start.y() - 18, 70, 22),
+                   Qt.AlignmentFlag.AlignLeft, "START")
+
+        robot_x = _number(self.live_model.latest.get("mission.pose_x_mm"))
+        robot_y = _number(self.live_model.latest.get("mission.pose_y_mm"))
+        robot_heading = _number(self.live_model.latest.get("mission.heading_deg"))
+        weight_detected = self.live_model.latest.get("weight.detected") is True
+        weight_mask = int(_number(self.live_model.latest.get("weight.sector_mask")) or 0)
+        if robot_x is not None and robot_y is not None:
+            point = self._screen(robot_x, robot_y)
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.setBrush(QColor("#0ea5e9"))
+            p.drawEllipse(point, 9, 9)
+            if robot_heading is not None:
+                angle = math.radians(robot_heading)
+                p.drawLine(point, QPointF(point.x() + 24 * math.cos(angle),
+                                          point.y() + 24 * math.sin(angle)))
+                sector_offsets = (-38.0, -13.0, 13.0, 38.0)
+                for sector, offset in enumerate(sector_offsets):
+                    active = bool(weight_mask & (1 << sector))
+                    sector_angle = math.radians(robot_heading + offset)
+                    reach = 125 if active else 70
+                    p.setPen(QPen(QColor("#22c55e" if active else "#475569"),
+                                  4 if active else 1,
+                                  Qt.PenStyle.SolidLine if active else Qt.PenStyle.DashLine))
+                    p.drawLine(point, QPointF(point.x() + reach * math.cos(sector_angle),
+                                              point.y() + reach * math.sin(sector_angle)))
+
+        panel = QRectF(max(8.0, self.width() - 285.0), 10.0, 275.0, 54.0)
+        p.setPen(QPen(QColor("#22c55e" if weight_detected else "#64748b"), 2))
+        p.setBrush(QColor(20, 83, 45, 220) if weight_detected else QColor(30, 41, 59, 220))
+        p.drawRoundedRect(panel, 7, 7)
+        p.setPen(QColor("#f8fafc"))
+        nearest = int(_number(self.live_model.latest.get("weight.nearest_mm")) or 0)
+        direction = int(_number(self.live_model.latest.get("weight.direction")) or 0)
+        direction_text = {-2: "far left", -1: "left", 1: "right", 2: "far right"}.get(direction, "—")
+        if weight_detected:
+            text = f"WEIGHT VISIBLE  ·  {nearest} mm  ·  {direction_text}"
+        elif "weight.detected" in self.live_model.latest:
+            text = "NO WEIGHT CURRENTLY VISIBLE"
+        else:
+            text = "WAITING FOR WEIGHT-VISIBILITY TELEMETRY"
+        p.drawText(panel, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+
+        p.setPen(QColor("#cbd5e1"))
+        mode = (f"Click arena to add: {self.add_mode}" if self.add_mode else
+                "Left-drag items · middle/right-drag to pan · wheel to zoom")
+        p.drawText(12, self.height() - 10, mode)
+        p.end()
+
 class ArenaCanvas(QWidget):
     def __init__(self, model, owner):
         super().__init__(owner)
@@ -1356,23 +1951,18 @@ class ArenaCanvas(QWidget):
         p.setPen(QColor("#667489"))
         p.drawText(
             20, 23,
-            "DISCOVERED MAP — thick solid = locked after 3 sensor frames; "
-            "thin/dashed = provisional geometry"
+            "DISCOVERED MAP — fused: solid red = arena boundary; "
+            "dashed orange = confirmed internal wall"
         )
 
         # Confirmed walls are drawn above the raw occupancy squares. Unlike
         # individual ray endpoints these landmarks remain fixed and extend as
         # later observations agree with the same physical wall.
+        p.setPen(QPen(QColor("#ef4444"), 5, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
         for wall in self.model.wall_tracks:
             if wall["observations"] < 3:
                 continue
-            locked = wall.get("locked", False)
-            p.setPen(QPen(
-                QColor("#ef4444" if locked else "#f87171"),
-                6 if locked else 3,
-                Qt.PenStyle.SolidLine if locked else Qt.PenStyle.DotLine,
-                Qt.PenCapStyle.RoundCap,
-            ))
             minimum, maximum = self.model.wall_segment(wall)
             if wall["orientation"] == "horizontal":
                 start = screen(minimum, wall["coordinate"])
@@ -1382,16 +1972,11 @@ class ArenaCanvas(QWidget):
                 end = screen(wall["coordinate"], maximum)
             p.drawLine(start, end)
 
+        p.setPen(QPen(QColor("#f97316"), 4, Qt.PenStyle.DashLine,
+                      Qt.PenCapStyle.RoundCap))
         for wall in self.model.internal_wall_tracks:
             if wall["observations"] < 3:
                 continue
-            locked = wall.get("locked", False)
-            p.setPen(QPen(
-                QColor("#f97316" if locked else "#fb923c"),
-                5 if locked else 3,
-                Qt.PenStyle.SolidLine if locked else Qt.PenStyle.DashLine,
-                Qt.PenCapStyle.RoundCap,
-            ))
             minimum, maximum = self.model.wall_segment(wall)
             if wall["orientation"] == "horizontal":
                 start = screen(minimum, wall["coordinate"])
@@ -1577,7 +2162,7 @@ class ArenaView(QWidget):
         self.settings = settings
         self.model = ArenaModel()
         self.sensor_unmatched = []
-        self.model.matrix_mirrored = str(settings.value("sensor/mirror_8x8", "false")).lower() == "true"
+        self.model.matrix_mirrored = str(settings.value("sensor/mirror_8x8", "true")).lower() == "true"
         layout = QHBoxLayout(self)
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -1621,7 +2206,11 @@ class ArenaView(QWidget):
             controls.addStretch()
             left_layout.addLayout(controls)
         self.canvas = ArenaCanvas(self.model, self)
-        left_layout.addWidget(self.canvas, 1)
+        self._build_mission_editor()
+        self.map_tabs = QTabWidget()
+        self.map_tabs.addTab(self.canvas, "Live Arena")
+        self.map_tabs.addTab(self.mission_page, "Mission Planner")
+        left_layout.addWidget(self.map_tabs, 1)
         self._build_navigation_tuning_panel()
         left_layout.addWidget(self.navigation_tuning_tabs)
         self._build_raw_tof_panel()
@@ -1724,8 +2313,305 @@ class ArenaView(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setWidget(side)
         scroll.setMaximumWidth(410)
+        self.side_scroll = scroll
         layout.addWidget(scroll)
+        self.map_tabs.currentChanged.connect(self._arena_subtab_changed)
+        self._arena_subtab_changed(self.map_tabs.currentIndex())
         self._sync()
+
+    def _build_mission_editor(self):
+        self.mission_layout = MissionLayout()
+        try:
+            saved = self.settings.value("navigation/mission_layout", "")
+            if saved:
+                self.mission_layout.load_dict(json.loads(str(saved)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+        self.mission_page = QWidget()
+        page_layout = QVBoxLayout(self.mission_page)
+        page_layout.setContentsMargins(5, 5, 5, 5)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(5)
+        self.mission_home_combo = QComboBox()
+        self.mission_home_combo.addItems(["Green home", "Blue home"])
+        self.mission_home_combo.setCurrentIndex(
+            0 if self.mission_layout.my_home == "green" else 1)
+        self.mission_home_combo.currentIndexChanged.connect(self._mission_home_changed)
+        toolbar.addWidget(QLabel("My home:"))
+        toolbar.addWidget(self.mission_home_combo)
+
+        self.mission_heading_combo = QComboBox()
+        self.mission_heading_combo.addItems(["East →", "South ↓", "West ←", "North ↑"])
+        self.mission_heading_combo.setCurrentIndex(
+            int(round(self.mission_layout.start["heading_deg"] / 90.0)) % 4)
+        self.mission_heading_combo.currentIndexChanged.connect(self._mission_heading_changed)
+        toolbar.addWidget(QLabel("Start heading:"))
+        toolbar.addWidget(self.mission_heading_combo)
+
+        self.mission_fallback_combo = QComboBox()
+        self.mission_fallback_combo.addItems(["Balanced", "Gap explorer", "Conservative"])
+        self.mission_fallback_combo.setCurrentIndex(self.mission_layout.fallback_strategy)
+        self.mission_fallback_combo.currentIndexChanged.connect(self._mission_fallback_changed)
+        toolbar.addWidget(QLabel("After weights:"))
+        toolbar.addWidget(self.mission_fallback_combo)
+        toolbar.addStretch()
+        page_layout.addLayout(toolbar)
+
+        tools = QHBoxLayout()
+        for label, mode in (("Set start", "start"), ("+ Weight", "weight"),
+                            ("+ Dummy weight", "dummy"), ("+ Wall", "wall"),
+                            ("+ Ramp", "ramp"), ("+ Tube", "tube")):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, m=mode: self.mission_canvas.set_add_mode(m))
+            tools.addWidget(button)
+        rotate = QPushButton("Rotate selected 90°")
+        rotate.clicked.connect(lambda: self.mission_canvas.rotate_selected())
+        tools.addWidget(rotate)
+        delete = QPushButton("Delete selected")
+        delete.clicked.connect(lambda: self.mission_canvas.delete_selected())
+        tools.addWidget(delete)
+        reset_view = QPushButton("Reset view")
+        reset_view.clicked.connect(lambda: self.mission_canvas.reset_view())
+        tools.addWidget(reset_view)
+        plan = QPushButton("PLAN ROUTE")
+        plan.setStyleSheet(
+            "QPushButton { background:#0369a1; color:white; font-weight:bold; padding:6px 12px; }")
+        plan.clicked.connect(self._plan_mission_route)
+        tools.addWidget(plan)
+        page_layout.addLayout(tools)
+
+        body = QHBoxLayout()
+        self.mission_canvas = MissionLayoutCanvas(
+            self.mission_layout, self.model, self.mission_page)
+        self.mission_canvas.layout_changed.connect(self._mission_layout_changed)
+        self.mission_canvas.selection_changed.connect(self._mission_selection_changed)
+        self.mission_canvas.cursor_moved.connect(self._mission_cursor_moved)
+        body.addWidget(self.mission_canvas, 1)
+
+        inspector = QWidget()
+        inspector.setMaximumWidth(310)
+        inspector_layout = QVBoxLayout(inspector)
+        inspector_layout.setContentsMargins(4, 4, 4, 4)
+
+        selection_group = QGroupBox("Selected obstacle dimensions")
+        selection_form = QFormLayout(selection_group)
+        self.mission_selected_label = QLabel("START")
+        selection_form.addRow("Selected", self.mission_selected_label)
+        self.mission_obstacle_width = QDoubleSpinBox()
+        self.mission_obstacle_width.setRange(50, 4000)
+        self.mission_obstacle_width.setDecimals(0)
+        self.mission_obstacle_width.setSuffix(" mm")
+        self.mission_obstacle_height = QDoubleSpinBox()
+        self.mission_obstacle_height.setRange(50, 2400)
+        self.mission_obstacle_height.setDecimals(0)
+        self.mission_obstacle_height.setSuffix(" mm")
+        self.mission_obstacle_width.valueChanged.connect(
+            self._mission_obstacle_dimension_changed)
+        self.mission_obstacle_height.valueChanged.connect(
+            self._mission_obstacle_dimension_changed)
+        selection_form.addRow("Length / diameter", self.mission_obstacle_width)
+        selection_form.addRow("Thickness / depth", self.mission_obstacle_height)
+        inspector_layout.addWidget(selection_group)
+
+        visibility_group = QGroupBox("Live weight visibility")
+        visibility_layout = QVBoxLayout(visibility_group)
+        self.mission_weight_visibility = QLabel(
+            "Waiting for weight-visibility telemetry")
+        self.mission_weight_visibility.setWordWrap(True)
+        self.mission_weight_visibility.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mission_weight_visibility.setMinimumHeight(74)
+        visibility_layout.addWidget(self.mission_weight_visibility)
+        inspector_layout.addWidget(visibility_group)
+
+        self.mission_cursor_label = QLabel("Cursor: —")
+        self.mission_cursor_label.setWordWrap(True)
+        inspector_layout.addWidget(self.mission_cursor_label)
+        guide = QLabel(
+            "Seven dashed vertical placement lines split the 4.9 m arena into eight equal bays. "
+            "Walls/ramps/tubes and dummy weights are inflated by robot radius + safety margin before A*. "
+            "Changing a wall dimension invalidates the old route; Plan Route recalculates around it.")
+        guide.setWordWrap(True)
+        inspector_layout.addWidget(guide)
+        inspector_layout.addStretch()
+        body.addWidget(inspector)
+        page_layout.addLayout(body, 1)
+
+        self.mission_status = QLabel(
+            "Pre-lay the arena: fixed border; green home top-left; blue home bottom-left. "
+            "The other home is NO-GO. Add real/dummy weights and obstacles, set START, then Plan Route.")
+        self.mission_status.setWordWrap(True)
+        page_layout.addWidget(self.mission_status)
+        self._mission_selection_changed("start")
+        self._refresh_mission_weight_visibility()
+
+    def _arena_subtab_changed(self, _index):
+        mission_visible = (
+            hasattr(self, "map_tabs") and hasattr(self, "mission_page") and
+            self.map_tabs.currentWidget() is self.mission_page
+        )
+        # Mission Planner gets the full Arena View working area while editing.
+        if hasattr(self, "navigation_tuning_tabs"):
+            self.navigation_tuning_tabs.setVisible(not mission_visible)
+        if hasattr(self, "raw_tof_group"):
+            self.raw_tof_group.setVisible(not mission_visible)
+        if hasattr(self, "side_scroll"):
+            self.side_scroll.setVisible(not mission_visible)
+        if mission_visible and hasattr(self, "mission_canvas"):
+            self.mission_canvas.update()
+
+    def _mission_cursor_moved(self, x, y):
+        if not hasattr(self, "mission_cursor_label"):
+            return
+        if (0.0 <= x <= self.mission_layout.WIDTH_MM and
+                0.0 <= y <= self.mission_layout.HEIGHT_MM):
+            self.mission_cursor_label.setText(
+                f"Cursor: x={x:.0f} mm, y={y:.0f} mm")
+        else:
+            self.mission_cursor_label.setText("Cursor: outside arena")
+
+    def _mission_selection_changed(self, ident):
+        if not hasattr(self, "mission_obstacle_width"):
+            return
+        obstacle = next(
+            (item for item in self.mission_layout.obstacles
+             if item.get("id") == ident), None)
+        self.mission_obstacle_width.blockSignals(True)
+        self.mission_obstacle_height.blockSignals(True)
+        try:
+            if obstacle is None:
+                if ident == "start":
+                    label = "START"
+                else:
+                    weight = next(
+                        (item for item in self.mission_layout.weights
+                         if item.get("id") == ident), None)
+                    label = ("DUMMY WEIGHT" if weight and weight.get("dummy") else
+                             "WEIGHT" if weight else "Nothing selected")
+                self.mission_selected_label.setText(label)
+                self.mission_obstacle_width.setEnabled(False)
+                self.mission_obstacle_height.setEnabled(False)
+                return
+            self.mission_selected_label.setText(
+                f"{obstacle['kind'].upper()} #{obstacle['id']}")
+            self.mission_obstacle_width.setEnabled(True)
+            self.mission_obstacle_width.setValue(float(obstacle.get("w", 100.0)))
+            is_tube = obstacle.get("kind") == "tube"
+            self.mission_obstacle_height.setEnabled(not is_tube)
+            self.mission_obstacle_height.setValue(
+                float(obstacle.get("h", obstacle.get("w", 100.0))))
+        finally:
+            self.mission_obstacle_width.blockSignals(False)
+            self.mission_obstacle_height.blockSignals(False)
+
+    def _mission_obstacle_dimension_changed(self, _value=None):
+        if not hasattr(self, "mission_canvas"):
+            return
+        ident = self.mission_canvas.selected_id
+        obstacle = next(
+            (item for item in self.mission_layout.obstacles
+             if item.get("id") == ident), None)
+        if obstacle is None:
+            return
+        had_route = bool(self.mission_layout.route)
+        width = self.mission_obstacle_width.value()
+        height = (width if obstacle.get("kind") == "tube"
+                  else self.mission_obstacle_height.value())
+        if not self.mission_layout.set_obstacle_size(ident, width, height):
+            return
+        self._save_mission_layout()
+        self.mission_canvas.update()
+        self.mission_status.setText(
+            f"{obstacle['kind'].title()} resized to {width:.0f} × {height:.0f} mm. "
+            "Route geometry updated." if obstacle.get("kind") != "tube" else
+            f"Tube resized to Ø{width:.0f} mm. Route geometry updated.")
+        if had_route:
+            self._plan_mission_route()
+
+    def _refresh_mission_weight_visibility(self):
+        if not hasattr(self, "mission_weight_visibility"):
+            return
+        latest = self.model.latest
+        if "weight.detected" not in latest:
+            self.mission_weight_visibility.setText(
+                "WAITING FOR V10 WEIGHT TELEMETRY\nNo live confirmation yet")
+            self.mission_weight_visibility.setStyleSheet(
+                "QLabel { background:#334155; color:white; padding:10px; font-weight:bold; }")
+            return
+        detected = latest.get("weight.detected") is True
+        mask = int(_number(latest.get("weight.sector_mask")) or 0)
+        nearest = int(_number(latest.get("weight.nearest_mm")) or 0)
+        direction = int(_number(latest.get("weight.direction")) or 0)
+        direction_text = {-2: "far left", -1: "left", 1: "right", 2: "far right"}.get(direction, "unknown")
+        if detected:
+            active = [name for bit, name in enumerate(
+                ("far-left", "mid-left", "mid-right", "far-right"))
+                if mask & (1 << bit)]
+            self.mission_weight_visibility.setText(
+                "WEIGHT VISIBLE\n"
+                f"{nearest} mm · {direction_text} · sectors: {', '.join(active) or '—'}")
+            self.mission_weight_visibility.setStyleSheet(
+                "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }")
+        else:
+            self.mission_weight_visibility.setText(
+                "NO WEIGHT CURRENTLY VISIBLE\n4-sector TOF confirmation is clear")
+            self.mission_weight_visibility.setStyleSheet(
+                "QLabel { background:#1e293b; color:#cbd5e1; padding:10px; font-weight:bold; }")
+
+    def _save_mission_layout(self):
+        self.settings.setValue(
+            "navigation/mission_layout",
+            json.dumps(self.mission_layout.to_dict(), separators=(",", ":")),
+        )
+
+    def _mission_layout_changed(self):
+        self.mission_layout.route = []
+        self._save_mission_layout()
+        self.mission_status.setText("Layout changed — press PLAN ROUTE to recalculate around the new geometry.")
+        self.mission_canvas.update()
+
+    def _mission_home_changed(self, index):
+        self.mission_layout.my_home = "green" if index == 0 else "blue"
+        self._mission_layout_changed()
+
+    def _mission_heading_changed(self, index):
+        self.mission_layout.start["heading_deg"] = float((index % 4) * 90)
+        self._mission_layout_changed()
+
+    def _mission_fallback_changed(self, index):
+        self.mission_layout.fallback_strategy = max(0, min(2, int(index)))
+        self._save_mission_layout()
+
+    def _navigation_strategy_changed(self, index):
+        if (hasattr(self, "map_tabs") and index == 3 and
+                self.map_tabs.indexOf(self.mission_page) >= 0):
+            self.map_tabs.setCurrentWidget(self.mission_page)
+
+    def _plan_mission_route(self):
+        # Use the same physical footprint/safety margin that will be sent to
+        # firmware so the graphical route and the real clearance agree.
+        self.mission_layout.ROBOT_RADIUS_MM = (
+            self.navigation_tuning_controls["robot_width_mm"].value() * 0.5
+        )
+        self.mission_layout.SAFETY_MARGIN_MM = max(
+            40.0, self.navigation_tuning_controls["gap_margin_mm"].value()
+        )
+        if self.mission_layout.plan():
+            target_count = sum(1 for item in self.mission_layout.weights if not item["dummy"])
+            length = MissionLayout._path_length(
+                [(self.mission_layout.start["x"], self.mission_layout.start["y"])] +
+                [(point["x"], point["y"]) for point in self.mission_layout.route]
+            )
+            self.mission_status.setText(
+                f"Route ready: {target_count} real weights, {len(self.mission_layout.route)} waypoints, "
+                f"approximately {length/1000.0:.1f} m. RUN NAVIGATION will upload this route first."
+            )
+        else:
+            self.mission_status.setText("ROUTE ERROR: " + self.mission_layout.route_error)
+        self.mission_canvas.update()
+        return bool(self.mission_layout.route)
 
     def _build_navigation_tuning_panel(self):
         self.navigation_tuning_tabs = QTabWidget()
@@ -1735,10 +2621,13 @@ class ArenaView(QWidget):
         self.navigation_strategy = QComboBox()
         self.navigation_strategy.addItems([
             "Balanced coverage", "Gap explorer", "Conservative wall-safe",
-            "Frontier grid + A*", "Reactive gap wander (no map planning)"
+            "Pre-laid mission"
         ])
         self.navigation_strategy.setCurrentIndex(max(0, min(
-            4, int(self.settings.value("navigation/strategy", 0)))))
+            3, int(self.settings.value("navigation/strategy", 0)))))
+        self.navigation_strategy.currentIndexChanged.connect(
+            self._navigation_strategy_changed
+        )
         grid.addWidget(QLabel("Algorithm"), 0, 0)
         grid.addWidget(self.navigation_strategy, 0, 1)
         definitions = [
@@ -1771,11 +2660,20 @@ class ArenaView(QWidget):
         self.navigation_tuning_tabs.addTab(page, "Navigation tuning")
 
     def _run_navigation_with_tuning(self):
-        # Make RUN NAVIGATION transactional from the operator's perspective:
-        # first push every visible tuning control, then start autonomy. This
-        # prevents a recording labelled Gap Explorer from silently running the
-        # previous Balanced strategy.
+        # RUN NAVIGATION is transactional: first push the visible tuning. The
+        # pre-laid strategy additionally computes/uploads its path before the
+        # normal autonomous_navigation command is sent.
         self._apply_navigation_tuning()
+        if self.navigation_strategy.currentIndex() == 3:
+            if not self.mission_layout.route and not self._plan_mission_route():
+                self.map_tabs.setCurrentWidget(self.mission_page)
+                return
+            payload = self.mission_layout.command_payload()
+            if len(payload["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS:
+                self.mission_status.setText("ROUTE ERROR: too many firmware waypoints.")
+                self.map_tabs.setCurrentWidget(self.mission_page)
+                return
+            self.command_requested.emit("mission_plan_set", payload)
         self.command_requested.emit(
             "autonomous_navigation", {"enabled": True}
         )
@@ -2010,22 +2908,18 @@ class ArenaView(QWidget):
             configured_ports.add(port)
             label = by_port.get(port, str(sensor.get("label", name)))
             lower = label.lower()
-            lateral = (-180 if "left left" in lower else -100 if "left" in lower
-                       else 180 if "right right" in lower else 100 if "right" in lower else 0)
+            lateral = -100 if "left" in lower else (180 if "right right" in lower else 100 if "right" in lower else 0)
             forward = 120  # top/bottom describes height, not forward/back position
             layer_default = "bottom" if "bottom" in lower else "top"
             layer = str(self.settings.value(f"arena/sensors/{name}/layer", layer_default)).lower()
             if layer not in ("top", "bottom"):
                 layer = layer_default
-            angle_default = (-45 if "left left" in lower
-                             else 45 if "right right" in lower else 0)
             spec = {"name": name, "port": port, "label": label,
-                    "angle": float(angle_default), "x": float(lateral),
-                    "y": float(forward), "layer": layer}
+                    "angle": 0.0, "x": float(lateral), "y": float(forward), "layer": layer}
             sensor_form.addRow(QLabel(f"{label} ({port}, {sensor.get('type', '?')})"))
             controls = {}
             for field, caption, default in (
-                ("angle", "Angle (°)", angle_default),
+                ("angle", "Angle (°)", 0),
                 ("x", "Right offset (mm)", lateral),
                 ("y", "Forward offset (mm)", forward),
             ):
@@ -2234,12 +3128,16 @@ class ArenaView(QWidget):
         if old_time is not None and old_time != timestamp:
             self._refresh_status()
             self.canvas.update()
+            if hasattr(self, "mission_canvas"):
+                self.mission_canvas.update()
 
     def receive_matrix(self, message):
         self._refresh_raw_matrix(message)
         self.model.receive_matrix(message)
         self._refresh_status()
         self.canvas.update()
+        if hasattr(self, "mission_canvas"):
+            self.mission_canvas.update()
 
     def set_matrix_mirrored(self, mirrored):
         if self.model.matrix_mirrored != mirrored:
@@ -2258,9 +3156,9 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 9):
+        if ("system.uptime_s" in m.latest and controller_version != 10):
             firmware_warning += (
-                "Navigation controller v9 is not running; upload the current clean build. "
+                "Navigation controller v10 is not running; upload the current clean build. "
             )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
@@ -2276,6 +3174,19 @@ class ArenaView(QWidget):
             ("ENCODER/IMU DISAGREEMENT: map translation held. "
              if m.encoder_imu_disagreement else "")
         )
+        self._refresh_mission_weight_visibility()
+        if hasattr(self, "mission_status") and m.latest.get("mission.active") is True:
+            visited = int(_number(m.latest.get("mission.targets_visited")) or 0)
+            total = int(_number(m.latest.get("mission.target_count")) or 0)
+            waypoint = int(_number(m.latest.get("mission.waypoint_index")) or 0)
+            waypoint_count = int(_number(m.latest.get("mission.waypoint_count")) or 0)
+            blocked = m.latest.get("mission.blocked") is True
+            self.mission_status.setText(
+                f"MISSION LIVE — weights {visited}/{total}; waypoint "
+                f"{waypoint + 1 if waypoint < waypoint_count else waypoint_count}/{waypoint_count}. "
+                + ("Live ranging is blocking the route; robot is holding position."
+                   if blocked else "Robot is correcting toward the uploaded route.")
+            )
         self.status.setText(
             f"{firmware_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "
             f"Travel: {m.distance_travelled_mm:.0f} mm; speed: {m.linear_speed_mm_s:.0f} mm/s. "
@@ -2291,8 +3202,6 @@ class ArenaView(QWidget):
             f"Known grid squares: {len(m.cells)}; boundaries/internal: "
             f"{sum(w['observations'] >= 3 for w in m.wall_tracks)}/"
             f"{sum(w['observations'] >= 3 for w in m.internal_wall_tracks)}; "
-            f"locked permanent walls: "
-            f"{sum(w.get('locked', False) for w in m.wall_tracks + m.internal_wall_tracks)}; "
             f"pending wall clusters: "
             f"{sum(not w.get('promoted') for w in m.wall_evidence_clusters)}; "
             f"possible-weight squares: "

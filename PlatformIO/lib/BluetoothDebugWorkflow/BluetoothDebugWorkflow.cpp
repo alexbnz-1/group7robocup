@@ -34,6 +34,9 @@ BluetoothDebugWorkflow::BluetoothDebugWorkflow(
 
 void BluetoothDebugWorkflow::begin()
 {
+    Serial.begin(115200);
+    delay(1500);
+    Serial.println("BOOT: workflow begin");
     // Teensy's default hardware-serial RX storage is too small for the longer
     // JSON motion commands when telemetry transmission temporarily delays the
     // parser. Extra storage prevents complete newline-terminated commands from
@@ -43,8 +46,10 @@ void BluetoothDebugWorkflow::begin()
     // navigation loop while the 115200-baud UART physically shifts them out.
     bluetoothPort_.addMemoryForWrite(bluetoothTxBuffer_, sizeof(bluetoothTxBuffer_));
     bluetoothPort_.begin(BluetoothConfig::BAUD);
+    Serial.println("BOOT: Serial1 ready");
     servos_.begin();
     servos_.torqueOff(0xFE);
+    Serial.println("BOOT: servo buses ready");
     dcMotor203_.begin();
     dcMotor203Second_.begin();
     encoders_.begin();
@@ -59,11 +64,17 @@ void BluetoothDebugWorkflow::begin()
         return;
     }
 
+    Serial.println("BOOT: config parsed");
+
     initialiseDigitalInputs();
     initialiseUltrasoundSensors();
+    Serial.println("BOOT: digital sensors ready");
     initialiseTofSensors();
+    Serial.println("BOOT: point TOF ready");
     const bool tof8x8Ready = tof8x8_.begin();
+    Serial.println("BOOT: matrix TOF begin returned");
     const bool imuReady = imu_.begin();
+    Serial.println("BOOT: IMU begin returned");
 
     JsonObject interval = findParameter("debug.telemetry_interval_ms");
     if (!interval.isNull())
@@ -76,10 +87,19 @@ void BluetoothDebugWorkflow::begin()
     link_.log(imuReady ? "INFO" : "WARNING",
               imuReady ? "BNO055 IMU ready" : "BNO055 IMU not detected on I2C0/I2C1");
     sendState();
+    Serial.println("BOOT: workflow ready");
 }
 
 void BluetoothDebugWorkflow::update()
 {
+    static uint32_t lastUsbHeartbeatMs = 0;
+    if (millis() - lastUsbHeartbeatMs >= 1000U)
+    {
+        lastUsbHeartbeatMs = millis();
+        Serial.printf("LOOP: uptime=%lu tx_free=%d dropped=%lu\n",
+                      millis(), bluetoothPort_.availableForWrite(),
+                      link_.droppedMessages());
+    }
     const uint32_t updateStartedUs = micros();
     if (lastUpdateStartedUs_ != 0)
         maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
@@ -88,7 +108,6 @@ void BluetoothDebugWorkflow::update()
     const uint32_t now = millis();
     for (uint8_t i = 0; i < digitalInputCount_; ++i)
         digitalInputs_[i].update(now);
-    updateArmSorting(now);
     if (dcMotor203SecondDeadman_ && dcMotor203SecondActive_ &&
         millis() - lastDcMotor203SecondCommandMs_ > KEYBOARD_DRIVE_TIMEOUT_MS)
     {
@@ -111,141 +130,6 @@ void BluetoothDebugWorkflow::update()
 void BluetoothDebugWorkflow::dispatch(JsonDocument& message, void* context)
 {
     static_cast<BluetoothDebugWorkflow*>(context)->handleMessage(message);
-}
-
-bool BluetoothDebugWorkflow::zeroArmSortingGate()
-{
-    const float currentAngle = servos_.readAngle(ARM_SORTING_HERKULEX_ID, 30);
-    if (isnan(currentAngle)) return false;
-    servoZeroOffsetsDeg_[ARM_SORTING_HERKULEX_ID] = currentAngle;
-    servoZeroed_[ARM_SORTING_HERKULEX_ID] = true;
-    lastServoId_ = ARM_SORTING_HERKULEX_ID;
-    lastServoAngleDeg_ = 0.0f;
-    measuredServoAngleDeg_ = 0.0f;
-    armSortingGateTargetDeg_ = NAN;
-    link_.telemetry("servo.zero_offset_deg", currentAngle);
-    return true;
-}
-
-void BluetoothDebugWorkflow::setArmSortingGate(float relativeAngleDeg)
-{
-    if (!servoZeroed_[ARM_SORTING_HERKULEX_ID]) return;
-    if (!isnan(armSortingGateTargetDeg_) &&
-        fabsf(armSortingGateTargetDeg_ - relativeAngleDeg) < 0.1f) return;
-    const float absoluteAngle = servoZeroOffsetsDeg_[ARM_SORTING_HERKULEX_ID] +
-                                relativeAngleDeg;
-    if (absoluteAngle < HerkulexConfig::MIN_ANGLE_DEG ||
-        absoluteAngle > HerkulexConfig::MAX_ANGLE_DEG)
-    {
-        link_.error("Arm sorting gate target exceeds Herkulex absolute range");
-        return;
-    }
-    servos_.torqueOff(ARM_SORTING_HERKULEX_ID);
-    delay(5);
-    servos_.clearError(ARM_SORTING_HERKULEX_ID);
-    servos_.moveAngle(ARM_SORTING_HERKULEX_ID, absoluteAngle,
-                      HerkulexConfig::SORTING_GATE_MOVE_TIME_MS,
-                      HerkulexTeensy::LED_BLUE);
-    delay(5);
-    servos_.torqueOn(ARM_SORTING_HERKULEX_ID);
-    delay(5);
-    servos_.moveAngle(ARM_SORTING_HERKULEX_ID, absoluteAngle,
-                      HerkulexConfig::SORTING_GATE_MOVE_TIME_MS,
-                      HerkulexTeensy::LED_BLUE);
-    armSortingGateTargetDeg_ = relativeAngleDeg;
-    lastServoId_ = ARM_SORTING_HERKULEX_ID;
-    lastServoAngleDeg_ = relativeAngleDeg;
-    lastMoveStartMs_ = millis();
-    lastMoveDurationMs_ = HerkulexConfig::SORTING_GATE_MOVE_TIME_MS;
-}
-
-void BluetoothDebugWorkflow::setArmSortingBumpers(bool enabled)
-{
-    hx12kC_.setAngle(enabled ? 0.0f : 130.0f);
-    hx12kD_.setAngle(enabled ? 130.0f : 0.0f);
-    armSortingBumperOn_ = enabled;
-}
-
-void BluetoothDebugWorkflow::updateArmSorting(uint32_t now)
-{
-    if (!armSortingEnabled_ || stopped_) return;
-
-    bool sensorFound = false;
-    bool detected = false;
-    for (uint8_t i = 0; i < digitalInputCount_; ++i)
-    {
-        if (strcmp(digitalInputNames_[i], "inductive_proximity") == 0)
-        {
-            sensorFound = true;
-            detected = digitalInputs_[i].detected();
-            break;
-        }
-    }
-    if (!sensorFound) return;
-
-    if (detected)
-    {
-        if (!armSortingHighPending_ && !armSortingHighConfirmed_)
-        {
-            armSortingHighPending_ = true;
-            armSortingHighSinceMs_ = now;
-        }
-        if (armSortingHighPending_ &&
-            now - armSortingHighSinceMs_ >= ARM_SORTING_CONFIRM_MS)
-        {
-            armSortingHighPending_ = false;
-            armSortingHighConfirmed_ = true;
-            armSortingPulseEndsMs_ = 0;
-            armSortingBumperHoldUntilMs_ = 0;
-            armSortingGateHoldUntilMs_ = 0;
-            setArmSortingBumpers(true);
-            setArmSortingGate(30.0f);
-            link_.log("INFO", "Inductive detection confirmed for 0.50 s: gate=30; bumpers ON");
-        }
-        return;
-    }
-
-    armSortingHighPending_ = false;
-    if (armSortingHighConfirmed_)
-    {
-        armSortingHighConfirmed_ = false;
-        armSortingBumperHoldUntilMs_ = now + ARM_SORTING_BUMPER_HOLD_MS;
-        armSortingGateHoldUntilMs_ = now + ARM_SORTING_GATE_HOLD_MS;
-        armSortingNextPulseMs_ = now + ARM_SORTING_PERIOD_MS;
-        link_.log("INFO", "Detection cleared: holding bumper 2 s and gate +30 for 5 s");
-    }
-
-    if (armSortingBumperHoldUntilMs_ != 0 &&
-        static_cast<int32_t>(now - armSortingBumperHoldUntilMs_) >= 0)
-    {
-        armSortingBumperHoldUntilMs_ = 0;
-        setArmSortingBumpers(false);
-    }
-    if (armSortingGateHoldUntilMs_ != 0 &&
-        static_cast<int32_t>(now - armSortingGateHoldUntilMs_) >= 0)
-    {
-        armSortingGateHoldUntilMs_ = 0;
-        setArmSortingGate(-30.0f);
-        link_.log("INFO", "Sorting gate hold complete: gate=-30");
-    }
-
-    if (armSortingPulseEndsMs_ != 0 &&
-        static_cast<int32_t>(now - armSortingPulseEndsMs_) >= 0)
-    {
-        armSortingPulseEndsMs_ = 0;
-        setArmSortingBumpers(false);
-    }
-    if (armSortingPulseEndsMs_ == 0 &&
-        armSortingBumperHoldUntilMs_ == 0 &&
-        armSortingGateHoldUntilMs_ == 0 &&
-        static_cast<int32_t>(now - armSortingNextPulseMs_) >= 0)
-    {
-        setArmSortingGate(-30.0f);
-        setArmSortingBumpers(true);
-        armSortingPulseEndsMs_ = now + ARM_SORTING_PULSE_MS;
-        armSortingNextPulseMs_ = now + ARM_SORTING_PERIOD_MS;
-        link_.log("INFO", "Arm sorting 20 s bumper pulse");
-    }
 }
 
 void BluetoothDebugWorkflow::handleMessage(JsonDocument& message)
@@ -350,6 +234,107 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         return;
     }
 
+    // Mission-plan upload is a built-in desktop/firmware protocol rather
+    // than a debug_config command. This keeps large editable layouts out of
+    // the generated command-definition table while still enforcing Debug Mode.
+    if (strcmp(commandName, "mission_plan_clear") == 0)
+    {
+        if (!debugMode_)
+        {
+            link_.error("Mission plan requires Debug Mode");
+            return;
+        }
+        if (navigationActive_)
+        {
+            link_.error("Stop autonomous navigation before replacing the mission plan");
+            return;
+        }
+        missionWaypointCount_ = 0;
+        missionWaypointIndex_ = 0;
+        missionTargetCount_ = 0;
+        missionTargetsVisited_ = 0;
+        missionPlanValid_ = false;
+        missionPoseInitialised_ = false;
+        link_.log("INFO", "Pre-laid mission plan cleared");
+        return;
+    }
+    if (strcmp(commandName, "mission_plan_set") == 0)
+    {
+        if (!debugMode_)
+        {
+            link_.error("Mission plan requires Debug Mode");
+            return;
+        }
+        if (navigationActive_)
+        {
+            link_.error("Stop autonomous navigation before replacing the mission plan");
+            return;
+        }
+        if (!message["points"].is<JsonArray>())
+        {
+            link_.error("Mission plan requires a flat points array");
+            return;
+        }
+        JsonArray points = message["points"].as<JsonArray>();
+        if (points.size() == 0 || points.size() % 3 != 0 ||
+            points.size() / 3 > MAX_MISSION_WAYPOINTS)
+        {
+            link_.error("Mission plan must contain 1..64 x,y,flags waypoint triples");
+            return;
+        }
+
+        const int startX = message["start_x_mm"] | -1;
+        const int startY = message["start_y_mm"] | -1;
+        const float startHeading = message["start_heading_deg"] | 0.0f;
+        const int fallback = message["fallback_strategy"] | 0;
+        if (startX < 0 || startX > 12000 || startY < 0 || startY > 12000 ||
+            fallback < 0 || fallback > 2)
+        {
+            link_.error("Mission start/fallback values are outside the supported range");
+            return;
+        }
+
+        uint8_t count = 0;
+        uint8_t targets = 0;
+        for (size_t i = 0; i < points.size(); i += 3)
+        {
+            const int x = points[i].as<int>();
+            const int y = points[i + 1].as<int>();
+            const int flags = points[i + 2].as<int>();
+            if (x < 0 || x > 12000 || y < 0 || y > 12000 || flags < 0 || flags > 255)
+            {
+                link_.error("Mission waypoint is outside the supported range");
+                missionPlanValid_ = false;
+                return;
+            }
+            missionWaypoints_[count].xMm = static_cast<int16_t>(x);
+            missionWaypoints_[count].yMm = static_cast<int16_t>(y);
+            missionWaypoints_[count].flags = static_cast<uint8_t>(flags);
+            if ((flags & 0x01) != 0)
+                ++targets;
+            ++count;
+        }
+
+        missionStartXmm_ = static_cast<float>(startX);
+        missionStartYmm_ = static_cast<float>(startY);
+        missionStartArenaHeadingDeg_ = startHeading;
+        while (missionStartArenaHeadingDeg_ >= 360.0f) missionStartArenaHeadingDeg_ -= 360.0f;
+        while (missionStartArenaHeadingDeg_ < 0.0f) missionStartArenaHeadingDeg_ += 360.0f;
+        missionFallbackStrategy_ = static_cast<uint8_t>(fallback);
+        missionWaypointCount_ = count;
+        missionWaypointIndex_ = 0;
+        missionTargetCount_ = targets;
+        missionTargetsVisited_ = 0;
+        missionPlanValid_ = count > 0 && targets > 0;
+        missionPoseInitialised_ = false;
+        missionBlockedSinceMs_ = 0;
+        link_.log(missionPlanValid_ ? "INFO" : "WARNING",
+                  missionPlanValid_
+                      ? "Pre-laid mission plan loaded"
+                      : "Mission plan loaded without any real-weight targets");
+        return;
+    }
+
     JsonObject definition = findCommand(commandName);
     if (definition.isNull())
     {
@@ -384,13 +369,6 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kB_.disable();
         hx12kC_.disable();
         hx12kD_.disable();
-        armSortingEnabled_ = false;
-        armSortingHighPending_ = false;
-        armSortingHighConfirmed_ = false;
-        armSortingBumperOn_ = false;
-        armSortingPulseEndsMs_ = 0;
-        armSortingBumperHoldUntilMs_ = 0;
-        armSortingGateHoldUntilMs_ = 0;
         stopped_ = true;
         sendState();
         link_.log("WARNING", "STOP received; servo torque disabled");
@@ -662,9 +640,13 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             link_.error("Autonomous navigation requires Debug Mode");
             return;
         }
+        if (navigationStrategy_ == 3 && !missionPlanValid_)
+        {
+            link_.error("Pre-laid mission strategy requires a planned route from Arena View");
+            return;
+        }
         navigationActive_ = true;
-        navigationState_ = navigationStrategy_ == 3 ? NAV_FRONTIER_EXPLORE :
-            (navigationStrategy_ == 4 ? NAV_WANDER_DRIVE : NAV_SEEK_WALL);
+        navigationState_ = navigationStrategy_ == 3 ? NAV_MISSION_TRACK : NAV_SEEK_WALL;
         navigationMotionStartedMs_ = millis();
         navigationHeadingReferenceDeg_ = imu_.headingDeg();
         navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
@@ -692,37 +674,23 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         navigationRecoveryForceHalfTurn_ = false;
         navigationClearanceTurnCount_ = 0;
         navigationMotionConsistent_ = true;
+        missionWaypointIndex_ = 0;
+        missionTargetsVisited_ = 0;
+        missionPoseInitialised_ = false;
+        missionBlockedSinceMs_ = 0;
         if (navigationStrategy_ == 3)
         {
-            frontierExplorer_.begin(encoders_.firstCount(), encoders_.secondCount(), imu_.headingDeg());
-            frontierLastPlanMs_ = 0;
-            frontierLastMapMs_ = 0;
-            frontierTurning_ = false;
-        }
-        if (navigationStrategy_ == 4)
-        {
-            navigationTargetHeadingDeg_ = imu_.headingDeg();
-            wanderNextDecisionMs_ = millis() + 6000U;
-            wanderTurnRight_ = true;
-            wanderAvoidanceCount_ = 0;
-            memset(wanderVisited_, 0, sizeof(wanderVisited_));
-            wanderVisitedCellCount_ = 0;
-            wanderXmm_ = 0.0f;
-            wanderYmm_ = 0.0f;
-            wanderStartHeadingDeg_ = imu_.headingDeg();
-            wanderLastEncoder1_ = encoders_.firstCount();
-            wanderLastEncoder2_ = encoders_.secondCount();
-            wanderCurrentCellIndex_ = -1;
-            wanderLastWeightMask_ = 0;
+            missionPoseXmm_ = missionStartXmm_;
+            missionPoseYmm_ = missionStartYmm_;
+            missionArenaHeadingDeg_ = missionStartArenaHeadingDeg_;
+            // Alignment is captured only after updateNavigation sees a valid
+            // BNO055 sample. Until then the mission holds the motors stopped.
+            missionPoseInitialised_ = false;
         }
         stopped_ = false;
         dcMotor203SecondDeadman_ = false;
         sendState();
-        link_.log("WARNING", navigationStrategy_ == 3
-            ? "Frontier grid and A* navigation started"
-            : (navigationStrategy_ == 4
-                ? "Reactive gap wander started; no stored map used for planning"
-                : "Autonomous navigation started"));
+        link_.log("WARNING", "Autonomous navigation started");
     }
     else if (strcmp(action, "encoder_zero") == 0)
     {
@@ -795,50 +763,6 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kD_.setAngle(enabled ? 130.0f : 0.0f);
         link_.log("INFO", enabled ? "Bumper servos ON: C=0, D=130" :
                                   "Bumper servos OFF: C=130, D=0");
-        sendState();
-    }
-    else if (strcmp(action, "arm_sorting_toggle") == 0)
-    {
-        if (!message["enabled"].is<bool>())
-        {
-            link_.error("Arm sorting command requires enabled=true or false");
-            return;
-        }
-        const bool enabled = message["enabled"].as<bool>();
-        if (enabled)
-        {
-            if (stopped_)
-            {
-                link_.error("Arm sorting requires Run Robot");
-                return;
-            }
-            if (!zeroArmSortingGate())
-            {
-                link_.error("Arm sorting could not read and zero Herkulex 4");
-                return;
-            }
-            armSortingEnabled_ = true;
-            armSortingHighPending_ = false;
-            armSortingHighConfirmed_ = false;
-            armSortingNextPulseMs_ = millis() + ARM_SORTING_PERIOD_MS;
-            armSortingPulseEndsMs_ = 0;
-            armSortingBumperHoldUntilMs_ = 0;
-            armSortingGateHoldUntilMs_ = 0;
-            setArmSortingBumpers(false);
-            setArmSortingGate(-30.0f);
-            link_.log("INFO", "Arm sorting ON: Herkulex 4 zeroed; gate=-30; bumpers OFF");
-        }
-        else
-        {
-            armSortingEnabled_ = false;
-            armSortingHighPending_ = false;
-            armSortingHighConfirmed_ = false;
-            armSortingPulseEndsMs_ = 0;
-            armSortingBumperHoldUntilMs_ = 0;
-            armSortingGateHoldUntilMs_ = 0;
-            setArmSortingBumpers(false);
-            link_.log("INFO", "Arm sorting OFF; bumpers OFF");
-        }
         sendState();
     }
     else if (strcmp(action, "tof_read_all") == 0)
@@ -1042,18 +966,6 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["servo.tracking_fault"] = trackingFault_;
     data["servo.continuous_velocity_active"] = continuousVelocityActive_;
     data["servo.commanded_velocity"] = commandedVelocity_;
-    data["sorting.enabled"] = armSortingEnabled_;
-    data["sorting.inductive_confirm_pending"] = armSortingHighPending_;
-    data["sorting.inductive_confirmed"] = armSortingHighConfirmed_;
-    data["sorting.bumpers_on"] = armSortingBumperOn_;
-    data["sorting.gate_target_deg"] = armSortingGateTargetDeg_;
-    data["sorting.next_periodic_bumper_ms"] = armSortingEnabled_ &&
-        !armSortingHighConfirmed_ ?
-        max(0L, static_cast<long>(armSortingNextPulseMs_ - now)) : 0L;
-    data["sorting.bumper_hold_remaining_ms"] = armSortingBumperHoldUntilMs_ == 0
-        ? 0L : max(0L, static_cast<long>(armSortingBumperHoldUntilMs_ - now));
-    data["sorting.gate_hold_remaining_ms"] = armSortingGateHoldUntilMs_ == 0
-        ? 0L : max(0L, static_cast<long>(armSortingGateHoldUntilMs_ - now));
     data["dc_motor_203.active"] = dcMotor203Active_;
     data["dc_motor_203.channel_a_percent"] = dcMotor203_.channelAPercent();
     data["dc_motor_203.channel_b_percent"] = dcMotor203_.channelBPercent();
@@ -1093,10 +1005,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         case NAV_CLEARANCE_TURN: navigationPhase = "clearance_turn"; break;
         case NAV_RECOVERY_REVERSE: navigationPhase = "recovery_reverse"; break;
         case NAV_RECOVERY_TURN: navigationPhase = "recovery_turn"; break;
-        case NAV_FRONTIER_EXPLORE: navigationPhase = "frontier_explore"; break;
-        case NAV_WANDER_DRIVE: navigationPhase = "wander_drive"; break;
-        case NAV_WANDER_TURN: navigationPhase = "wander_turn"; break;
-        case NAV_WANDER_REVERSE: navigationPhase = "wander_reverse"; break;
+        case NAV_MISSION_TRACK: navigationPhase = "mission_track"; break;
         default: break;
     }
     data["navigation.phase"] = navigationPhase;
@@ -1135,25 +1044,20 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["navigation.recovery_force_half_turn"] = navigationRecoveryForceHalfTurn_;
     data["navigation.clearance_turn_count"] = navigationClearanceTurnCount_;
     data["navigation.strategy"] = navigationStrategy_;
-    data["navigation.frontier.pose_x_mm"] = frontierExplorer_.xMm();
-    data["navigation.frontier.pose_y_mm"] = frontierExplorer_.yMm();
-    data["navigation.frontier.known_cells"] = frontierExplorer_.knownCells();
-    data["navigation.frontier.frontier_count"] = frontierExplorer_.frontierCount();
-    data["navigation.frontier.path_cells"] = frontierExplorer_.pathLength();
-    data["navigation.frontier.replan_count"] = frontierExplorer_.replanCount();
-    data["navigation.frontier.complete"] = frontierExplorer_.complete();
-    data["navigation.wander_avoidance_count"] = wanderAvoidanceCount_;
-    data["navigation.wander.pose_x_mm"] = wanderXmm_;
-    data["navigation.wander.pose_y_mm"] = wanderYmm_;
-    data["navigation.wander.visited_cells"] = wanderVisitedCellCount_;
-    data["weight.detected"] = weightSectorMask_ != 0;
-    data["weight.sector_mask"] = weightSectorMask_;
-    data["weight.nearest_mm"] = weightNearestMm_;
-    data["weight.direction"] = weightDirection_;
     data["navigation.gap_passable"] = navigationGapPassable_;
     data["navigation.gap_width_mm"] = navigationGapWidthMm_;
     data["navigation.gap_centre_column_x2"] = navigationGapCentreColumnX2_;
     data["navigation.matrix_floor_rows"] = navigationMatrixFloorRows_;
+    data["mission.plan_valid"] = missionPlanValid_;
+    data["mission.active"] = navigationActive_ && navigationStrategy_ == 3;
+    data["mission.waypoint_index"] = missionWaypointIndex_;
+    data["mission.waypoint_count"] = missionWaypointCount_;
+    data["mission.targets_visited"] = missionTargetsVisited_;
+    data["mission.target_count"] = missionTargetCount_;
+    data["mission.pose_x_mm"] = missionPoseXmm_;
+    data["mission.pose_y_mm"] = missionPoseYmm_;
+    data["mission.heading_deg"] = missionArenaHeadingDeg_;
+    data["mission.blocked"] = missionBlockedSinceMs_ != 0;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
     data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
@@ -1472,69 +1376,6 @@ void BluetoothDebugWorkflow::readTofSensors()
         tofDistanceMm_[i] = Tof::read(i);
         tofTimedOut_[i] = Tof::timedOut(i);
     }
-    updateWeightDetection();
-}
-
-void BluetoothDebugWorkflow::updateWeightDetection()
-{
-    static const char* BOTTOM_NAMES[4] = {
-        "bottom_left_left", "bottom_mid_left",
-        "bottom_mid_right", "bottom_right_right"
-    };
-    static const char* TOP_NAMES[4] = {
-        "top_left_left", "top_mid_left", "top_mid_right", "top_right_right"
-    };
-    static const int8_t DIRECTIONS[4] = {-2, -1, 1, 2};
-    constexpr uint16_t MAX_WEIGHT_RANGE_MM = 1200;
-    constexpr uint16_t MIN_TOP_BOTTOM_GAP_MM = 150;
-    constexpr uint8_t CONFIRM_POLLS = 3;
-
-    weightSectorMask_ = 0;
-    weightNearestMm_ = 0;
-    weightDirection_ = 0;
-    for (uint8_t sector = 0; sector < 4; ++sector)
-    {
-        int8_t bottomIndex = -1;
-        int8_t topIndex = -1;
-        for (uint8_t i = 0; i < tofSensorCount_; ++i)
-        {
-            if (strcmp(tofSensorNames_[i], BOTTOM_NAMES[sector]) == 0)
-                bottomIndex = static_cast<int8_t>(i);
-            if (strcmp(tofSensorNames_[i], TOP_NAMES[sector]) == 0)
-                topIndex = static_cast<int8_t>(i);
-        }
-        bool lowObject = false;
-        uint16_t bottomMm = 0;
-        if (bottomIndex >= 0 && topIndex >= 0 &&
-            tofAvailable_[bottomIndex] && !tofTimedOut_[bottomIndex] &&
-            tofAvailable_[topIndex] && !tofTimedOut_[topIndex])
-        {
-            const int bottom = tofDistanceMm_[bottomIndex];
-            const int top = tofDistanceMm_[topIndex];
-            if (bottom >= 30 && bottom <= MAX_WEIGHT_RANGE_MM && top >= 30)
-            {
-                bottomMm = static_cast<uint16_t>(bottom);
-                lowObject = top >= bottom + MIN_TOP_BOTTOM_GAP_MM;
-            }
-        }
-        if (lowObject)
-        {
-            if (weightEvidence_[sector] < CONFIRM_POLLS)
-                ++weightEvidence_[sector];
-        }
-        else
-            weightEvidence_[sector] = 0;
-
-        if (weightEvidence_[sector] >= CONFIRM_POLLS)
-        {
-            weightSectorMask_ |= static_cast<uint8_t>(1U << sector);
-            if (weightNearestMm_ == 0 || bottomMm < weightNearestMm_)
-            {
-                weightNearestMm_ = bottomMm;
-                weightDirection_ = DIRECTIONS[sector];
-            }
-        }
-    }
 }
 
 void BluetoothDebugWorkflow::updateMotionAndRangeSensors()
@@ -1697,8 +1538,7 @@ void BluetoothDebugWorkflow::updateNavigation()
 
     // Navigation deliberately ignores every bottom point TOF. Those sensors
     // can see one another/chassis hardware and are reserved for weight sensing
-    // and mapping. Middle top sensors feed the forward estimate; the new
-    // far-left/far-right top sensors feed their respective avoidance sides.
+    // and mapping. Only the two top point TOFs feed forward navigation.
     uint16_t frontCandidates[MAX_TOF_SENSORS + 1] = {};
     uint8_t frontCandidateCount = 0;
     for (uint8_t i = 0; i < tofSensorCount_; ++i)
@@ -1708,13 +1548,7 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (strncmp(tofSensorNames_[i], "top_", 4) != 0)
             continue;
         const int value = tofDistanceMm_[i];
-        if (value < 30 || value > 3500)
-            continue;
-        if (strcmp(tofSensorNames_[i], "top_left_left") == 0)
-            includeMinimum(left, value, 3500);
-        else if (strcmp(tofSensorNames_[i], "top_right_right") == 0)
-            includeMinimum(right, value, 3500);
-        else
+        if (value >= 30 && value <= 3500)
             frontCandidates[frontCandidateCount++] = static_cast<uint16_t>(value);
     }
     for (uint8_t i = 0; i < ultrasoundSensorCount_; ++i)
@@ -2185,373 +2019,6 @@ void BluetoothDebugWorkflow::updateNavigation()
             static_cast<int16_t>(lroundf(basePower - correction)), 75, 100);
         setDrive(-channelAPower, -channelBPower);
     };
-
-    // Strategy 4 deliberately has no occupancy grid or global map. It reacts
-    // only to the current sensor field, while the desktop Arena View remains
-    // free to draw the live rays and pose for the operator.
-    if (navigationStrategy_ == 4)
-    {
-        const int32_t wanderDelta1 = encoders_.firstCount() - wanderLastEncoder1_;
-        const int32_t wanderDelta2 = encoders_.secondCount() - wanderLastEncoder2_;
-        wanderLastEncoder1_ = encoders_.firstCount();
-        wanderLastEncoder2_ = encoders_.secondCount();
-        const float wanderDistanceMm =
-            ((-wanderDelta1 * ENCODER_1_MM_PER_COUNT) +
-             (wanderDelta2 * ENCODER_2_MM_PER_COUNT)) * 0.5f;
-        const float wanderRelativeHeading =
-            (imu_.headingDeg() - wanderStartHeadingDeg_) * DEG_TO_RAD;
-        wanderXmm_ += wanderDistanceMm * sinf(wanderRelativeHeading);
-        wanderYmm_ += wanderDistanceMm * cosf(wanderRelativeHeading);
-
-        auto visitedIndexAt = [&](float xMm, float yMm) -> int16_t {
-            const int x = WANDER_VISITED_SIZE / 2 +
-                static_cast<int>(lroundf(xMm / WANDER_VISITED_CELL_MM));
-            const int y = WANDER_VISITED_SIZE / 2 +
-                static_cast<int>(lroundf(yMm / WANDER_VISITED_CELL_MM));
-            if (x < 0 || y < 0 || x >= WANDER_VISITED_SIZE || y >= WANDER_VISITED_SIZE)
-                return -1;
-            return static_cast<int16_t>(y * WANDER_VISITED_SIZE + x);
-        };
-        const int16_t currentVisitedIndex = visitedIndexAt(wanderXmm_, wanderYmm_);
-        bool enteredVisitedCell = false;
-        if (currentVisitedIndex >= 0 && currentVisitedIndex != wanderCurrentCellIndex_)
-        {
-            enteredVisitedCell = wanderVisited_[currentVisitedIndex] != 0;
-            if (wanderVisited_[currentVisitedIndex] == 0) ++wanderVisitedCellCount_;
-            if (wanderVisited_[currentVisitedIndex] < 255)
-                ++wanderVisited_[currentVisitedIndex];
-            wanderCurrentCellIndex_ = currentVisitedIndex;
-        }
-        auto visitsToward = [&](float relativeAngleDeg) -> uint8_t {
-            const float angle = wanderRelativeHeading + relativeAngleDeg * DEG_TO_RAD;
-            const int16_t target = visitedIndexAt(
-                wanderXmm_ + 700.0f * sinf(angle),
-                wanderYmm_ + 700.0f * cosf(angle));
-            return target < 0 ? 255 : wanderVisited_[target];
-        };
-        auto beginWanderTurn = [&](bool turnRight, float angleDeg) {
-            wanderTurnRight_ = turnRight;
-            navigationTargetHeadingDeg_ = normaliseHeading(
-                imu_.headingDeg() + (turnRight ? angleDeg : -angleDeg));
-            navigationState_ = NAV_WANDER_TURN;
-            navigationTurnSettledSinceMs_ = 0;
-            navigationTurnPulseStartedMs_ = now;
-            navigationTurnCoastUntilMs_ = 0;
-            navigationTurnDirection_ = 0;
-        };
-        auto reverseDistanceMm = [&]() {
-            const float first = fabsf(
-                (encoders_.firstCount() - wanderReverseStartEncoder1_) *
-                ENCODER_1_MM_PER_COUNT);
-            const float second = fabsf(
-                (encoders_.secondCount() - wanderReverseStartEncoder2_) *
-                ENCODER_2_MM_PER_COUNT);
-            return (first + second) * 0.5f;
-        };
-        auto chooseOpenRight = [&]() {
-            // Prefer a physically confirmed 8x8 gap. Otherwise compare both
-            // side ranges; alternate ties so the robot does not settle into a
-            // permanent clockwise or anticlockwise circuit.
-            if (navigationGapPassable_ && navigationGapCentreColumnX2_ != 0)
-                return navigationGapCentreColumnX2_ > 0;
-            if (left != 0xFFFF && right != 0xFFFF &&
-                abs(static_cast<int>(right) - static_cast<int>(left)) > 100)
-                return right > left;
-            if (leftBlocked != rightBlocked) return !rightBlocked;
-            const uint8_t leftVisits = visitsToward(-55.0f);
-            const uint8_t rightVisits = visitsToward(55.0f);
-            if (leftVisits != rightVisits) return rightVisits < leftVisits;
-            wanderTurnRight_ = !wanderTurnRight_;
-            return wanderTurnRight_;
-        };
-
-        switch (navigationState_)
-        {
-            case NAV_WANDER_REVERSE:
-            {
-                // Reverse until at least one side of a U-shaped trap clears;
-                // cap the manoeuvre so a failed side sensor cannot cause an
-                // endless reverse.
-                setDrive(100, 100);
-                const float backedMm = reverseDistanceMm();
-                const bool leftClear = left == 0xFFFF || left > 350;
-                const bool rightClear = right == 0xFFFF || right > 350;
-                if ((backedMm >= 200.0f && (leftClear || rightClear)) ||
-                    backedMm >= 650.0f)
-                {
-                    setDrive(0, 0);
-                    beginWanderTurn(chooseOpenRight(), 90.0f);
-                }
-                return;
-            }
-
-            case NAV_WANDER_TURN:
-                if (runHeadingTurn())
-                {
-                    navigationState_ = NAV_WANDER_DRIVE;
-                    navigationTargetHeadingDeg_ = imu_.headingDeg();
-                    wanderNextDecisionMs_ = now + 5000U + (now % 4000U);
-                }
-                return;
-
-            default:
-                navigationState_ = NAV_WANDER_DRIVE;
-                break;
-        }
-
-        const bool boxedIn = frontBlocked &&
-            left != 0xFFFF && right != 0xFFFF && left < 350 && right < 350;
-        if (boxedIn)
-        {
-            navigationState_ = NAV_WANDER_REVERSE;
-            wanderReverseStartEncoder1_ = encoders_.firstCount();
-            wanderReverseStartEncoder2_ = encoders_.secondCount();
-            ++wanderAvoidanceCount_;
-            setDrive(100, 100);
-            link_.log("WARNING", "Reactive wander found a U-shaped trap; reversing to a clear side");
-            return;
-        }
-
-        if (frontBlocked)
-        {
-            ++wanderAvoidanceCount_;
-            // Use a smaller deflection when the matrix has identified a real
-            // passable off-centre gap; use a right-angle avoidance turn for a
-            // broad wall or when no forward gap is known.
-            const bool turnRight = chooseOpenRight();
-            const float turnDeg = navigationGapPassable_ ? 35.0f : 85.0f;
-            setDrive(0, 0);
-            beginWanderTurn(turnRight, turnDeg);
-            return;
-        }
-
-        if (leftBlocked != rightBlocked)
-        {
-            ++wanderAvoidanceCount_;
-            // Ultrasounds face sideways: steer away before the chassis reaches
-            // the wall, without committing to a full 90 degree corner turn.
-            beginWanderTurn(leftBlocked, 25.0f);
-            return;
-        }
-
-        // A bottom-only return is a low object rather than a wall. Bias the
-        // wander heading toward a newly confirmed weight sector once, while
-        // leaving the top sensors in charge of collision avoidance.
-        if (weightSectorMask_ != 0 && weightSectorMask_ != wanderLastWeightMask_)
-        {
-            wanderLastWeightMask_ = weightSectorMask_;
-            const bool targetRight = weightDirection_ > 0;
-            const float targetTurnDeg = abs(weightDirection_) >= 2 ? 35.0f : 18.0f;
-            beginWanderTurn(targetRight, targetTurnDeg);
-            return;
-        }
-        if (weightSectorMask_ == 0) wanderLastWeightMask_ = 0;
-
-        // Crossing into a previously visited 200 mm cell causes an immediate
-        // preference for the less-visited side. The live obstacle layer can
-        // still force the only physically open route when retracing is needed.
-        if (enteredVisitedCell)
-        {
-            beginWanderTurn(chooseOpenRight(), 45.0f);
-            wanderNextDecisionMs_ = now + 5000U;
-            return;
-        }
-
-        // Periodic gentle heading changes make this an explorer rather than a
-        // straight-line wall shuttle. They are suppressed beside close walls.
-        if (static_cast<int32_t>(now - wanderNextDecisionMs_) >= 0 &&
-            !leftBlocked && !rightBlocked)
-        {
-            const bool turnRight = chooseOpenRight();
-            beginWanderTurn(turnRight, 30.0f);
-            return;
-        }
-
-        driveOnHeading(navigationTargetHeadingDeg_, 100);
-        return;
-    }
-
-    // Strategy 3 is a map-driven explorer.  The existing three reactive
-    // strategies remain completely unchanged below this early return.
-    if (navigationStrategy_ == 3)
-    {
-        // Completion is latched until the operator explicitly starts a new
-        // run.  Otherwise this branch would re-enter exploration and emit the
-        // completion log on every planning interval.
-        if (navigationState_ == NAV_COMPLETE && frontierExplorer_.complete())
-        {
-            setDrive(0, 0);
-            return;
-        }
-        navigationState_ = NAV_FRONTIER_EXPLORE;
-        frontierExplorer_.updatePose(
-            encoders_.firstCount(), encoders_.secondCount(), imu_.headingDeg());
-
-        if (now - frontierLastMapMs_ >= 100U)
-        {
-            frontierLastMapMs_ = now;
-            if (front != 0xFFFF)
-                frontierExplorer_.observeRay(
-                    front, 0.0f, front < 3500 || navigationMatrixBroadWall_,
-                    25.0f, 245.0f);
-            // Side ultrasounds and angled outer TOFs have different origins
-            // and bearings; preserve those instead of projecting the combined
-            // left/right minimum as one false ray.
-            for (uint8_t i = 0; i < ultrasoundSensorCount_ && i < 2; ++i)
-            {
-                if (!ultrasoundSensors_[i].valid() || ultrasoundSensors_[i].timedOut())
-                    continue;
-                const uint16_t distance = ultrasoundSensors_[i].distanceMm();
-                frontierExplorer_.observeRay(
-                    distance, i == 0 ? -90.0f : 90.0f, distance < 3000,
-                    i == 0 ? -195.0f : 190.0f, 0.0f);
-            }
-            for (uint8_t i = 0; i < tofSensorCount_; ++i)
-            {
-                if (!tofAvailable_[i] || tofTimedOut_[i] ||
-                    tofDistanceMm_[i] < 30 || tofDistanceMm_[i] > 3500)
-                    continue;
-                if (strcmp(tofSensorNames_[i], "top_left_left") == 0)
-                    frontierExplorer_.observeRay(
-                        static_cast<uint16_t>(tofDistanceMm_[i]), -45.0f, true,
-                        -180.0f, 120.0f);
-                else if (strcmp(tofSensorNames_[i], "top_right_right") == 0)
-                    frontierExplorer_.observeRay(
-                        static_cast<uint16_t>(tofDistanceMm_[i]), 45.0f, true,
-                        180.0f, 120.0f);
-            }
-
-            // Preserve the 8x8's angular information instead of collapsing it
-            // to one forward ray.  A vertical median rejects isolated pixels.
-            if (tof8x8_.available() && tof8x8_.lastReadSucceeded())
-            {
-                const uint8_t rows = 8U - min(
-                    navigationMatrixFloorRows_, static_cast<uint8_t>(4U));
-                for (uint8_t col = 0; col < 8; ++col)
-                {
-                    uint16_t values[8] = {};
-                    uint8_t count = 0;
-                    for (uint8_t row = 0; row < rows; ++row)
-                    {
-                        const uint16_t value = tof8x8_.distanceMm(row, col);
-                        if (value >= 30 && value <= 3500) values[count++] = value;
-                    }
-                    if (count < 3) continue;
-                    for (uint8_t i = 1; i < count; ++i)
-                    {
-                        const uint16_t value = values[i];
-                        uint8_t j = i;
-                        while (j > 0 && values[j - 1] > value)
-                        {
-                            values[j] = values[j - 1];
-                            --j;
-                        }
-                        values[j] = value;
-                    }
-                    const uint16_t distance = values[count / 2];
-                    const float angle = ((static_cast<float>(col) - 3.5f) / 8.0f) *
-                                        navigationMatrixFovDeg_;
-                    frontierExplorer_.observeRay(distance, angle, distance < 3000,
-                                                 25.0f, 245.0f);
-                }
-            }
-        }
-
-        // Aim beyond the immediately adjacent 100 mm cell.  Treating every
-        // grid cell as a precision stop made the chassis twitch from one tiny
-        // correction to the next; this gives it a useful rolling look-ahead.
-        while (frontierExplorer_.hasWaypoint() &&
-               frontierExplorer_.waypointReached(130.0f)) {}
-        // A close wall seen while intentionally rotating is expected. Only
-        // invalidate a route when the chassis is in its forward-follow phase.
-        if (frontBlocked && frontierExplorer_.hasWaypoint() && !frontierTurning_)
-        {
-            frontierExplorer_.invalidatePath();
-            frontierTurning_ = false;
-            setDrive(0, 0);
-        }
-
-        // Continue a route-search scan on every control cycle. Planning itself
-        // is deliberately rate limited, but motor control must not be.
-        if (!frontierExplorer_.hasWaypoint() && frontierTurning_)
-        {
-            if (runHeadingTurn())
-            {
-                frontierTurning_ = false;
-                frontierLastPlanMs_ = now;
-            }
-            return;
-        }
-
-        // Keep a valid route.  Replanning once per second changed the chosen
-        // frontier underneath the controller and was the main source of rapid
-        // left/right reversals.  Replan only after arrival or a real blockage.
-        if (!frontierExplorer_.hasWaypoint() && now - frontierLastPlanMs_ >= 350U)
-        {
-            frontierLastPlanMs_ = now;
-            frontierTurning_ = false;
-            if (!frontierExplorer_.plan(navigationRobotWidthMm_, navigationGapMarginMm_))
-            {
-                if (frontierExplorer_.complete())
-                {
-                    navigationState_ = NAV_COMPLETE;
-                    setDrive(0, 0);
-                    link_.log("INFO", "Frontier exploration complete; no reachable unknown boundary remains");
-                    return;
-                }
-                // A missing route is not completion. Scan one controlled 45
-                // degree sector, settle on it, collect another map slice and
-                // retry. This avoids the former unbounded full-power spin.
-                if (!frontierTurning_)
-                {
-                    navigationTargetHeadingDeg_ = normaliseHeading(
-                        imu_.headingDeg() + 45.0f);
-                    frontierTurning_ = true;
-                    navigationTurnSettledSinceMs_ = 0;
-                    navigationTurnPulseStartedMs_ = now;
-                    navigationTurnCoastUntilMs_ = 0;
-                    navigationTurnDirection_ = 0;
-                }
-                if (runHeadingTurn())
-                {
-                    frontierTurning_ = false;
-                    frontierLastPlanMs_ = now;
-                }
-                return;
-            }
-        }
-
-        if (!frontierExplorer_.hasWaypoint())
-        {
-            setDrive(0, 0);
-            return;
-        }
-
-        navigationTargetHeadingDeg_ = frontierExplorer_.waypointHeadingDeg();
-        const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
-        // Enter a controlled turn only for a meaningful heading error.  The
-        // shared turn controller pulses the 100% command near the target,
-        // coasts before reversing torque and requires the heading to settle.
-        // The separate entry/exit thresholds prevent threshold chatter.
-        if (!frontierTurning_ && fabsf(error) > 20.0f)
-        {
-            frontierTurning_ = true;
-            navigationTurnSettledSinceMs_ = 0;
-            navigationTurnPulseStartedMs_ = now;
-            navigationTurnCoastUntilMs_ = 0;
-            navigationTurnDirection_ = 0;
-        }
-        if (frontierTurning_)
-        {
-            if (runHeadingTurn()) frontierTurning_ = false;
-        }
-        else
-        {
-            driveOnHeading(navigationTargetHeadingDeg_, 100);
-        }
-        return;
-    }
-
     auto beginForwardLeg = [&](float exactHeading) {
         navigationHeadingReferenceDeg_ = normaliseHeading(exactHeading);
         navigationMotionStartedMs_ = now;
@@ -2726,6 +2193,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             navigationState_ == NAV_FOLLOW_WALL ||
             navigationState_ == NAV_SWEEP ||
             navigationState_ == NAV_LANE_SHIFT ||
+            navigationState_ == NAV_MISSION_TRACK ||
             navigationState_ == NAV_OBSTACLE_OFFSET ||
             navigationState_ == NAV_OBSTACLE_PASS ||
             navigationState_ == NAV_OBSTACLE_RETURN;
@@ -2759,6 +2227,140 @@ void BluetoothDebugWorkflow::updateNavigation()
         navigationMotionConsistent_ = true;
         setDrive(100, 100);
         link_.log("WARNING", "U-shaped enclosure detected; reversing to find turning clearance");
+    }
+
+    if (navigationState_ == NAV_MISSION_TRACK && navigationStrategy_ == 3)
+    {
+        if (!lastImuSampleValid_)
+        {
+            setDrive(0, 0);
+            return;
+        }
+        // Mission coordinates use screen-style arena axes: +X right/east,
+        // +Y down/south and positive headings clockwise. BNO055 heading is
+        // clockwise too, so the arena/BNO alignment is a fixed start offset.
+        if (!missionPoseInitialised_)
+        {
+            missionPoseXmm_ = missionStartXmm_;
+            missionPoseYmm_ = missionStartYmm_;
+            missionArenaHeadingDeg_ = missionStartArenaHeadingDeg_;
+            missionStartImuHeadingDeg_ = imu_.headingDeg();
+            missionLastEncoder1_ = encoders_.firstCount();
+            missionLastEncoder2_ = encoders_.secondCount();
+            missionPoseInitialised_ = true;
+        }
+
+        const int32_t currentEncoder1 = encoders_.firstCount();
+        const int32_t currentEncoder2 = encoders_.secondCount();
+        const int32_t deltaEncoder1 = currentEncoder1 - missionLastEncoder1_;
+        const int32_t deltaEncoder2 = currentEncoder2 - missionLastEncoder2_;
+        missionLastEncoder1_ = currentEncoder1;
+        missionLastEncoder2_ = currentEncoder2;
+
+        if (lastImuSampleValid_)
+        {
+            missionArenaHeadingDeg_ = normaliseHeading(
+                missionStartArenaHeadingDeg_ +
+                headingDelta(missionStartImuHeadingDeg_, imu_.headingDeg()));
+
+            // Powered straight-run calibration has encoder 1 reversed and
+            // encoder 2 forward in physical robot coordinates.
+            const float leftMm = -deltaEncoder1 * ENCODER_1_MM_PER_COUNT;
+            const float rightMm = deltaEncoder2 * ENCODER_2_MM_PER_COUNT;
+            const float distanceMm = (leftMm + rightMm) * 0.5f;
+            if (fabsf(distanceMm) <= 350.0f)
+            {
+                const float angleRad = missionArenaHeadingDeg_ * DEG_TO_RAD;
+                missionPoseXmm_ += distanceMm * cosf(angleRad);
+                missionPoseYmm_ += distanceMm * sinf(angleRad);
+            }
+        }
+
+        if (missionWaypointIndex_ >= missionWaypointCount_ ||
+            missionTargetsVisited_ >= missionTargetCount_)
+        {
+            setDrive(0, 0);
+            navigationStrategy_ = missionFallbackStrategy_;
+            navigationState_ = NAV_SEEK_WALL;
+            navigationHeadingReferenceDeg_ = imu_.headingDeg();
+            navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
+            navigationLaneIndex_ = 0;
+            navigationSweepLeftReferenceValid_ = false;
+            navigationSweepRightReferenceValid_ = false;
+            navigationSweepProgressMm_ = 0.0f;
+            navigationExpectedSweepLengthValid_ = false;
+            missionBlockedSinceMs_ = 0;
+            beginForwardLeg(navigationHeadingReferenceDeg_);
+            link_.log("INFO", "All pre-laid weight targets visited; switching to roaming strategy");
+            return;
+        }
+
+        const MissionWaypoint& waypoint = missionWaypoints_[missionWaypointIndex_];
+        const float dx = static_cast<float>(waypoint.xMm) - missionPoseXmm_;
+        const float dy = static_cast<float>(waypoint.yMm) - missionPoseYmm_;
+        const float distanceToWaypoint = sqrtf(dx * dx + dy * dy);
+        const float arrivalMm = (waypoint.flags & 0x01) != 0 ? 100.0f : 120.0f;
+
+        if (distanceToWaypoint <= arrivalMm)
+        {
+            setDrive(0, 0);
+            if ((waypoint.flags & 0x01) != 0 &&
+                missionTargetsVisited_ < missionTargetCount_)
+            {
+                ++missionTargetsVisited_;
+                link_.log("INFO", "Pre-laid mission weight location visited");
+            }
+            ++missionWaypointIndex_;
+            missionBlockedSinceMs_ = 0;
+            return;
+        }
+
+        // Known walls/ramps/tubes/dummy weights are already inflated into the
+        // desktop A* route. Live ranging remains a safety layer. If reality
+        // disagrees with the pre-laid map, hold position without aborting the
+        // mission; once the path clears, course-to-waypoint resumes and pulls
+        // the robot back onto the polyline automatically.
+        if (frontBlocked && !navigationGapPassable_)
+        {
+            setDrive(0, 0);
+            if (missionBlockedSinceMs_ == 0)
+            {
+                missionBlockedSinceMs_ = now;
+                link_.log("WARNING", "Pre-laid mission path blocked by live ranging; holding for clearance");
+            }
+            return;
+        }
+        missionBlockedSinceMs_ = 0;
+
+        float desiredArenaHeadingDeg = atan2f(dy, dx) * RAD_TO_DEG;
+        desiredArenaHeadingDeg = normaliseHeading(desiredArenaHeadingDeg);
+        const float targetBnoHeadingDeg = normaliseHeading(
+            missionStartImuHeadingDeg_ +
+            headingDelta(missionStartArenaHeadingDeg_, desiredArenaHeadingDeg));
+        navigationTargetHeadingDeg_ = targetBnoHeadingDeg;
+
+        if (!lastImuSampleValid_)
+        {
+            setDrive(0, 0);
+            return;
+        }
+
+        const float headingError = headingDelta(imu_.headingDeg(), targetBnoHeadingDeg);
+        if (fabsf(headingError) > 18.0f)
+        {
+            // Point-turn until the requested path is reasonably aligned, then
+            // proportional straight-line heading correction takes over.
+            const bool turnRight = headingError > 0.0f;
+            const int16_t turnPower = fabsf(headingError) > 55.0f ? 90 : 80;
+            setDrive(turnRight ? -turnPower : turnPower,
+                     turnRight ? turnPower : -turnPower);
+        }
+        else
+        {
+            const int16_t basePower = distanceToWaypoint < 350.0f ? 78 : 88;
+            driveOnHeading(targetBnoHeadingDeg, basePower);
+        }
+        return;
     }
 
     switch (navigationState_)

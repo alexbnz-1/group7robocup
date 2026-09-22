@@ -8,7 +8,6 @@
 #include <DualEncoder.h>
 #include <HerkulexTeensy.h>
 #include <Hx12kServo.h>
-#include <FrontierExplorer.h>
 #include <RobotDebug.h>
 #include <Tof.h>
 #include <Tof8x8.h>
@@ -43,7 +42,6 @@ private:
     Hx12kServo hx12kD_;
     RobotDebug link_;
     Tof8x8 tof8x8_;
-    FrontierExplorer frontierExplorer_;
     JsonDocument config_;
 
     bool debugMode_ = false;
@@ -115,10 +113,7 @@ private:
         NAV_CLEARANCE_TURN = 19,
         NAV_RECOVERY_REVERSE = 20,
         NAV_RECOVERY_TURN = 21,
-        NAV_FRONTIER_EXPLORE = 22,
-        NAV_WANDER_DRIVE = 23,
-        NAV_WANDER_TURN = 24,
-        NAV_WANDER_REVERSE = 25
+        NAV_MISSION_TRACK = 22
     };
     bool navigationActive_ = false;
     uint8_t navigationState_ = 0;
@@ -199,52 +194,45 @@ private:
     int8_t navigationGapCentreColumnX2_ = 0;
     uint16_t navigationGapWidthMm_ = 0;
 
-    bool navigationMotionConsistent_ = true;
-    uint32_t frontierLastPlanMs_ = 0;
-    uint32_t frontierLastMapMs_ = 0;
-    bool frontierTurning_ = false;
-    uint32_t wanderNextDecisionMs_ = 0;
-    int32_t wanderReverseStartEncoder1_ = 0;
-    int32_t wanderReverseStartEncoder2_ = 0;
-    bool wanderTurnRight_ = true;
-    uint16_t wanderAvoidanceCount_ = 0;
-    static constexpr uint8_t WANDER_VISITED_SIZE = 32;
-    static constexpr uint16_t WANDER_VISITED_CELL_MM = 200;
-    uint8_t wanderVisited_[WANDER_VISITED_SIZE * WANDER_VISITED_SIZE] = {};
-    uint16_t wanderVisitedCellCount_ = 0;
-    float wanderXmm_ = 0.0f;
-    float wanderYmm_ = 0.0f;
-    float wanderStartHeadingDeg_ = 0.0f;
-    int32_t wanderLastEncoder1_ = 0;
-    int32_t wanderLastEncoder2_ = 0;
-    int16_t wanderCurrentCellIndex_ = -1;
-    uint8_t wanderLastWeightMask_ = 0;
+    // Pre-laid mission strategy (navigation.strategy == 3). The desktop GUI
+    // does the expensive grid/A* planning and uploads a compact polyline.
+    // Firmware continuously re-aims at the active waypoint using BNO055 yaw
+    // and encoder distance so small path errors are corrected on the robot.
+    static constexpr uint8_t MAX_MISSION_WAYPOINTS = 64;
+    struct MissionWaypoint {
+        int16_t xMm = 0;
+        int16_t yMm = 0;
+        uint8_t flags = 0;  // bit 0 = real-weight visit point
+    };
+    MissionWaypoint missionWaypoints_[MAX_MISSION_WAYPOINTS] = {};
+    uint8_t missionWaypointCount_ = 0;
+    uint8_t missionWaypointIndex_ = 0;
+    uint8_t missionFallbackStrategy_ = 0;
+    uint8_t missionTargetCount_ = 0;
+    uint8_t missionTargetsVisited_ = 0;
+    bool missionPlanValid_ = false;
+    bool missionPoseInitialised_ = false;
+    float missionStartXmm_ = 0.0f;
+    float missionStartYmm_ = 0.0f;
+    float missionStartArenaHeadingDeg_ = 0.0f;
+    float missionStartImuHeadingDeg_ = 0.0f;
+    float missionPoseXmm_ = 0.0f;
+    float missionPoseYmm_ = 0.0f;
+    float missionArenaHeadingDeg_ = 0.0f;
+    int32_t missionLastEncoder1_ = 0;
+    int32_t missionLastEncoder2_ = 0;
+    uint32_t missionBlockedSinceMs_ = 0;
 
-    // Bottom-only point-TOF returns identify low weights: matching bottom and
-    // top sensors are compared at each fresh 100 ms range poll.
+    // Live low-object/weight visibility from matched bottom/top point-TOF pairs.
+    // Four sectors run far-left, mid-left, mid-right, far-right. A sector is
+    // confirmed only after three fresh 100 ms polls agree that the bottom TOF
+    // sees an object at least 150 mm closer than its matched top TOF.
     uint8_t weightEvidence_[4] = {};
     uint8_t weightSectorMask_ = 0;
     uint16_t weightNearestMm_ = 0;
     int8_t weightDirection_ = 0;
 
-    // Automatic arm sorting uses the debounced logical `detected` value from
-    // the configured D21 inductive input (including its active-low setting).
-    bool armSortingEnabled_ = false;
-    bool armSortingHighPending_ = false;
-    bool armSortingHighConfirmed_ = false;
-    bool armSortingBumperOn_ = false;
-    float armSortingGateTargetDeg_ = NAN;
-    uint32_t armSortingHighSinceMs_ = 0;
-    uint32_t armSortingNextPulseMs_ = 0;
-    uint32_t armSortingPulseEndsMs_ = 0;
-    uint32_t armSortingBumperHoldUntilMs_ = 0;
-    uint32_t armSortingGateHoldUntilMs_ = 0;
-    static constexpr uint8_t ARM_SORTING_HERKULEX_ID = 4;
-    static constexpr uint32_t ARM_SORTING_CONFIRM_MS = 500;
-    static constexpr uint32_t ARM_SORTING_PERIOD_MS = 20000;
-    static constexpr uint32_t ARM_SORTING_PULSE_MS = 1000;
-    static constexpr uint32_t ARM_SORTING_BUMPER_HOLD_MS = 2000;
-    static constexpr uint32_t ARM_SORTING_GATE_HOLD_MS = 5000;
+    bool navigationMotionConsistent_ = true;
 
     static void dispatch(JsonDocument& message, void* context);
     void handleMessage(JsonDocument& message);
@@ -266,10 +254,6 @@ private:
     void sendTof8x8Frame();
     void updateAutomaticServoRead();
     void updateTrackingState(float absoluteAngle);
-    void updateArmSorting(uint32_t now);
-    bool zeroArmSortingGate();
-    void setArmSortingGate(float relativeAngleDeg);
-    void setArmSortingBumpers(bool enabled);
     JsonObject findParameter(const char* name);
     JsonObject findCommand(const char* name);
 };
