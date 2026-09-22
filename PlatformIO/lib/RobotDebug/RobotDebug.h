@@ -21,7 +21,6 @@ private:
     // Normal telemetry now includes navigation phase/heading and can exceed
     // the former 3072-byte allocation once encoder counts gain more digits.
     static constexpr size_t TX_BUFFER_SIZE = 4096;
-    static constexpr size_t TX_CHUNK_SIZE = 20;
     Stream& stream_;
     MessageHandler handler_;
     void* context_;

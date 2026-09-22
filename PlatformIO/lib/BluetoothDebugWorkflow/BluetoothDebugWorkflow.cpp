@@ -3,6 +3,17 @@
 #include <config.h>
 #include <debug_config.generated.h>
 
+namespace {
+// BNO055 does not provide absolute velocity. Detect the beginning of a real
+// chassis-motion event from linear acceleration at the 50 ms IMU sample rate,
+// then expose an event counter so the desktop map cannot miss a short launch
+// acceleration between slower telemetry frames.
+bool imuMotionActive = false;
+uint8_t imuMotionHighSamples = 0;
+uint8_t imuMotionLowSamples = 0;
+uint32_t imuMotionEventCount = 0;
+}
+
 BluetoothDebugWorkflow::BluetoothDebugWorkflow(
     HardwareSerialIMXRT& bluetoothPort,
     HardwareSerial& herkulexPort
@@ -28,6 +39,9 @@ void BluetoothDebugWorkflow::begin()
     // parser. Extra storage prevents complete newline-terminated commands from
     // being truncated before link_.update() can consume them.
     bluetoothPort_.addMemoryForRead(bluetoothRxBuffer_, sizeof(bluetoothRxBuffer_));
+    // Large telemetry and matrix lines must be queued without blocking the
+    // navigation loop while the 115200-baud UART physically shifts them out.
+    bluetoothPort_.addMemoryForWrite(bluetoothTxBuffer_, sizeof(bluetoothTxBuffer_));
     bluetoothPort_.begin(BluetoothConfig::BAUD);
     servos_.begin();
     servos_.torqueOff(0xFE);
@@ -66,6 +80,10 @@ void BluetoothDebugWorkflow::begin()
 
 void BluetoothDebugWorkflow::update()
 {
+    const uint32_t updateStartedUs = micros();
+    if (lastUpdateStartedUs_ != 0)
+        maxUpdateGapUs_ = max(maxUpdateGapUs_, updateStartedUs - lastUpdateStartedUs_);
+    lastUpdateStartedUs_ = updateStartedUs;
     link_.update();
     const uint32_t now = millis();
     for (uint8_t i = 0; i < digitalInputCount_; ++i)
@@ -508,6 +526,22 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         navigationTargetHeadingDeg_ = navigationHeadingReferenceDeg_;
         navigationLaneIndex_ = 0;
         navigationSweepTurnRight_ = true;
+        navigationSweepLeftReferenceValid_ = false;
+        navigationSweepRightReferenceValid_ = false;
+        navigationSweepLateralErrorMm_ = 0;
+        navigationSweepProgressMm_ = 0.0f;
+        navigationExpectedSweepLengthMm_ = 0.0f;
+        navigationExpectedSweepLengthValid_ = false;
+        navigationSweepProgressLastEncoder1_ = encoders_.firstCount();
+        navigationSweepProgressLastEncoder2_ = encoders_.secondCount();
+        navigationDetourRight_ = true;
+        navigationDetourOriginalHeadingDeg_ = navigationHeadingReferenceDeg_;
+        navigationDetourOffsetMm_ = 0.0f;
+        navigationDetourEdgeCleared_ = false;
+        navigationDetourObstacleSeen_ = false;
+        navigationDetourClearSamples_ = 0;
+        navigationDetourLastTriggerCount_ = 0;
+        navigationObstacleCount_ = 0;
         navigationMotionConsistent_ = true;
         stopped_ = false;
         dcMotor203SecondDeadman_ = false;
@@ -750,6 +784,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     data["system.uptime_s"] = now / 1000.0f;
     data["system.debug_mode"] = debugMode_;
     data["system.stopped"] = stopped_;
+    data["system.navigation_controller_version"] = 6;
+    data["system.max_loop_gap_ms"] = maxUpdateGapUs_ / 1000.0f;
     data["bluetooth.messages_received"] = receivedMessages_;
     data["servo.last_id"] = lastServoId_;
     data["servo.commanded_angle_deg"] = lastServoAngleDeg_;
@@ -786,12 +822,47 @@ void BluetoothDebugWorkflow::sendTelemetry()
         case NAV_LANE_SHIFT: navigationPhase = "lane_shift"; break;
         case NAV_LANE_TURN_IN: navigationPhase = "lane_turn_in"; break;
         case NAV_COMPLETE: navigationPhase = "complete"; break;
+        case NAV_OBSTACLE_TURN_OUT: navigationPhase = "obstacle_turn_out"; break;
+        case NAV_OBSTACLE_OFFSET: navigationPhase = "obstacle_offset"; break;
+        case NAV_OBSTACLE_TURN_FORWARD: navigationPhase = "obstacle_turn_forward"; break;
+        case NAV_OBSTACLE_PASS: navigationPhase = "obstacle_pass"; break;
+        case NAV_OBSTACLE_TURN_BACK: navigationPhase = "obstacle_turn_back"; break;
+        case NAV_OBSTACLE_RETURN: navigationPhase = "obstacle_return"; break;
+        case NAV_OBSTACLE_TURN_IN: navigationPhase = "obstacle_turn_in"; break;
+        case NAV_ESCAPE_REVERSE: navigationPhase = "escape_reverse"; break;
+        case NAV_ESCAPE_TURN: navigationPhase = "escape_turn"; break;
+        case NAV_CLEARANCE_TURN: navigationPhase = "clearance_turn"; break;
         default: break;
     }
     data["navigation.phase"] = navigationPhase;
     data["navigation.lane"] = navigationLaneIndex_;
     data["navigation.target_heading_deg"] = navigationTargetHeadingDeg_;
     data["navigation.motion_consistent"] = navigationMotionConsistent_;
+    data["navigation.matrix_close_zones"] = navigationMatrixCloseZones_;
+    data["navigation.matrix_usable_zones"] = navigationMatrixUsableZones_;
+    data["navigation.matrix_broad_wall"] = navigationMatrixBroadWall_;
+    if (navigationState_ == NAV_SWEEP)
+    {
+        const bool remainingSideValid = navigationSweepTurnRight_
+            ? navigationSweepRightReferenceValid_
+            : navigationSweepLeftReferenceValid_;
+        if (remainingSideValid)
+            data["navigation.remaining_width_mm"] = navigationSweepTurnRight_
+                ? navigationSweepRightReferenceMm_
+                : navigationSweepLeftReferenceMm_;
+    }
+    data["navigation.next_shift_mm"] = navigationSweepLateralErrorMm_ > 0
+        ? navigationSweepLateralErrorMm_ : 0;
+    data["navigation.sweep_progress_mm"] = navigationSweepProgressMm_;
+    data["navigation.expected_sweep_length_mm"] =
+        navigationExpectedSweepLengthValid_ ? navigationExpectedSweepLengthMm_ : 0.0f;
+    const bool detourActive = navigationState_ >= NAV_OBSTACLE_TURN_OUT &&
+        navigationState_ <= NAV_OBSTACLE_TURN_IN;
+    data["navigation.detour_active"] = detourActive;
+    data["navigation.detour_side"] = detourActive ?
+        (navigationDetourRight_ ? 1 : -1) : 0;
+    data["navigation.obstacle_count"] = navigationObstacleCount_;
+    data["navigation.detour_offset_mm"] = navigationDetourOffsetMm_;
     data["encoder.1.count"] = encoders_.firstCount();
     data["encoder.1.delta"] = encoders_.firstDelta();
     data["encoder.1.counts_per_s"] = encoders_.firstCountsPerSecond();
@@ -825,6 +896,8 @@ void BluetoothDebugWorkflow::sendTelemetry()
     }
     data["imu.available"] = imu_.available();
     data["imu.valid"] = lastImuSampleValid_;
+    data["imu.motion_active"] = imuMotionActive;
+    data["imu.motion_event_count"] = imuMotionEventCount;
     if (imu_.available()) {
         data["imu.bus"] = imu_.bus();
         data["imu.address"] = imu_.address();
@@ -884,6 +957,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
     if (!isnan(servoPositionErrorDeg_))
         data["servo.position_error_deg"] = servoPositionErrorDeg_;
     link_.send(message);
+    maxUpdateGapUs_ = 0;
 
     // Keep electrical diagnostics in a second, slower packet. These raw pin
     // values change far less often than motion state and sending them at the
@@ -1117,6 +1191,55 @@ void BluetoothDebugWorkflow::updateMotionAndRangeSensors()
         lastMotionSampleMs_ = now;
         encoders_.sample(now);
         lastImuSampleValid_ = imu_.update();
+        if (lastImuSampleValid_)
+        {
+            const float ax = imu_.linearAccelX();
+            const float ay = imu_.linearAccelY();
+            const float az = imu_.linearAccelZ();
+            const float motionAccel = sqrtf(ax * ax + ay * ay + az * az);
+            constexpr float IMU_MOTION_START_MPS2 = 0.22f;
+            constexpr float IMU_MOTION_STOP_MPS2 = 0.08f;
+
+            if (!imuMotionActive)
+            {
+                imuMotionLowSamples = 0;
+                if (motionAccel >= IMU_MOTION_START_MPS2)
+                {
+                    if (imuMotionHighSamples < 255)
+                        ++imuMotionHighSamples;
+                    if (imuMotionHighSamples >= 2)
+                    {
+                        imuMotionActive = true;
+                        imuMotionHighSamples = 0;
+                        ++imuMotionEventCount;
+                    }
+                }
+                else
+                    imuMotionHighSamples = 0;
+            }
+            else
+            {
+                imuMotionHighSamples = 0;
+                if (motionAccel <= IMU_MOTION_STOP_MPS2)
+                {
+                    if (imuMotionLowSamples < 255)
+                        ++imuMotionLowSamples;
+                    if (imuMotionLowSamples >= 3)
+                    {
+                        imuMotionActive = false;
+                        imuMotionLowSamples = 0;
+                    }
+                }
+                else
+                    imuMotionLowSamples = 0;
+            }
+        }
+        else
+        {
+            imuMotionActive = false;
+            imuMotionHighSamples = 0;
+            imuMotionLowSamples = 0;
+        }
     }
     if (now - lastRangePollMs_ >= 100U)
     {
@@ -1132,6 +1255,14 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
     dcMotor203Second_.stop();
     dcMotor203SecondActive_ = false;
     dcMotor203SecondDeadman_ = false;
+    navigationSweepLeftReferenceValid_ = false;
+    navigationSweepRightReferenceValid_ = false;
+    navigationSweepLateralErrorMm_ = 0;
+    navigationSweepProgressMm_ = 0.0f;
+    navigationDetourOffsetMm_ = 0.0f;
+    navigationDetourEdgeCleared_ = false;
+    navigationDetourObstacleSeen_ = false;
+    navigationDetourClearSamples_ = 0;
     if (reason != nullptr)
         link_.log("INFO", reason);
 }
@@ -1148,13 +1279,31 @@ void BluetoothDebugWorkflow::updateNavigation()
     }
 
     constexpr uint16_t FRONT_AVOID_MM = 300;
+    // At the observed ~1.2 s matrix frame cadence the robot can travel over
+    // 200 mm between frames. A genuinely broad wall therefore needs an
+    // earlier threshold than a point return. Requiring three quarters of the
+    // centre zones prevents one or two bad pixels from causing a turn.
+    constexpr uint16_t MATRIX_BROAD_WALL_MM = 550;
     constexpr uint16_t SIDE_AVOID_MM = 200;
-    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 250;
-    // The previous 300 mm lane spacing left visibly coarse bands in the map.
-    // 200 mm gives substantially more overlap between passes while still
-    // covering roughly the same total arena width.
+    constexpr uint16_t WALL_FOLLOW_TARGET_MM = 200;
+    // 200 mm is now only the nominal spacing. The opposite side ultrasound
+    // determines how much arena width remains, so there is no fixed lane count.
     constexpr float LANE_SPACING_MM = 200.0f;
-    constexpr uint8_t SWEEP_LANE_COUNT = 11;
+    constexpr uint16_t SWEEP_EDGE_TARGET_MM = 250;
+    constexpr uint16_t SWEEP_EDGE_TOLERANCE_MM = 75;
+
+    // Localised forward obstacles are bypassed with a rectangular detour. A
+    // true arena end wall should block the full 8x8 horizontal view, while an
+    // internal wall/obstacle leaves at least one outer flank visibly open.
+    constexpr uint16_t OBSTACLE_FORWARD_GAP_MM = 550;
+    constexpr uint16_t OBSTACLE_MIN_SIDE_ROOM_MM = 450;
+    constexpr float OBSTACLE_EARLY_WALL_MARGIN_MM = 450.0f;
+    constexpr uint16_t OBSTACLE_SIDE_TRACK_MAX_MM = 650;
+    constexpr uint16_t OBSTACLE_SIDE_RELEASE_MM = 800;
+    constexpr float OBSTACLE_CLEAR_MARGIN_MM = 220.0f;
+    constexpr float OBSTACLE_MAX_OFFSET_MM = 1200.0f;
+    constexpr float OBSTACLE_MAX_PASS_MM = 2500.0f;
+
     constexpr float ENCODER_1_MM_PER_COUNT = 0.09094f;
     constexpr float ENCODER_2_MM_PER_COUNT = 0.09592f;
 
@@ -1162,10 +1311,14 @@ void BluetoothDebugWorkflow::updateNavigation()
     static uint32_t wallFollowLastFallCount = 0;
     static uint32_t wallFollowLastGoodMs = 0;
     static bool wallFollowFilterArmed = false;
+    static float laneShiftTargetMm = LANE_SPACING_MM;
+    static uint32_t sweepLeftLastFallCount = 0;
+    static uint32_t sweepRightLastFallCount = 0;
+    static bool sweepReferenceFilterArmed = false;
 
     uint16_t front = 0xFFFF, left = 0xFFFF, right = 0xFFFF;
-    auto includeMinimum = [](uint16_t& target, int value) {
-        if (value >= 30 && value <= 3500)
+    auto includeMinimum = [](uint16_t& target, int value, int maximum = 3500) {
+        if (value >= 30 && value <= maximum)
             target = min(target, static_cast<uint16_t>(value));
     };
 
@@ -1189,26 +1342,49 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (!ultrasoundSensors_[i].valid() || ultrasoundSensors_[i].timedOut())
             continue;
         // Ultrasound A faces robot-left and B faces robot-right.
-        if (i == 0) includeMinimum(left, ultrasoundSensors_[i].distanceMm());
-        else includeMinimum(right, ultrasoundSensors_[i].distanceMm());
+        if (i == 0) includeMinimum(left, ultrasoundSensors_[i].distanceMm(), 5000);
+        else includeMinimum(right, ultrasoundSensors_[i].distanceMm(), 5000);
     }
+    uint8_t matrixLeftOpenColumns = 0;
+    uint8_t matrixRightOpenColumns = 0;
+    uint16_t matrixLeftGapMm = 0;
+    uint16_t matrixRightGapMm = 0;
+    uint16_t matrixBroadValues[32] = {};
+    uint8_t matrixBroadValueCount = 0;
+    uint8_t matrixUsableCentreCount = 0;
     if (tof8x8_.available() && tof8x8_.lastReadSucceeded())
     {
         uint16_t centreValues[32];
         uint8_t centreCount = 0;
+        uint16_t columnValues[8][8] = {};
+        uint8_t columnCounts[8] = {};
+
         for (uint8_t row = 0; row < 8; ++row)
             for (uint8_t col = 0; col < 8; ++col)
             {
                 const uint16_t value = tof8x8_.distanceMm(row, col);
+                // Zero is an invalid return, but a coherent 10-29 mm field is
+                // a real near-contact wall. The 14:57 run produced 12-21 mm
+                // across almost every zone while the chassis pushed into it.
+                if (col >= 2 && col <= 5 && value >= 10 && value <= 3500)
+                {
+                    ++matrixUsableCentreCount;
+                    if (value < MATRIX_BROAD_WALL_MM)
+                        matrixBroadValues[matrixBroadValueCount++] = value;
+                }
                 // Preserve the established 8x8 rejection of chassis/noise
-                // returns below 200 mm. The side-facing ultrasound channels
-                // provide the separate 200 mm side clearance.
+                // returns below 200 mm for ordinary range estimation. The
+                // separate broad-wall consensus above deliberately retains a
+                // coherent close surface, which must not disappear merely
+                // because every zone crossed below 200 mm together.
                 if (value < 200 || value > 3500)
                     continue;
-                if (col >= 2 && col <= 5) centreValues[centreCount++] = value;
+                columnValues[col][columnCounts[col]++] = value;
+                if (col >= 2 && col <= 5)
+                    centreValues[centreCount++] = value;
             }
-        auto lowerQuartile = [](uint16_t* values, uint8_t count) -> uint16_t {
-            if (count == 0) return 0xFFFF;
+
+        auto sortSmall = [](uint16_t* values, uint8_t count) {
             for (uint8_t i = 1; i < count; ++i)
             {
                 const uint16_t value = values[i];
@@ -1220,11 +1396,55 @@ void BluetoothDebugWorkflow::updateNavigation()
                 }
                 values[j] = value;
             }
+        };
+        auto lowerQuartile = [&](uint16_t* values, uint8_t count) -> uint16_t {
+            if (count == 0) return 0xFFFF;
+            sortSmall(values, count);
             return values[(count - 1) / 4];
         };
+
         const uint16_t matrixForward = lowerQuartile(centreValues, centreCount);
         if (matrixForward != 0xFFFF)
             frontCandidates[frontCandidateCount++] = matrixForward;
+
+        const bool broadCloseWall = matrixUsableCentreCount >= 20 &&
+            static_cast<uint16_t>(matrixBroadValueCount) * 3U >=
+                static_cast<uint16_t>(matrixUsableCentreCount) * 2U;
+        if (broadCloseWall)
+        {
+            sortSmall(matrixBroadValues, matrixBroadValueCount);
+            const uint16_t broadMedian =
+                matrixBroadValues[matrixBroadValueCount / 2];
+            // This is independent evidence from dozens of zones, not one
+            // candidate in the later three-sensor median. Make it authoritative.
+            front = min(front, broadMedian);
+        }
+        navigationMatrixBroadWall_ = broadCloseWall;
+
+        // Treat an outer flank as genuinely open only when at least two of its
+        // three horizontal columns contain a stable median return farther than
+        // the detour-gap threshold. A broad arena wall therefore does not look
+        // like a bypassable obstacle merely because one pixel is noisy.
+        for (uint8_t col = 0; col < 8; ++col)
+        {
+            if (columnCounts[col] < 3)
+                continue;
+            sortSmall(columnValues[col], columnCounts[col]);
+            const uint16_t columnMedian =
+                columnValues[col][columnCounts[col] / 2];
+            if (columnMedian <= OBSTACLE_FORWARD_GAP_MM)
+                continue;
+            if (col <= 2)
+            {
+                ++matrixLeftOpenColumns;
+                matrixLeftGapMm = max(matrixLeftGapMm, columnMedian);
+            }
+            if (col >= 5)
+            {
+                ++matrixRightOpenColumns;
+                matrixRightGapMm = max(matrixRightGapMm, columnMedian);
+            }
+        }
     }
 
     // A median across the top-left, top-right and matrix forward estimates
@@ -1241,7 +1461,16 @@ void BluetoothDebugWorkflow::updateNavigation()
         frontCandidates[j] = value;
     }
     if (frontCandidateCount > 0)
-        front = frontCandidates[frontCandidateCount / 2];
+    {
+        const uint16_t candidateMedian =
+            frontCandidates[frontCandidateCount / 2];
+        front = min(front, candidateMedian);
+    }
+
+    navigationMatrixCloseZones_ = matrixBroadValueCount;
+    navigationMatrixUsableZones_ = matrixUsableCentreCount;
+    if (!tof8x8_.available() || !tof8x8_.lastReadSucceeded())
+        navigationMatrixBroadWall_ = false;
 
     if (navigationState_ != NAV_FOLLOW_WALL)
     {
@@ -1281,9 +1510,68 @@ void BluetoothDebugWorkflow::updateNavigation()
     navigationFrontMm_ = front == 0xFFFF ? 0 : front;
     navigationLeftMm_ = left == 0xFFFF ? 0 : left;
     navigationRightMm_ = right == 0xFFFF ? 0 : right;
-    const bool frontBlocked = front != 0xFFFF && front < FRONT_AVOID_MM;
+    const bool frontBlocked = navigationMatrixBroadWall_ ||
+        (front != 0xFFFF && front < FRONT_AVOID_MM);
     const bool leftBlocked = left != 0xFFFF && left < SIDE_AVOID_MM;
     const bool rightBlocked = right != 0xFFFF && right < SIDE_AVOID_MM;
+
+    auto updateSweepReference = [](uint16_t sample, uint16_t& filtered, bool& valid) {
+        if (sample == 0xFFFF)
+            return;
+        if (!valid)
+        {
+            filtered = sample;
+            valid = true;
+            return;
+        }
+        int32_t delta = static_cast<int32_t>(sample) - filtered;
+        delta = constrain(delta, -200L, 200L);
+        int32_t adjustment = delta / 3;
+        if (adjustment == 0 && delta != 0)
+            adjustment = delta > 0 ? 1 : -1;
+        filtered = static_cast<uint16_t>(constrain(
+            static_cast<int32_t>(filtered) + adjustment, 30L, 5000L));
+    };
+
+    // The main loop runs much faster than an ultrasound ping. Update each
+    // sweep-width filter only when that sensor has completed a new echo,
+    // otherwise repeatedly feeding the same stale sample would make the
+    // filter appear far more confident than the physical measurement rate.
+    if (navigationState_ != NAV_SWEEP)
+    {
+        sweepReferenceFilterArmed = false;
+    }
+    else if (!sweepReferenceFilterArmed)
+    {
+        if (ultrasoundSensorCount_ > 0)
+            sweepLeftLastFallCount = ultrasoundSensors_[0].fallCount();
+        if (ultrasoundSensorCount_ > 1)
+            sweepRightLastFallCount = ultrasoundSensors_[1].fallCount();
+        sweepReferenceFilterArmed = true;
+    }
+    else
+    {
+        if (ultrasoundSensorCount_ > 0)
+        {
+            const uint32_t fallCount = ultrasoundSensors_[0].fallCount();
+            if (fallCount != sweepLeftLastFallCount)
+            {
+                sweepLeftLastFallCount = fallCount;
+                updateSweepReference(left, navigationSweepLeftReferenceMm_,
+                                     navigationSweepLeftReferenceValid_);
+            }
+        }
+        if (ultrasoundSensorCount_ > 1)
+        {
+            const uint32_t fallCount = ultrasoundSensors_[1].fallCount();
+            if (fallCount != sweepRightLastFallCount)
+            {
+                sweepRightLastFallCount = fallCount;
+                updateSweepReference(right, navigationSweepRightReferenceMm_,
+                                     navigationSweepRightReferenceValid_);
+            }
+        }
+    }
 
     auto normaliseHeading = [](float heading) {
         while (heading >= 360.0f) heading -= 360.0f;
@@ -1302,28 +1590,75 @@ void BluetoothDebugWorkflow::updateNavigation()
         dcMotor203SecondActive_ = channelA != 0 || channelB != 0;
         dcMotor203SecondDeadman_ = false;
     };
+    auto beginHeadingTurn = [&](float targetHeading, NavigationState state) {
+        navigationTargetHeadingDeg_ = normaliseHeading(targetHeading);
+        navigationState_ = state;
+        navigationMotionStartedMs_ = now;
+        navigationTurnSettledSinceMs_ = 0;
+        navigationTurnPulseStartedMs_ = now;
+        navigationTurnCoastUntilMs_ = now;
+        navigationTurnDirection_ = 0;
+        navigationMotionConsistent_ = true;
+    };
     auto beginRightAngleTurn = [&](bool rightTurn, NavigationState state) {
         // Always turn from the exact heading of the current leg, not from the
         // slightly imperfect measured heading at the transition. Otherwise a
         // few degrees of turn tolerance accumulate on every sweep lane.
-        navigationTargetHeadingDeg_ = normaliseHeading(
-            navigationHeadingReferenceDeg_ + (rightTurn ? 90.0f : -90.0f));
-        navigationState_ = state;
-        navigationMotionStartedMs_ = now;
-        navigationMotionConsistent_ = true;
+        beginHeadingTurn(
+            navigationHeadingReferenceDeg_ + (rightTurn ? 90.0f : -90.0f), state);
     };
     auto runHeadingTurn = [&]() {
         const float error = headingDelta(imu_.headingDeg(), navigationTargetHeadingDeg_);
-        if (lastImuSampleValid_ && fabsf(error) <= 3.0f &&
-            now - navigationMotionStartedMs_ >= 350U)
+        if (!lastImuSampleValid_)
         {
             setDrive(0, 0);
-            return true;
+            return false;
         }
-        const bool turnRight = error >= 0.0f;
-        const int16_t turnPower = fabsf(error) > 15.0f ? 80 : 75;
-        setDrive(turnRight ? -turnPower : turnPower,
-                 turnRight ? turnPower : -turnPower);
+
+        const float absoluteError = fabsf(error);
+        if (absoluteError <= 4.0f)
+        {
+            setDrive(0, 0);
+            if (navigationTurnSettledSinceMs_ == 0)
+                navigationTurnSettledSinceMs_ = now;
+            // Do not start the next forward leg while rotational inertia is
+            // still carrying the chassis through the target heading.
+            return now - navigationTurnSettledSinceMs_ >= 300U;
+        }
+        navigationTurnSettledSinceMs_ = 0;
+
+        const int8_t direction = error >= 0.0f ? 1 : -1;
+        if (direction != navigationTurnDirection_)
+        {
+            // The recordings showed full-power direction reversals producing
+            // a 20+ degree ping-pong. Coast before applying reverse torque.
+            navigationTurnDirection_ = direction;
+            navigationTurnCoastUntilMs_ = now + 180U;
+            navigationTurnPulseStartedMs_ = navigationTurnCoastUntilMs_;
+            setDrive(0, 0);
+            return false;
+        }
+        if (now < navigationTurnCoastUntilMs_)
+        {
+            setDrive(0, 0);
+            return false;
+        }
+
+        const bool turnRight = direction > 0;
+        if (absoluteError > 55.0f)
+        {
+            setDrive(turnRight ? -100 : 100, turnRight ? 100 : -100);
+            navigationTurnPulseStartedMs_ = now;
+            return false;
+        }
+
+        // The drivetrain does not move reliably below 75%, so reduce angular
+        // speed with duty cycle rather than an unusably small PWM command.
+        const uint32_t pulsePhase = (now - navigationTurnPulseStartedMs_) % 300U;
+        if (pulsePhase < 90U)
+            setDrive(turnRight ? -100 : 100, turnRight ? 100 : -100);
+        else
+            setDrive(0, 0);
         return false;
     };
     auto driveOnHeading = [&](float targetHeading, int16_t basePower) {
@@ -1337,9 +1672,9 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (fabsf(error) < 0.75f)
             correction = 0.0f;
         const int16_t channelAPower = constrain(
-            static_cast<int16_t>(lroundf(basePower + correction)), 75, 85);
+            static_cast<int16_t>(lroundf(basePower + correction)), 75, 100);
         const int16_t channelBPower = constrain(
-            static_cast<int16_t>(lroundf(basePower - correction)), 75, 85);
+            static_cast<int16_t>(lroundf(basePower - correction)), 75, 100);
         setDrive(-channelAPower, -channelBPower);
     };
     auto beginForwardLeg = [&](float exactHeading) {
@@ -1347,6 +1682,110 @@ void BluetoothDebugWorkflow::updateNavigation()
         navigationMotionStartedMs_ = now;
         navigationMotionConsistent_ = true;
     };
+    auto encoderDistanceFrom = [&](int32_t firstStart, int32_t secondStart) {
+        const float firstDistance = fabsf(
+            (encoders_.firstCount() - firstStart) * ENCODER_1_MM_PER_COUNT);
+        const float secondDistance = fabsf(
+            (encoders_.secondCount() - secondStart) * ENCODER_2_MM_PER_COUNT);
+        return (firstDistance + secondDistance) * 0.5f;
+    };
+    auto detourSensorIndex = [&]() -> int8_t {
+        // Turning right places the obstacle on robot-left (ultrasound A).
+        // Turning left places it on robot-right (ultrasound B).
+        return navigationDetourRight_ ? 0 : 1;
+    };
+    auto armDetourSideTracking = [&]() {
+        navigationDetourObstacleSeen_ = false;
+        navigationDetourClearSamples_ = 0;
+        navigationDetourEdgeCleared_ = false;
+        const int8_t index = detourSensorIndex();
+        navigationDetourLastTriggerCount_ =
+            index >= 0 && index < ultrasoundSensorCount_
+                ? ultrasoundSensors_[index].triggerCount()
+                : 0;
+    };
+    auto detourSideJustCleared = [&]() {
+        const int8_t index = detourSensorIndex();
+        if (index < 0 || index >= ultrasoundSensorCount_)
+            return false;
+        const uint32_t triggerCount = ultrasoundSensors_[index].triggerCount();
+        if (triggerCount == navigationDetourLastTriggerCount_)
+            return false;
+        navigationDetourLastTriggerCount_ = triggerCount;
+
+        const bool valid = ultrasoundSensors_[index].valid() &&
+                           !ultrasoundSensors_[index].timedOut();
+        const uint16_t distance = valid ? ultrasoundSensors_[index].distanceMm() : 0;
+        if (valid && distance <= OBSTACLE_SIDE_TRACK_MAX_MM)
+        {
+            navigationDetourObstacleSeen_ = true;
+            navigationDetourClearSamples_ = 0;
+            return false;
+        }
+
+        const bool clear = ultrasoundSensors_[index].timedOut() ||
+            (valid && distance >= OBSTACLE_SIDE_RELEASE_MM);
+        if (navigationDetourObstacleSeen_ && clear)
+        {
+            if (navigationDetourClearSamples_ < 3)
+                ++navigationDetourClearSamples_;
+            if (navigationDetourClearSamples_ >= 2)
+            {
+                navigationDetourClearSamples_ = 0;
+                return true;
+            }
+        }
+        else if (valid)
+            navigationDetourClearSamples_ = 0;
+        return false;
+    };
+    auto avoidBlockedTurnExit = [&]() -> bool {
+        if (!frontBlocked)
+            return false;
+
+        const bool leftClose = left != 0xFFFF && left < 350;
+        const bool rightClose = right != 0xFFFF && right < 350;
+        if (leftClose && rightClose)
+        {
+            navigationState_ = NAV_ESCAPE_REVERSE;
+            navigationEscapeStartEncoder1_ = encoders_.firstCount();
+            navigationEscapeStartEncoder2_ = encoders_.secondCount();
+            navigationEscapeTurnRight_ = right >= left;
+            navigationMotionStartedMs_ = now;
+            navigationMotionConsistent_ = true;
+            setDrive(100, 100);
+            link_.log("WARNING", "Turn ended inside a U-shaped enclosure; backing out");
+            return true;
+        }
+
+        // Never enter a forward state while a wall is still directly ahead.
+        // Turn another quarter-turn toward the side with the most measured
+        // room, then reassess. Repeated blocked exits naturally keep turning
+        // until a clear heading is actually visible.
+        const bool turnRight = right != 0xFFFF &&
+            (left == 0xFFFF || right >= left);
+        setDrive(0, 0);
+        beginRightAngleTurn(turnRight, NAV_CLEARANCE_TURN);
+        link_.log("WARNING", "Turn ended facing a wall; turning again before moving");
+        return true;
+    };
+
+    // Learn the arena's long dimension from completed wall-to-wall sweep legs.
+    // Only encoder travel while actually in NAV_SWEEP contributes here; all
+    // sideways/forward detour motion is excluded so going around an obstacle
+    // cannot make the learned arena length grow.
+    if (navigationState_ == NAV_SWEEP)
+    {
+        const float firstStepMm = fabsf(
+            (encoders_.firstCount() - navigationSweepProgressLastEncoder1_) *
+            ENCODER_1_MM_PER_COUNT);
+        const float secondStepMm = fabsf(
+            (encoders_.secondCount() - navigationSweepProgressLastEncoder2_) *
+            ENCODER_2_MM_PER_COUNT);
+        navigationSweepProgressMm_ += (firstStepMm + secondStepMm) * 0.5f;
+        navigationSweepProgressLastEncoder1_ = encoders_.firstCount();
+        navigationSweepProgressLastEncoder2_ = encoders_.secondCount();
+    }
 
     // Encoder/IMU agreement is recorded for diagnosis only. It never cancels
     // the coverage program.
@@ -1357,7 +1796,10 @@ void BluetoothDebugWorkflow::updateNavigation()
         const bool forwardState = navigationState_ == NAV_SEEK_WALL ||
             navigationState_ == NAV_FOLLOW_WALL ||
             navigationState_ == NAV_SWEEP ||
-            navigationState_ == NAV_LANE_SHIFT;
+            navigationState_ == NAV_LANE_SHIFT ||
+            navigationState_ == NAV_OBSTACLE_OFFSET ||
+            navigationState_ == NAV_OBSTACLE_PASS ||
+            navigationState_ == NAV_OBSTACLE_RETURN;
         if (forwardState)
             navigationMotionConsistent_ = lastImuSampleValid_ &&
                 e1 < -10.0f && e2 > 10.0f;
@@ -1366,9 +1808,30 @@ void BluetoothDebugWorkflow::updateNavigation()
                 (fabsf(e1) > 10.0f || fabsf(e2) > 10.0f);
     }
 
+    // A simultaneous close front, left and right return is a U-shaped trap,
+    // not an ordinary end wall. Back out before attempting another turn so the
+    // chassis has physical clearance to rotate. Bottom TOFs remain excluded.
+    const bool forwardNavigationState = navigationState_ == NAV_SEEK_WALL ||
+        navigationState_ == NAV_FOLLOW_WALL || navigationState_ == NAV_SWEEP;
+    const bool uTrapLeftClose = left != 0xFFFF && left < 350;
+    const bool uTrapRightClose = right != 0xFFFF && right < 350;
+    if (forwardNavigationState && frontBlocked &&
+        uTrapLeftClose && uTrapRightClose)
+    {
+        navigationState_ = NAV_ESCAPE_REVERSE;
+        navigationEscapeStartEncoder1_ = encoders_.firstCount();
+        navigationEscapeStartEncoder2_ = encoders_.secondCount();
+        navigationEscapeTurnRight_ = right >= left;
+        navigationMotionStartedMs_ = now;
+        navigationMotionConsistent_ = true;
+        setDrive(100, 100);
+        link_.log("WARNING", "U-shaped enclosure detected; reversing to find turning clearance");
+    }
+
     switch (navigationState_)
     {
         case NAV_SEEK_WALL:
+            laneShiftTargetMm = LANE_SPACING_MM;
             if (frontBlocked)
             {
                 setDrive(0, 0);
@@ -1376,14 +1839,16 @@ void BluetoothDebugWorkflow::updateNavigation()
                 link_.log("INFO", "Navigation reached first wall; turning right");
             }
             else if (front == 0xFFFF)
-                setDrive(-75, 75);  // rotate until forward ranging is recovered
+                setDrive(-100, 100);  // rotate until forward ranging is recovered
             else
-                driveOnHeading(navigationHeadingReferenceDeg_, 80);
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
             break;
 
         case NAV_INITIAL_TURN:
             if (runHeadingTurn())
             {
+                if (avoidBlockedTurnExit())
+                    break;
                 navigationState_ = NAV_FOLLOW_WALL;
                 beginForwardLeg(navigationTargetHeadingDeg_);
                 link_.log("INFO", "Navigation following first wall to corner");
@@ -1409,18 +1874,26 @@ void BluetoothDebugWorkflow::updateNavigation()
                     constrain(wallErrorMm * 0.06f, -10.0f, 10.0f);
                 const float wallTargetHeading = normaliseHeading(
                     navigationHeadingReferenceDeg_ + headingOffsetDeg);
-                driveOnHeading(wallTargetHeading, 78);
+                driveOnHeading(wallTargetHeading, 100);
             }
             else
-                driveOnHeading(navigationHeadingReferenceDeg_, 78);
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
             break;
 
         case NAV_CORNER_TURN:
             if (runHeadingTurn())
             {
+                if (avoidBlockedTurnExit())
+                    break;
                 navigationState_ = NAV_SWEEP;
                 navigationLaneIndex_ = 0;
                 navigationSweepTurnRight_ = true;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                navigationSweepLateralErrorMm_ = 0;
+                navigationSweepProgressMm_ = 0.0f;
+                navigationSweepProgressLastEncoder1_ = encoders_.firstCount();
+                navigationSweepProgressLastEncoder2_ = encoders_.secondCount();
                 beginForwardLeg(navigationTargetHeadingDeg_);
                 link_.log("INFO", "Arena sweep lane 1 started");
             }
@@ -1429,31 +1902,344 @@ void BluetoothDebugWorkflow::updateNavigation()
         case NAV_SWEEP:
             if (frontBlocked)
             {
-                if (navigationLaneIndex_ + 1 >= SWEEP_LANE_COUNT)
+                // A real arena end wall should occupy the broad horizontal
+                // forward field. An internal wall/obstacle is considered
+                // bypassable only when the 8x8 sees a clearly open outer
+                // flank and the corresponding side ultrasound says there is
+                // enough lateral room to start the manoeuvre.
+                const bool leftGapOpen = matrixLeftOpenColumns >= 2;
+                const bool rightGapOpen = matrixRightOpenColumns >= 2;
+                const bool blockedMuchEarlierThanExpected =
+                    navigationExpectedSweepLengthValid_ &&
+                    navigationSweepProgressMm_ + OBSTACLE_EARLY_WALL_MARGIN_MM <
+                        navigationExpectedSweepLengthMm_;
+                const bool unexpectedObstacle = blockedMuchEarlierThanExpected ||
+                    leftGapOpen || rightGapOpen;
+                const bool canDetourLeft = unexpectedObstacle &&
+                    left != 0xFFFF && left >= OBSTACLE_MIN_SIDE_ROOM_MM &&
+                    (blockedMuchEarlierThanExpected || leftGapOpen);
+                const bool canDetourRight = unexpectedObstacle &&
+                    right != 0xFFFF && right >= OBSTACLE_MIN_SIDE_ROOM_MM &&
+                    (blockedMuchEarlierThanExpected || rightGapOpen);
+
+                if (canDetourLeft || canDetourRight)
+                {
+                    if (canDetourLeft && canDetourRight)
+                    {
+                        // Prefer the side with more verified lateral room. The
+                        // 8x8 flank distance is used only as a tie-breaker.
+                        if (right != left)
+                            navigationDetourRight_ = right > left;
+                        else
+                            navigationDetourRight_ = matrixRightGapMm >= matrixLeftGapMm;
+                    }
+                    else
+                        navigationDetourRight_ = canDetourRight;
+
+                    navigationDetourOriginalHeadingDeg_ =
+                        navigationHeadingReferenceDeg_;
+                    navigationDetourOffsetMm_ = 0.0f;
+                    navigationDetourEdgeCleared_ = false;
+                    navigationDetourObstacleSeen_ = false;
+                    navigationDetourClearSamples_ = 0;
+                    ++navigationObstacleCount_;
+                    setDrive(0, 0);
+                    beginRightAngleTurn(
+                        navigationDetourRight_, NAV_OBSTACLE_TURN_OUT);
+                    link_.log(
+                        "WARNING",
+                        navigationDetourRight_
+                            ? "Unexpected obstacle detected; detouring right"
+                            : "Unexpected obstacle detected; detouring left");
+                    break;
+                }
+
+                if (unexpectedObstacle)
+                {
+                    setDrive(0, 0);
+                    stopNavigation(
+                        "Unexpected obstacle detected but no safe detour side is available");
+                    break;
+                }
+
+                // No unexpected-obstacle evidence exists, so handle the broad
+                // return as the normal arena end wall. Completed long passes
+                // teach a filtered expected arena length for later lanes.
+                if (!navigationExpectedSweepLengthValid_)
+                {
+                    navigationExpectedSweepLengthMm_ = navigationSweepProgressMm_;
+                    navigationExpectedSweepLengthValid_ =
+                        navigationSweepProgressMm_ >= 600.0f;
+                }
+                else if (navigationSweepProgressMm_ >= 600.0f)
+                {
+                    navigationExpectedSweepLengthMm_ =
+                        navigationExpectedSweepLengthMm_ * 0.75f +
+                        navigationSweepProgressMm_ * 0.25f;
+                }
+
+                const bool remainingValid = navigationSweepTurnRight_
+                    ? navigationSweepRightReferenceValid_
+                    : navigationSweepLeftReferenceValid_;
+                const uint16_t remainingMm = navigationSweepTurnRight_
+                    ? navigationSweepRightReferenceMm_
+                    : navigationSweepLeftReferenceMm_;
+
+                if (!remainingValid)
+                {
+                    // Do not blindly step sideways when the boundary sensor is
+                    // unavailable. Sit at the end wall until a usable side
+                    // range is recovered.
+                    navigationSweepLateralErrorMm_ = 0;
+                    setDrive(0, 0);
+                }
+                else if (remainingMm <=
+                         SWEEP_EDGE_TARGET_MM + SWEEP_EDGE_TOLERANCE_MM)
                 {
                     navigationState_ = NAV_COMPLETE;
+                    navigationSweepLateralErrorMm_ = 0;
                     setDrive(0, 0);
-                    link_.log("INFO", "Arena sweep complete");
+                    link_.log("INFO", "Arena sweep complete at opposite side wall");
                 }
                 else
                 {
+                    // Normally move 200 mm. On the last transition, shorten
+                    // the lateral step so the next pass lands close to the
+                    // opposite wall instead of overshooting it.
+                    const float remainingShiftMm =
+                        static_cast<float>(remainingMm - SWEEP_EDGE_TARGET_MM);
+                    laneShiftTargetMm = min(LANE_SPACING_MM, remainingShiftMm);
+                    navigationSweepLateralErrorMm_ = static_cast<int16_t>(
+                        constrain(lroundf(laneShiftTargetMm), 0L, 5000L));
                     setDrive(0, 0);
                     beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_OUT);
                 }
             }
             else if (leftBlocked && !rightBlocked)
                 driveOnHeading(
-                    normaliseHeading(navigationHeadingReferenceDeg_ + 7.0f), 78);
+                    normaliseHeading(navigationHeadingReferenceDeg_ + 7.0f),
+                    100);
             else if (rightBlocked && !leftBlocked)
                 driveOnHeading(
-                    normaliseHeading(navigationHeadingReferenceDeg_ - 7.0f), 78);
+                    normaliseHeading(navigationHeadingReferenceDeg_ - 7.0f),
+                    100);
             else
-                driveOnHeading(navigationHeadingReferenceDeg_, 80);
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
+            break;
+
+        case NAV_ESCAPE_REVERSE:
+        {
+            const float reversedMm = encoderDistanceFrom(
+                navigationEscapeStartEncoder1_, navigationEscapeStartEncoder2_);
+            const bool leftOpen = left != 0xFFFF && left >= 350;
+            const bool rightOpen = right != 0xFFFF && right >= 350;
+            if ((reversedMm >= 350.0f && (leftOpen || rightOpen)) ||
+                reversedMm >= 900.0f)
+            {
+                setDrive(0, 0);
+                if (leftOpen || rightOpen)
+                    navigationEscapeTurnRight_ = rightOpen &&
+                        (!leftOpen || right >= left);
+                beginRightAngleTurn(navigationEscapeTurnRight_, NAV_ESCAPE_TURN);
+            }
+            else
+                setDrive(100, 100);
+            break;
+        }
+
+        case NAV_ESCAPE_TURN:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                navigationState_ = NAV_SEEK_WALL;
+                navigationLaneIndex_ = 0;
+                navigationSweepProgressMm_ = 0.0f;
+                navigationExpectedSweepLengthMm_ = 0.0f;
+                navigationExpectedSweepLengthValid_ = false;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log("INFO", "U-shaped enclosure cleared; seeking wall on new heading");
+            }
+            break;
+
+        case NAV_OBSTACLE_TURN_OUT:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                navigationState_ = NAV_OBSTACLE_OFFSET;
+                navigationDetourStartEncoder1_ = encoders_.firstCount();
+                navigationDetourStartEncoder2_ = encoders_.secondCount();
+                navigationDetourPhaseStartEncoder1_ = navigationDetourStartEncoder1_;
+                navigationDetourPhaseStartEncoder2_ = navigationDetourStartEncoder2_;
+                armDetourSideTracking();
+                beginForwardLeg(navigationTargetHeadingDeg_);
+            }
+            break;
+
+        case NAV_OBSTACLE_OFFSET:
+        {
+            const float totalOffsetMm = encoderDistanceFrom(
+                navigationDetourStartEncoder1_, navigationDetourStartEncoder2_);
+            if (frontBlocked && !navigationDetourEdgeCleared_)
+            {
+                stopNavigation(
+                    "Obstacle detour aborted: lateral route blocked before obstacle edge");
+                break;
+            }
+
+            if (!navigationDetourEdgeCleared_ && detourSideJustCleared())
+            {
+                navigationDetourEdgeCleared_ = true;
+                navigationDetourPhaseStartEncoder1_ = encoders_.firstCount();
+                navigationDetourPhaseStartEncoder2_ = encoders_.secondCount();
+            }
+
+            if (totalOffsetMm >= OBSTACLE_MAX_OFFSET_MM &&
+                !navigationDetourEdgeCleared_)
+            {
+                stopNavigation(
+                    "Obstacle detour aborted: obstacle edge not found within lateral limit");
+                break;
+            }
+
+            const float clearMarginMm = navigationDetourEdgeCleared_
+                ? encoderDistanceFrom(navigationDetourPhaseStartEncoder1_,
+                                      navigationDetourPhaseStartEncoder2_)
+                : 0.0f;
+            if (navigationDetourEdgeCleared_ &&
+                (clearMarginMm >= OBSTACLE_CLEAR_MARGIN_MM || frontBlocked))
+            {
+                navigationDetourOffsetMm_ = totalOffsetMm;
+                setDrive(0, 0);
+                beginHeadingTurn(
+                    navigationDetourOriginalHeadingDeg_,
+                    NAV_OBSTACLE_TURN_FORWARD);
+            }
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
+            break;
+        }
+
+        case NAV_OBSTACLE_TURN_FORWARD:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                navigationState_ = NAV_OBSTACLE_PASS;
+                navigationDetourPhaseStartEncoder1_ = encoders_.firstCount();
+                navigationDetourPhaseStartEncoder2_ = encoders_.secondCount();
+                armDetourSideTracking();
+                beginForwardLeg(navigationDetourOriginalHeadingDeg_);
+            }
+            break;
+
+        case NAV_OBSTACLE_PASS:
+        {
+            const float passDistanceMm = encoderDistanceFrom(
+                navigationDetourPhaseStartEncoder1_,
+                navigationDetourPhaseStartEncoder2_);
+            if (frontBlocked)
+            {
+                stopNavigation(
+                    "Obstacle detour aborted: forward bypass path is blocked");
+                break;
+            }
+
+            if (!navigationDetourEdgeCleared_ && detourSideJustCleared())
+            {
+                navigationDetourEdgeCleared_ = true;
+                navigationDetourPhaseStartEncoder1_ = encoders_.firstCount();
+                navigationDetourPhaseStartEncoder2_ = encoders_.secondCount();
+            }
+
+            if (passDistanceMm >= OBSTACLE_MAX_PASS_MM &&
+                !navigationDetourEdgeCleared_)
+            {
+                stopNavigation(
+                    "Obstacle detour aborted: obstacle did not end within forward limit");
+                break;
+            }
+
+            const float clearMarginMm = navigationDetourEdgeCleared_
+                ? encoderDistanceFrom(navigationDetourPhaseStartEncoder1_,
+                                      navigationDetourPhaseStartEncoder2_)
+                : 0.0f;
+            if (navigationDetourEdgeCleared_ &&
+                clearMarginMm >= OBSTACLE_CLEAR_MARGIN_MM)
+            {
+                setDrive(0, 0);
+                const float returnHeading = normaliseHeading(
+                    navigationDetourOriginalHeadingDeg_ +
+                    (navigationDetourRight_ ? -90.0f : 90.0f));
+                beginHeadingTurn(returnHeading, NAV_OBSTACLE_TURN_BACK);
+            }
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
+            break;
+        }
+
+        case NAV_OBSTACLE_TURN_BACK:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                navigationState_ = NAV_OBSTACLE_RETURN;
+                navigationDetourPhaseStartEncoder1_ = encoders_.firstCount();
+                navigationDetourPhaseStartEncoder2_ = encoders_.secondCount();
+                beginForwardLeg(navigationTargetHeadingDeg_);
+            }
+            break;
+
+        case NAV_OBSTACLE_RETURN:
+        {
+            const float returnedMm = encoderDistanceFrom(
+                navigationDetourPhaseStartEncoder1_,
+                navigationDetourPhaseStartEncoder2_);
+            if (frontBlocked && returnedMm + 40.0f < navigationDetourOffsetMm_)
+            {
+                stopNavigation(
+                    "Obstacle detour aborted: return path to sweep lane is blocked");
+                break;
+            }
+            if (returnedMm >= navigationDetourOffsetMm_)
+            {
+                setDrive(0, 0);
+                beginHeadingTurn(
+                    navigationDetourOriginalHeadingDeg_,
+                    NAV_OBSTACLE_TURN_IN);
+            }
+            else
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
+            break;
+        }
+
+        case NAV_OBSTACLE_TURN_IN:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                navigationState_ = NAV_SWEEP;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                navigationSweepLateralErrorMm_ = 0;
+                navigationDetourEdgeCleared_ = false;
+                navigationDetourObstacleSeen_ = false;
+                navigationDetourClearSamples_ = 0;
+                navigationSweepProgressLastEncoder1_ = encoders_.firstCount();
+                navigationSweepProgressLastEncoder2_ = encoders_.secondCount();
+                beginForwardLeg(navigationDetourOriginalHeadingDeg_);
+                link_.log("INFO", "Obstacle cleared; returned to original sweep path");
+            }
             break;
 
         case NAV_LANE_TURN_OUT:
             if (runHeadingTurn())
             {
+                if (avoidBlockedTurnExit())
+                    break;
                 navigationState_ = NAV_LANE_SHIFT;
                 navigationShiftStartEncoder1_ = encoders_.firstCount();
                 navigationShiftStartEncoder2_ = encoders_.secondCount();
@@ -1470,24 +2256,52 @@ void BluetoothDebugWorkflow::updateNavigation()
                 (encoders_.secondCount() - navigationShiftStartEncoder2_) *
                 ENCODER_2_MM_PER_COUNT);
             const float shiftedMm = (firstDistance + secondDistance) * 0.5f;
-            if (shiftedMm >= LANE_SPACING_MM || frontBlocked)
+            if (shiftedMm >= laneShiftTargetMm || frontBlocked)
             {
                 setDrive(0, 0);
                 beginRightAngleTurn(navigationSweepTurnRight_, NAV_LANE_TURN_IN);
             }
             else
-                driveOnHeading(navigationHeadingReferenceDeg_, 75);
+                driveOnHeading(navigationHeadingReferenceDeg_, 100);
             break;
         }
 
         case NAV_LANE_TURN_IN:
             if (runHeadingTurn())
             {
+                if (avoidBlockedTurnExit())
+                    break;
                 ++navigationLaneIndex_;
                 navigationSweepTurnRight_ = !navigationSweepTurnRight_;
                 navigationState_ = NAV_SWEEP;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                navigationSweepLateralErrorMm_ = 0;
+                navigationSweepProgressMm_ = 0.0f;
+                navigationSweepProgressLastEncoder1_ = encoders_.firstCount();
+                navigationSweepProgressLastEncoder2_ = encoders_.secondCount();
                 beginForwardLeg(navigationTargetHeadingDeg_);
                 link_.log("INFO", "Next arena sweep lane started");
+            }
+            break;
+
+        case NAV_CLEARANCE_TURN:
+            if (runHeadingTurn())
+            {
+                if (avoidBlockedTurnExit())
+                    break;
+                // The unexpected extra turn invalidates the old sweep lane.
+                // Reacquire a wall on the newly verified clear heading rather
+                // than trying to continue stale geometry.
+                navigationState_ = NAV_SEEK_WALL;
+                navigationLaneIndex_ = 0;
+                navigationSweepProgressMm_ = 0.0f;
+                navigationExpectedSweepLengthMm_ = 0.0f;
+                navigationExpectedSweepLengthValid_ = false;
+                navigationSweepLeftReferenceValid_ = false;
+                navigationSweepRightReferenceValid_ = false;
+                beginForwardLeg(navigationTargetHeadingDeg_);
+                link_.log("INFO", "Front path clear after additional turn; reacquiring wall");
             }
             break;
 

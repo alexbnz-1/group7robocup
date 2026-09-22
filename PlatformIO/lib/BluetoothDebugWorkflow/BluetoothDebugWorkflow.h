@@ -26,6 +26,7 @@ private:
     static constexpr uint8_t MAX_ULTRASOUND_SENSORS = 2;
     HardwareSerialIMXRT& bluetoothPort_;
     uint8_t bluetoothRxBuffer_[2048] = {};
+    uint8_t bluetoothTxBuffer_[8192] = {};
     HerkulexTeensy servos_;
     DcMotor203 dcMotor203_;
     DcMotor203 dcMotor203Second_;
@@ -68,6 +69,8 @@ private:
     uint32_t lastElectricalDiagnosticsMs_ = 0;
     uint32_t lastDefinitionsMs_ = 0;
     uint32_t receivedMessages_ = 0;
+    uint32_t lastUpdateStartedUs_ = 0;
+    uint32_t maxUpdateGapUs_ = 0;
     uint8_t tofSensorCount_ = 0;
     char tofSensorNames_[MAX_TOF_SENSORS][25] = {};
     bool tofAvailable_[MAX_TOF_SENSORS] = {};
@@ -92,7 +95,17 @@ private:
         NAV_LANE_TURN_OUT = 6,
         NAV_LANE_SHIFT = 7,
         NAV_LANE_TURN_IN = 8,
-        NAV_COMPLETE = 9
+        NAV_COMPLETE = 9,
+        NAV_OBSTACLE_TURN_OUT = 10,
+        NAV_OBSTACLE_OFFSET = 11,
+        NAV_OBSTACLE_TURN_FORWARD = 12,
+        NAV_OBSTACLE_PASS = 13,
+        NAV_OBSTACLE_TURN_BACK = 14,
+        NAV_OBSTACLE_RETURN = 15,
+        NAV_OBSTACLE_TURN_IN = 16,
+        NAV_ESCAPE_REVERSE = 17,
+        NAV_ESCAPE_TURN = 18,
+        NAV_CLEARANCE_TURN = 19
     };
     bool navigationActive_ = false;
     uint8_t navigationState_ = 0;
@@ -105,6 +118,13 @@ private:
     uint32_t navigationMotionStartedMs_ = 0;
     float navigationHeadingReferenceDeg_ = 0.0f;
     float navigationTargetHeadingDeg_ = 0.0f;
+    uint32_t navigationTurnSettledSinceMs_ = 0;
+    uint32_t navigationTurnPulseStartedMs_ = 0;
+    uint32_t navigationTurnCoastUntilMs_ = 0;
+    int8_t navigationTurnDirection_ = 0;
+    uint8_t navigationMatrixCloseZones_ = 0;
+    uint8_t navigationMatrixUsableZones_ = 0;
+    bool navigationMatrixBroadWall_ = false;
     int32_t navigationShiftStartEncoder1_ = 0;
     int32_t navigationShiftStartEncoder2_ = 0;
     uint8_t navigationLaneIndex_ = 0;
@@ -114,6 +134,31 @@ private:
     bool navigationSweepLeftReferenceValid_ = false;
     bool navigationSweepRightReferenceValid_ = false;
     int16_t navigationSweepLateralErrorMm_ = 0;
+    float navigationSweepProgressMm_ = 0.0f;
+    float navigationExpectedSweepLengthMm_ = 0.0f;
+    bool navigationExpectedSweepLengthValid_ = false;
+    int32_t navigationSweepProgressLastEncoder1_ = 0;
+    int32_t navigationSweepProgressLastEncoder2_ = 0;
+
+    // Temporary obstacle-bypass state. A detour leaves the active sweep lane,
+    // tracks around one localised obstacle, then uses encoder distance and the
+    // exact BNO055 heading lattice to return to the same original path.
+    bool navigationDetourRight_ = true;
+    float navigationDetourOriginalHeadingDeg_ = 0.0f;
+    float navigationDetourOffsetMm_ = 0.0f;
+    int32_t navigationDetourStartEncoder1_ = 0;
+    int32_t navigationDetourStartEncoder2_ = 0;
+    int32_t navigationDetourPhaseStartEncoder1_ = 0;
+    int32_t navigationDetourPhaseStartEncoder2_ = 0;
+    bool navigationDetourEdgeCleared_ = false;
+    bool navigationDetourObstacleSeen_ = false;
+    uint8_t navigationDetourClearSamples_ = 0;
+    uint32_t navigationDetourLastTriggerCount_ = 0;
+    uint16_t navigationObstacleCount_ = 0;
+    int32_t navigationEscapeStartEncoder1_ = 0;
+    int32_t navigationEscapeStartEncoder2_ = 0;
+    bool navigationEscapeTurnRight_ = true;
+
     bool navigationMotionConsistent_ = true;
 
     static void dispatch(JsonDocument& message, void* context);

@@ -70,6 +70,48 @@ class ArenaModelTests(unittest.TestCase):
         self.assertAlmostEqual(self.map.x, expected, places=4)
         self.assertAlmostEqual(self.map.y, expected, places=4)
 
+    def test_commanded_point_turn_does_not_create_map_translation(self):
+        self.map._integrate_pose({
+            "encoder.1.count": 0, "encoder.2.count": 0,
+            "imu.available": True, "imu.valid": True,
+            "imu.heading_deg": 0,
+        })
+        self.map._integrate_pose({
+            "encoder.1.count": 0, "encoder.2.count": 0,
+            "imu.available": True, "imu.valid": True,
+            "imu.heading_deg": 0,
+        })
+        self.map._integrate_pose({
+            "encoder.1.count": 120, "encoder.2.count": -80,
+            "imu.available": True, "imu.valid": True,
+            "imu.heading_deg": 25,
+            "dc_motor_203_second.channel_a_percent": -80,
+            "dc_motor_203_second.channel_b_percent": 80,
+        })
+        self.assertAlmostEqual(self.map.x, 0)
+        self.assertAlmostEqual(self.map.y, 0)
+        self.assertTrue(self.map.wheel_slip_detected)
+        self.assertNotAlmostEqual(self.map.theta, math.pi / 2)
+
+    def test_forward_wheelspin_at_close_wall_does_not_move_map(self):
+        self.map._integrate_pose({
+            "encoder.1.count": 0, "encoder.2.count": 0,
+            "imu.available": True, "imu.valid": True,
+            "imu.heading_deg": 0,
+        })
+        self.map._integrate_pose({
+            "encoder.1.count": 100, "encoder.2.count": 100,
+            "imu.available": True, "imu.valid": True,
+            "imu.heading_deg": 0,
+            "dc_motor_203_second.channel_a_percent": -90,
+            "dc_motor_203_second.channel_b_percent": -90,
+            "navigation.front_mm": 180,
+        })
+        self.assertAlmostEqual(self.map.x, 0)
+        self.assertAlmostEqual(self.map.y, 0)
+        self.assertEqual(self.map.distance_travelled_mm, 0)
+        self.assertTrue(self.map.wheel_slip_detected)
+
     def test_running_fusion_is_usable_when_system_calibration_is_zero(self):
         # The first encoder frame establishes the odometry baseline; the next
         # two establish and then change the absolute IMU heading.
@@ -167,6 +209,58 @@ class ArenaModelTests(unittest.TestCase):
         endpoint = self.map._cell(0, 500)
         self.assertGreater(self.map.cells[endpoint], 0)
         self.assertLess(self.map.cells[self.map._cell(0, 200)], 0)
+
+    def test_repeated_top_returns_form_one_persistent_wall(self):
+        self.map.sensor_specs[0]["layer"] = "top"
+        for index, distance in enumerate((500, 505, 495, 502), start=1):
+            self.feed(index * 200, 0, 0, distance=distance)
+        confirmed = [wall for wall in self.map.wall_tracks
+                     if wall["observations"] >= 3]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["orientation"], "horizontal")
+        self.assertAlmostEqual(confirmed[0]["coordinate"], 500, delta=10)
+
+    def test_bottom_sensor_never_becomes_a_wall(self):
+        self.map.sensor_specs = [
+            {"name": "lower", "angle": 0, "x": 0, "y": 0,
+             "port": "XSHUT5", "layer": "bottom"},
+        ]
+        for index in range(4):
+            self.map._frame = {
+                "encoder.1.count": 0, "encoder.2.count": 0,
+                "tof.lower.available": True,
+                "tof.lower.timed_out": False,
+                "tof.lower.distance_mm": 500,
+            }
+            self.map.finish_frame()
+        self.assertFalse(self.map.wall_tracks)
+
+    def test_known_boundary_cannot_spawn_parallel_duplicate_walls(self):
+        self.map.theta = math.pi / 2
+        for distance in (500, 505, 495, 900, 1300):
+            self.map._add_observation(
+                distance, 0, "top", wall_candidate=True
+            )
+        self.assertEqual(len(self.map.wall_tracks), 1)
+        self.assertEqual(self.map.wall_tracks[0]["boundary"], "north")
+        self.assertAlmostEqual(self.map.wall_tracks[0]["coordinate"], 500,
+                               delta=10)
+
+    def test_four_confirmed_walls_join_at_discovered_corners(self):
+        self.map.wall_tracks = [
+            {"orientation": "horizontal", "coordinate": 1200,
+             "minimum": -100, "maximum": 100, "observations": 3},
+            {"orientation": "horizontal", "coordinate": -1200,
+             "minimum": -100, "maximum": 100, "observations": 3},
+            {"orientation": "vertical", "coordinate": -2450,
+             "minimum": -100, "maximum": 100, "observations": 3},
+            {"orientation": "vertical", "coordinate": 2450,
+             "minimum": -100, "maximum": 100, "observations": 3},
+        ]
+        self.assertEqual(self.map.wall_segment(self.map.wall_tracks[0]),
+                         (-2450, 2450))
+        self.assertEqual(self.map.wall_segment(self.map.wall_tracks[2]),
+                         (-1200, 1200))
 
     def test_every_configured_point_sensor_is_used(self):
         self.map.sensor_specs = [
@@ -290,6 +384,27 @@ class SensorLayoutTests(unittest.TestCase):
             self.assertEqual((again["layer"], again["x"]), ("top", -135.0))
             view.close()
             restored.close()
+
+    def test_arena_controls_emit_existing_robot_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "controls.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            sent = []
+            view.command_requested.connect(
+                lambda name, arguments: sent.append((name, arguments))
+            )
+            view.run_motors_button.click()
+            view.run_navigation_button.click()
+            view.stop_navigation_button.click()
+            view.stop_motors_button.click()
+            self.assertEqual(sent, [
+                ("run", {}),
+                ("autonomous_navigation", {"enabled": True}),
+                ("autonomous_navigation", {"enabled": False}),
+                ("stop", {}),
+            ])
+            view.close()
 
     def test_raw_tof_panel_shows_point_and_complete_matrix_values(self):
         with tempfile.TemporaryDirectory() as directory:

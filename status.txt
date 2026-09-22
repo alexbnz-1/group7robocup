@@ -3044,3 +3044,755 @@ For the next run, specifically inspect the first follow_wall segment for
 oscillation around 250 mm, verify that 200 mm lane shifts are physically close
 to 200 mm, and confirm that the tighter 3 degree turn threshold does not cause
 a turn to hunt indefinitely at the drivetrain's 75 percent minimum.
+
+
+===============================================================================
+51. ULTRASONIC ARENA-WIDTH SWEEP TERMINATION AND IMU-CONFIRMED MAP ODOMETRY
+===============================================================================
+
+This change is based on testing-branch commit 92cffc0 ("online chat made
+better") and supersedes the fixed eleven-lane completion rule described in the
+second section 50. The improved 200 mm lane spacing and proportional wall/
+heading control from that commit are retained, but the robot no longer assumes
+a known arena width or a set number of sweep passes.
+
+Dynamic sweep width / opposite-wall detection:
+
+- The 200 mm value is now only the nominal separation between adjacent long
+  sweep passes. There is no `SWEEP_LANE_COUNT` completion condition.
+- The robot begins the sweep while already running close to the first side wall
+  after the 250 mm left-wall-follow phase. It then works laterally toward the
+  opposite side of the arena.
+- Both side ultrasound sensors are used to determine how much unmapped arena
+  remains. Because the robot reverses its long-sweep heading after every lane,
+  the sensor looking toward the still-unmapped side alternates naturally:
+    - when the next lane shift is to robot-right, Ultrasound B/right is the
+      remaining-width sensor;
+    - when the next lane shift is to robot-left, Ultrasound A/left is the
+      remaining-width sensor.
+- Side ultrasound readings used for arena width accept the driver's full useful
+  range up to 5000 mm. Each side has a filtered sweep reference. The filter is
+  updated only when that ultrasonic channel completes a new echo, not once per
+  main-loop iteration, so a stale sample cannot be counted repeatedly.
+- A new sweep-side sample is rate-limited by 200 mm before the filtered value
+  moves one third of the limited difference. This reduces the chance that one
+  broad-beam reflection or spike causes premature arena completion.
+- At the end of every long pass, when the forward sensors reach the end wall,
+  the controller examines the ultrasonic sensor facing the still-unmapped side.
+  If no valid filtered side range is available, the drivetrain remains neutral
+  and waits rather than blindly making another lateral move.
+- The target final side clearance is 250 mm. A +/-75 mm completion allowance is
+  used, so when the remaining-side ultrasonic reports 325 mm or less at the end
+  of a long pass the coverage routine enters `complete` and commands neutral.
+- If more arena remains, the next shift is normally 200 mm. When less than
+  200 mm of lateral travel remains before the 250 mm edge target, that final
+  shift is shortened to exactly the measured remaining amount. The following
+  long pass therefore runs close to the opposite wall rather than overshooting
+  it. In effect the pattern goes from brushing one side of the arena to
+  brushing the other without knowing the arena width in advance.
+- `navigation.lane` is retained as a diagnostic count only; it no longer
+  decides when mapping is finished.
+- Added compact telemetry:
+    - `navigation.remaining_width_mm` while a valid remaining-side reference is
+      available during a sweep;
+    - `navigation.next_shift_mm` for the dynamically selected lateral move.
+
+Encoder/IMU cross-check for the virtual map:
+
+The BNO055 does not provide a trustworthy absolute translational velocity
+signal. Its linear acceleration can, however, independently confirm that the
+physical chassis actually started moving. A firmware-side motion-event detector
+therefore runs at the existing 50 ms IMU sample rate:
+
+- motion start threshold: 0.22 m/s^2 for two consecutive samples (~100 ms);
+- motion stop threshold: 0.08 m/s^2 for three consecutive samples (~150 ms);
+- each confirmed stationary-to-moving transition increments a persistent
+  `imu.motion_event_count`;
+- `imu.motion_active` and `imu.motion_event_count` are included in normal
+  telemetry. The event counter allows the GUI to see a short launch
+  acceleration even when it occurred between slower telemetry packets.
+
+Arena View now cross-checks encoder translation against this IMU evidence:
+
+- encoder counts are always consumed immediately, including rejected motion,
+  so false wheel movement can never be accumulated and applied later;
+- when a new encoder-motion bout starts, map translation is accepted only when
+  the IMU is currently valid and either `imu.motion_active` is true, the motion
+  event counter has incremented, or the fused BNO055 heading has changed by at
+  least 0.5 degrees (independent evidence for a real turn);
+- once a bout has been confirmed, the confirmation remains latched while the
+  encoders continue moving. This is necessary because a robot travelling at
+  steady velocity can legitimately have approximately zero linear
+  acceleration;
+- when the encoders stop, the latch clears. The next encoder-motion bout must be
+  independently confirmed again by the IMU;
+- if the encoders move while the current IMU is invalid or supplies no motion
+  evidence, Arena View leaves x/y and travelled distance unchanged, reports
+  zero virtual linear speed for that sample, and displays
+  `ENCODER/IMU DISAGREEMENT: map translation held.`;
+- older recordings/firmware that do not contain the new `imu.motion_*` fields
+  retain the legacy odometry path for replay compatibility.
+
+Files changed:
+
+- PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp
+- Non-Teensy-Files/BluetoothDebugGUI/ArenaView.py
+
+No header, pin assignment, debug_config.json, Bluetooth command format, sensor
+wiring or GUI control layout change is required.
+
+Verification performed for this handoff:
+
+- ArenaView.py passes Python bytecode compilation.
+- Synthetic ArenaModel checks confirm: encoder-only movement is held; a new IMU
+  motion event permits translation; constant-speed encoder movement remains
+  accepted after the event; stopping resets the latch; a later wheel-only bout
+  is held again; and an invalid IMU holds translation even if stale motion
+  fields claim activity.
+- The modified C++ has balanced braces, contains no `SWEEP_LANE_COUNT`, and the
+  expected dynamic-width / IMU-motion telemetry paths are present.
+
+Not verified in this environment:
+
+- PlatformIO/Teensy compilation, because the project PlatformIO toolchain is not
+  available here.
+- Physical dynamic-width behaviour. The first robot test should watch
+  `navigation.remaining_width_mm` and `navigation.next_shift_mm`, confirm that
+  the remaining-side sensor alternates B/A correctly between lanes, verify a
+  shortened final shift near the opposite wall, and confirm the robot stops
+  after making the final wall-adjacent pass rather than after a predetermined
+  lane count.
+- The encoder/IMU map gate should also be tested with the drive wheels spinning
+  while the chassis is physically restrained: the virtual robot should remain
+  stationary and show the disagreement warning.
+
+
+===============================================================================
+52. UNEXPECTED-WALL DETOURS THAT RETURN TO THE ORIGINAL SWEEP PATH
+===============================================================================
+
+This change builds directly on section 51's dynamic arena-width sweep logic and
+IMU-confirmed Arena View odometry. The robot still maps the arena with 200 mm
+nominal lane spacing, still decides the final arena width from the side
+ultrasound sensors, and still has no fixed sweep-lane count. The new behaviour
+only changes what happens when a forward wall/obstacle appears where a normal
+arena end wall is not expected.
+
+Unexpected-wall detection:
+
+- Completed wall-to-wall sweep legs now teach the firmware an expected long
+  sweep length from the calibrated encoders.
+- `navigation.sweep_progress_mm` accumulates only while the robot is actually
+  travelling on its long sweep line. Temporary obstacle-detour travel is
+  deliberately excluded so a bypass cannot make the learned arena length grow.
+- The first clean completed sweep establishes the expected sweep length. Later
+  completed sweeps low-pass update it with 75 percent previous length and
+  25 percent current length.
+- Once that expected length exists, a forward wall reached more than 450 mm
+  before the expected end of the lane is classified as an unexpected obstacle
+  rather than an arena boundary.
+- The SEN0628 8x8 also provides a geometry-based obstacle cue. Each horizontal
+  X column uses the median of at least three valid Y samples. An outer left or
+  right flank is considered open when at least two of its three outer columns
+  see farther than 550 mm.
+- The 8x8 flank rule allows a localised obstacle to be recognised even before
+  an expected arena length has been learned. A broad wall that fills the whole
+  first-sweep field cannot be distinguished safely from the true arena end wall
+  until at least one clean wall-to-wall sweep has established the arena length.
+
+Choosing a bypass side:
+
+- A detour is attempted only when the chosen side ultrasound reports at least
+  450 mm of lateral room.
+- If both sides are possible, the robot prefers the side with the greater
+  measured ultrasound clearance. The 8x8 flank distance is used only as a
+  tie-breaker.
+- If the controller knows the wall is unexpectedly early but neither side has
+  enough verified room, autonomous navigation stops rather than guessing a
+  route or driving into the obstruction.
+
+Detour path:
+
+1. The current exact sweep heading is saved. The lane number and the normal
+   B/A alternating arena-width direction are not changed.
+2. The robot turns 90 degrees toward the selected bypass side.
+3. It drives laterally while the ultrasound sensor facing back toward the
+   obstacle tracks the obstacle edge. A right detour therefore tracks the wall
+   with Ultrasound A/left; a left detour tracks it with Ultrasound B/right.
+4. A side return at 650 mm or less confirms that the obstacle is actually being
+   tracked. The edge is considered cleared only after two fresh ultrasonic
+   measurements are clear: either timeout/open space or a valid range of at
+   least 800 mm.
+5. After the edge is cleared the robot continues another 220 mm for body
+   clearance, records the total lateral encoder offset, then turns back onto the
+   exact original sweep heading.
+6. It drives forward past the obstacle, again using the obstacle-side
+   ultrasound to determine when the far edge has passed. It then adds another
+   220 mm forward clearance margin.
+7. The robot turns 90 degrees back toward the original sweep lane and drives the
+   exact measured lateral offset back using both calibrated encoders.
+8. It turns back to the stored original sweep heading and resumes the same
+   sweep path from beyond the obstacle. The lane counter is not incremented and
+   the detour does not consume a 200 mm coverage lane shift.
+9. On returning to the sweep path, the side-width filters are deliberately
+   invalidated and reacquired so measurements taken while the robot was rotated
+   around the obstacle cannot corrupt the remaining-arena-width estimate.
+
+Safety limits during a detour:
+
+- Maximum lateral search for an obstacle edge: 1200 mm.
+- Maximum forward travel while waiting to pass the obstacle: 2500 mm.
+- If the lateral route becomes front-blocked before the obstacle edge is found,
+  the forward bypass path becomes blocked, the return path becomes blocked, or
+  the obstacle never ends within the above limits, navigation stops and logs an
+  explicit abort reason.
+- Broad returns at approximately the learned sweep-end distance still follow
+  the existing normal arena end-wall sequence and dynamic 200 mm/final-shortened
+  lane-shift logic.
+
+New navigation phases:
+
+- `obstacle_turn_out`
+- `obstacle_offset`
+- `obstacle_turn_forward`
+- `obstacle_pass`
+- `obstacle_turn_back`
+- `obstacle_return`
+- `obstacle_turn_in`
+
+New compact telemetry:
+
+- `navigation.sweep_progress_mm`
+- `navigation.expected_sweep_length_mm` (0 until learned)
+- `navigation.detour_active`
+- `navigation.detour_side` (`1` = right, `-1` = left, `0` = none)
+- `navigation.obstacle_count`
+- `navigation.detour_offset_mm`
+
+Files changed:
+
+- PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp
+- PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h
+
+No ArenaView.py, debug_config.json, pin mapping, sensor driver, Bluetooth command
+format, recording schema or desktop control changes are required. The generic
+telemetry path will expose the new navigation fields automatically, and the
+existing Arena View will naturally draw the physical detour because its pose is
+still derived from the encoders plus the section 51 IMU cross-check.
+
+Verification performed for this handoff:
+
+- The generated C++ source has balanced braces and parentheses.
+- Every new NAV_OBSTACLE_* state used by the implementation is declared in the
+  replacement header, and every new navigation member referenced by the source
+  is present in that header.
+- Lightweight logic checks confirm the right/left detour heading sequence
+  returns to the exact original heading, the 450 mm early-wall rule separates a
+  clearly premature wall from a near-end wall, and the 8x8 flank rule requires
+  at least two agreeing outer columns rather than one noisy pixel.
+- The section 51 dynamic arena-width logic and IMU motion-event telemetry remain
+  present in the complete replacement source.
+
+Not verified in this environment:
+
+- PlatformIO/Teensy compilation and physical obstacle testing. After replacing
+  both files, run the normal PlatformIO build before uploading.
+- The first physical obstacle test should use a finite wall/box placed well
+  inside a known sweep. Watch `navigation.phase`, `navigation.detour_side`,
+  `navigation.detour_offset_mm`, `navigation.sweep_progress_mm` and
+  `navigation.expected_sweep_length_mm`. Confirm the robot goes around the
+  object, returns to the same line beyond it, then continues the normal sweep.
+- Test both left and right bypasses and also place an obstruction where neither
+  side has 450 mm clearance; that case should stop safely rather than force a
+  detour.
+
+
+===============================================================================
+53. 2026-09-22 RUN DIAGNOSIS: TURN OSCILLATION AND MISSED CLOSE WALL
+===============================================================================
+
+The newest recording, `RobotRun_2026-09-22_13-17-44.rdbg`, was inspected
+directly rather than judging the behaviour from the Arena View drawing. It
+contains 162.3 seconds, 17,084 telemetry rows and 125 signals. Autonomous
+navigation ran from 6.87 seconds until the dashboard STOP command at 94.43
+seconds.
+
+The recording does not contain the newer sweep-progress, expected-length or
+detour telemetry fields now present in the workspace. Therefore the current
+dynamic-width/detour implementation was either added after this run or had not
+yet been uploaded to the Teensy. The faults below are still directly visible in
+the recorded controller and the fixes have been applied to the newer workspace
+implementation so they are not lost when that version is uploaded.
+
+Two independent faults were found in the recorded control timeline.
+
+Corner-turn oscillation:
+
+- At 29.52 seconds the robot entered `corner_turn` with a target heading of
+  48.44 degrees. It did not begin sweep lane 1 until 78.52 seconds, so this one
+  turn consumed almost exactly 49 seconds.
+- The BNO055 trace shows repeated overshoot across the same target: examples
+  include about 34, 58, 36 and 55 degrees. The motor commands reversed directly
+  between the drivetrain's 75 percent minimum usable turn commands. Rotational
+  inertia therefore carried the chassis through the target on every reversal.
+- Heading turns now coast for 180 ms before reversing direction. Outside 25
+  degrees they retain the existing 80 percent turn. Inside 25 degrees they use
+  90 ms pulses at the known-working 75 percent motor command followed by the
+  remainder of a 300 ms neutral interval.
+- Entering the target band no longer immediately starts the next forward leg.
+  Both motors remain neutral and the BNO055 heading must stay within 4 degrees
+  for 300 ms. This prevents residual rotation from bending the start of a
+  sweep.
+
+Missed 8x8 wall:
+
+- At 88.75 seconds, 25 of the 31 usable centre zones were below 450 mm and the
+  centre median was about 415 mm. At 89.94 seconds, every one of the 32 centre
+  zones reported the same close wall between 153 and 188 mm.
+- The old navigation path discarded all matrix values below 200 mm before
+  fusion. It consequently converted that exceptionally strong, coherent wall
+  frame into no matrix reading. `navigation.front_mm` became zero at 90.9
+  seconds and the robot continued forward. It did not enter the lane turn until
+  approximately 92.1 seconds, when a separate point sensor reported 42 mm.
+- Navigation now has an independent broad-wall detector over the 32 central
+  matrix zones. At least 20 zones must be usable and at least 75 percent of
+  those zones must be below 450 mm. A coherent surface satisfying that rule is
+  authoritative even when its ranges are below 200 mm; isolated close noise
+  remains rejected.
+- Replaying the recorded pixel values through the new rule would declare the
+  wall at 88.75 seconds, over three seconds earlier than the old state change.
+  The 450 mm matrix threshold compensates for the observed roughly 1.2 second
+  interval between full matrix frames; ordinary point-sensor avoidance remains
+  at 300 mm.
+- New recorded telemetry exposes `navigation.matrix_close_zones`,
+  `navigation.matrix_usable_zones` and `navigation.matrix_broad_wall`. A future
+  run can therefore show the complete evidence behind each forward-wall
+  decision.
+
+Review of the intervening workspace changes:
+
+- Arena View now cross-checks encoder translation against BNO055 linear-motion
+  events, suppressing false map travel when the wheels turn without moving the
+  chassis.
+- Firmware now publishes IMU motion activity/event telemetry, learns expected
+  wall-to-wall sweep length, measures remaining arena width dynamically and
+  contains a seven-phase rectangular bypass for unexpected internal obstacles.
+- The fixed sweep count was removed and nominal lane spacing is now 200 mm.
+- The wall-follow target had accidentally returned to 250 mm. It has been
+  restored to the requested 200 mm and protected by the regression suite.
+
+Files changed for this diagnosis and fix:
+
+- `PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.cpp`
+- `PlatformIO/lib/BluetoothDebugWorkflow/BluetoothDebugWorkflow.h`
+- `Non-Teensy-Files/BluetoothDebugGUI/test_recording_replay.py`
+- `status.txt`
+
+Verification:
+
+- PlatformIO Teensy 4.0 release build succeeds. The image uses 133,912 bytes of
+  flash code and leaves 325,792 bytes of RAM1 available for local variables.
+- All 38 desktop regression tests pass in offscreen mode.
+- Regression checks now require the 200 mm wall-follow target, dynamic 200 mm
+  lane spacing, broad-matrix wall consensus, settled/pulsed heading turns and
+  the absence of a fixed sweep-lane count.
+- Physical verification still requires uploading the new firmware. The next
+  recording should show a short, monotonic corner turn and a broad-wall verdict
+  before the front of the robot reaches 300 mm from a flat wall.
+
+
+===============================================================================
+54. NEW RUN CONFIRMED TO BE USING THE PRE-FIX TEENSY BINARY
+===============================================================================
+
+`RobotRun_2026-09-22_13-35-43.rdbg` was captured after section 53's source-code
+fix, but its telemetry proves that the corrected firmware was not running on
+the Teensy.
+
+- It still contains exactly 125 signals and does not contain
+  `navigation.matrix_close_zones`, `navigation.matrix_usable_zones`,
+  `navigation.matrix_broad_wall`, `navigation.sweep_progress_mm`,
+  `navigation.expected_sweep_length_mm` or the obstacle-detour fields.
+- At the first wall the old controller was still commanding approximately
+  -79/-81 percent while its front range changed from 436 mm at 20.4 seconds to
+  210 mm at 21.6 seconds. Residual motion brought the reported range to 77 mm.
+- During the following turn, the recording shows uninterrupted -80/+80 motor
+  output followed by direct, uninterrupted +/-75 percent reversals around the
+  316.06 degree target. Example BNO055 headings were 339, 273, 330, 302, 328,
+  313 and 322 degrees. This is precisely the old turn implementation; the new
+  implementation cannot generate that trace because it inserts neutral coast
+  time and 90 ms near-target pulses.
+- The robot remained in navigation state 2 (`initial_turn`) for the remainder
+  of the 44.4 second recording.
+
+No further controller constants were changed from this run because it did not
+exercise the current source. A connected-device check showed only COM10, the
+CH9143 Bluetooth adapter, plus the computer's two standard Bluetooth serial
+ports. No Teensy programming USB device was available, so the corrected binary
+could not be uploaded. The next required action is to connect the Teensy USB
+programming port and upload the already-successful PlatformIO build before
+performing another physical run.
+
+
+===============================================================================
+55. 90 PERCENT CRUISE, U-TRAP ESCAPE AND FALSE-MAP-TRAVEL REJECTION
+===============================================================================
+
+The lower horizontal Arena View trail in the 13:35 recording was not real
+chassis travel. The robot was physically against the wall while its wheels and
+turn commands continued accumulating encoder counts. Motor vibration could
+also satisfy the BNO055 linear-acceleration event latch, so encoder/IMU motion
+agreement alone was insufficient to reject this wheel slip.
+
+Arena View now applies two additional kinematic checks:
+
+- Opposite-sign bank-2 commands of at least 50 percent are a commanded point
+  turn. Unequal encoder counts during that command may rotate the chassis, but
+  they cannot be treated as centre translation. The map continues consuming
+  BNO055 heading while holding X/Y position.
+- When both bank-2 channels command forward at 50 percent or more and
+  `navigation.front_mm` is 300 mm or closer, encoder motion is treated as
+  forward wheelspin against a wall. Translation and travelled distance are
+  held rather than drawing the robot through the observed wall.
+- The Arena View status explicitly reports `WHEEL SLIP / POINT TURN: map
+  translation held` when either rule is active.
+
+Navigation speed and wall approach:
+
+- Open-space forward travel now requests 90 percent. Heading correction may
+  adjust the two channels between 85 and 95 percent.
+- Inside 700 mm of a forward return, travel drops to the drivetrain's known
+  usable 75 percent minimum to reduce stopping distance. Point turns retain
+  the separately controlled 75/80 percent coast-and-pulse algorithm.
+- The broad 8x8 wall rule now uses a 550 mm threshold and requires at least 20
+  usable centre zones with at least two thirds agreeing. In the 13:35 run this
+  would have detected the first wall at 19.45 seconds, when 22 of 32 central
+  zones were below 550 mm and their median was about 468 mm. The old controller
+  continued until the next close frame.
+
+U-shaped enclosure recovery:
+
+- A U-trap is declared only when forward navigation has a confirmed front wall
+  and both side ultrasound ranges are below 350 mm.
+- The controller enters the new `escape_reverse` phase and commands both drive
+  channels backward at 80 percent.
+- It backs at least 350 mm and continues until either side ultrasound reaches
+  350 mm or more. A 900 mm encoder-distance fallback prevents indefinite
+  reverse travel if a side reading never recovers.
+- It then enters `escape_turn`, chooses the side with more verified clearance,
+  performs the controlled 90 degree turn, clears learned sweep-length state and
+  restarts wall seeking on the new heading.
+- Bottom TOFs do not participate in this rule; they remain reserved for weight
+  sensing.
+
+The Navigation command description now accurately states 90 percent open-space
+travel, 200 mm wall following, 200 mm sweep spacing and U-trap recovery. The
+generated embedded configuration was refreshed by the PlatformIO build.
+
+Verification:
+
+- Teensy 4.0 release firmware builds successfully: 134,488 bytes of code and
+  324,736 bytes of RAM1 remaining for local variables.
+- All 40 desktop regression tests pass. New tests prove that commanded point
+  turns and forward wheelspin at a close wall do not translate the Arena View.
+- The programming USB was still unavailable at the time of this build, so this
+  firmware still requires upload before physical testing.
+
+
+===============================================================================
+56. FULL AUDIT OF ROBOTRUN_2026-09-22_14-08-10
+===============================================================================
+
+The 112.02 second recording was audited from the raw newline-delimited serial
+packets, SQLite telemetry, command/log tables, matrix frames and recorded UI
+snapshots. It did not run the controller represented by the current source.
+The embedded command description had been refreshed, but the executable motor
+logic was still the previous build.
+
+Commands and actuator outputs:
+
+- The only motion command from the app was autonomous-navigation RUN at 1.82
+  seconds. STOP was sent at 107.54 seconds. No Herkulex or HX12K position command
+  was issued; their commanded values remained zero/disabled.
+- Open-space motor output was -80/-80 percent, not the requested -90/-90. The
+  corresponding recorded PPM pulses were 1140/1140 microseconds. Positive 80
+  percent produced 1860 microseconds, negative 75 percent produced 1163
+  microseconds and positive 75 percent produced 1838 microseconds. These values
+  are consistent with the motor driver's configured PPM conversion.
+- During straight motion Encoder 1 was negative and Encoder 2 positive, matching
+  the calibrated forward polarity. During point turns the wheel response and
+  BNO055 heading both changed, so neither drive channel was electrically dead.
+
+Navigation timeline:
+
+- Wall seek began around 2.9 seconds on an 86.625 degree heading. Forward range
+  fell through 1578, 1156, 605 and 259 mm. The initial turn began at 9.0 seconds.
+- The requested first-turn target was 176.625 degrees. Continuous -80/+80 output
+  drove the heading through 157 to 233 degrees, an overshoot of about 56 degrees.
+  Reverse torque then brought it back to 179 degrees.
+- The old controller declared the turn complete immediately at 19.16 seconds.
+  Inertia continued rotating the chassis to approximately 121 degrees while
+  wall-follow output was already driving forward. The robot therefore started
+  wall following about 56 degrees off its intended heading.
+- The corner was declared at 24.23 seconds. Because of the bad preceding leg,
+  the next nominal 90 degree target was 266.625 degrees while measured heading
+  was only about 110 degrees: an effective 156 degree correction.
+- That turn oscillated repeatedly through approximately 212 to 340 degrees.
+  At 50.17 seconds it was still in `corner_turn`. When telemetry returned at
+  110.08 seconds it was in `lane_turn_in`, still commanding -80/+80.
+
+Sensor audit over the 32 intact full telemetry frames:
+
+- Top middle left TOF: available but timed out in 32/32 frames; no distance was
+  produced. This sensor is not currently providing navigation redundancy.
+- Top middle right TOF: available and not timed out in 32/32 frames; 31 recorded
+  distances ranged from 77 to 3008 mm.
+- Ultrasound A and B: both valid and not timed out in 32/32 frames. A ranged
+  from 136 to 2264 mm; B ranged from 263 to 3145 mm.
+- SEN0628 matrix: 32/32 frames valid at address 0x33. The matrix itself was not
+  the cause of the failed turns.
+- Bottom middle right frequently returned the 8191 invalid sentinel. Bottom
+  far right timed out in every intact frame. Several other bottom sensors were
+  available but produced no usable distance. These remain excluded from
+  navigation as intended, but their weight-sensing coverage is incomplete.
+- BNO055 fusion remained in status 5 and passed self-test. Gyro calibration was
+  3/3, accelerometer 1/3 and magnetometer 1-2/3; whole-system calibration stayed
+  0/3. Short relative turns are observable, but absolute magnetic heading is
+  not fully calibrated.
+
+Telemetry and map faults:
+
+- There was a complete 58.29 second raw-stream gap from 50.39 to 108.68 seconds
+  and a 59.91 second gap between full telemetry frames.
+- One returning line was malformed. A later syntactically valid packet had lost
+  byte spans inside field names, producing keys such as
+  `ultrasound.b.trigger_counasound.b.rise_count`. Those corrupt keys then
+  appeared in the saved UI snapshots.
+- The transport sent each JSON line in 20-byte pieces with a 3 ms delay between
+  every piece and then called `flush()`. A normal 3 KB frame could block the
+  firmware loop for hundreds of milliseconds. This invalidated 90 ms steering
+  timing and contributed to control latency and link saturation.
+- Replaying the recording through the corrected map gives a final local pose of
+  approximately X=310 mm, Y=1285 mm, heading=-180.4 degrees and 1525 mm accepted
+  travel. Point-turn and close-wall wheelspin are now rejected, reducing the
+  impossible trail, but the minute-long telemetry hole cannot be reconstructed.
+
+Transport and controller corrections:
+
+- Serial1 now has an additional 8192-byte hardware TX ring. Complete JSON lines
+  are queued to the UART without per-chunk delays and without `flush()`, allowing
+  the hardware UART to drain asynchronously while the control loop continues.
+- Telemetry now includes `system.navigation_controller_version=4` and
+  `system.max_loop_gap_ms`. The Arena View warns clearly if controller version 4
+  is absent, preventing another stale/mixed binary from being mistaken for the
+  current controller.
+- Heading turns now stop continuous 80 percent torque at 55 degrees remaining,
+  rather than 25 degrees, and use the existing short 75 percent pulse/coast
+  control for the remainder. This prevents the roughly 45 degree/second chassis
+  from entering the target region with maximum accumulated inertia.
+- The full PlatformIO output directory was cleaned before rebuilding, ensuring
+  every library and the workflow source were recompiled.
+
+Verification:
+
+- Clean Teensy 4.0 release build succeeds: 134,808 bytes of flash code and
+  316,544 bytes of RAM1 remain available for local variables.
+- Firmware image SHA-256:
+  `D89DCCEBFA905A60B56BFBB41ED17C3E40DFB39948B86F9FEFB650A9D8CA93FB`.
+- All 40 desktop regression tests pass. Tests now also require the 8 KB TX ring,
+  absence of the old delay/flush transport, controller-version telemetry and
+  the 55 degree early transition to pulsed turning.
+- No Teensy programming USB port was visible after the audit. Only the CH9143
+  COM10 link and two computer Bluetooth COM ports were present, so the clean
+  image has not been uploaded.
+
+
+===============================================================================
+57. FULL AUDIT OF ROBOTRUN_2026-09-22_14-24-40 AND CONTROLLER V5
+===============================================================================
+
+The 260.70 second recording contains 45,587 telemetry rows, 398 SEN0628 matrix
+frames and 262 complete GUI snapshots. Navigation found the first wall, followed
+it to a corner and started eleven sweep lanes before the operator stopped the
+run. The physical sequence was substantially better than the preceding run,
+but it exposed two remaining design faults: the displayed map remembered noisy
+ray cells instead of physical walls, and completed turns were allowed to enter
+a forward state even when the newly facing sensors already saw a close wall.
+
+Recording findings:
+
+- Navigation RUN was received at 7.51 seconds. The first wall was found at
+  12.65 seconds, wall following began at 15.25 seconds, the first corner was
+  detected at 23.76 seconds and sweep lane 1 began at 40.56 seconds.
+- Later lane starts were logged at approximately 50.91, 65.31, 81.52, 102.93,
+  121.26, 142.07, 162.95, 185.18, 207.33 and 241.19 seconds. STOP was received
+  at 244.48 seconds.
+- Multiple turns ended with a wall already directly ahead. The first sweep
+  began with a forward range near 108 mm and immediately entered a lane turn;
+  the next began near 121 mm and again changed state almost immediately. The
+  controller had no mandatory post-turn clearance check.
+- The recorded motor outputs still topped out at 80-85 percent. No telemetry
+  field named `system.navigation_controller_version`, `system.max_loop_gap_ms`,
+  `navigation.matrix_broad_wall` or `navigation.sweep_progress_mm` exists in
+  this recording. It therefore came from an intermediate/stale executable, not
+  the clean controller-v4 image documented in section 56.
+- Of 1,047 raw packets, ten were malformed around 197-213 seconds. Several
+  syntactically valid frames also contained truncated or joined signal names.
+  This is consistent with the old blocking/chunked serial transport still being
+  present in the executable that produced the recording.
+- Both top point TOFs were available in 392 of 393 intact telemetry frames and
+  had no recorded timeouts. Ultrasound A had 383 valid samples and Ultrasound B
+  had 362. The SEN0628 supplied 398 frames. These sensors were producing useful
+  data; the main problem was how geometry and state transitions used it.
+- BNO055 fusion stayed in running status 5 and gyro calibration remained 3/3.
+  Whole-system calibration remained 0/3 and magnetic calibration varied from
+  1/3 to 3/3, so relative turns are useful but long-term global heading should
+  not be treated as an exact absolute reference.
+- The bottom sensors remain unsuitable for navigation. Several frequently
+  returned the 8191 sentinel or no useful distance. They remain reserved for
+  paired top/bottom weight detection.
+
+Persistent wall map:
+
+- ArenaModel now keeps a separate collection of persistent wall tracks rather
+  than asking the red/green occupancy grid to represent permanent geometry.
+- Repeated returns from top point TOFs, both side ultrasounds and each 8x8
+  horizontal sector are classified into one north, south, east or west arena
+  boundary. Each confirmed wall uses the median perpendicular coordinate and
+  extends its along-wall limits as more of it is observed.
+- A track is displayed only after at least three agreeing observations. Once
+  confirmed its perpendicular position is locked for the rest of the run, so
+  later odometry noise cannot relocate it or spawn stacks of parallel copies.
+  Confirmed perpendicular walls meet at their measured intersections, producing
+  a clean discovered outline only after all four sides have actually been seen.
+  The latest run replays as exactly four retained boundaries rather than the 64
+  duplicate candidate lines produced by the first clustering attempt.
+- Bottom TOFs never vote for persistent walls. They continue contributing only
+  ordinary display evidence and repeated top/bottom weight candidates.
+- Reset Map clears the persistent walls along with pose, trail and occupancy
+  evidence.
+
+Controller version 5:
+
+- Normal autonomous translation now uses a 100 percent base command in wall
+  seeking, wall following, sweep lanes, lane shifts and obstacle-detour legs.
+  IMU heading correction may reduce one wheel slightly while the other remains
+  at full command; this is necessary to steer rather than repeat a curve.
+- Point turns now also use 100 percent during their driven pulses. The existing
+  pulse/coast approach, reversal coast and 300 ms settled-heading requirement
+  are retained to prevent continuous full-output ping-pong around the target.
+- Every turn that would lead to forward motion now checks the current combined
+  top-TOF/8x8 forward result first. If it is still blocked, the robot turns an
+  additional 90 degrees toward the ultrasound side with more room and checks
+  again. It cannot enter the next forward state until a clear heading exists.
+- If a completed turn sees the front blocked and both side ultrasounds below
+  350 mm, the existing U-shaped enclosure recovery is entered immediately. The
+  robot reverses until a side clears before choosing another turn.
+- An unexpected additional clearance turn invalidates the old sweep-lane
+  geometry. When a clear direction is found, navigation deliberately returns
+  to wall acquisition rather than blindly continuing an obsolete lane.
+- Telemetry reports `system.navigation_controller_version=5` and phase
+  `clearance_turn`; Arena View warns if version 5 is not actually running.
+
+Verification:
+
+- All 44 desktop regression tests pass, including persistent-wall confirmation,
+  exclusion of bottom sensors from wall geometry, full replay, transport and
+  navigation source checks.
+- Teensy 4.0 release firmware builds successfully: 135,384 bytes of code and
+  316,544 bytes of RAM1 remain available for local variables.
+- Firmware image SHA-256:
+  `25333683570BBCCD19410E9BE7EA631D6DC3F552A38F371583C643F6FC2DA46A`.
+- This section documents a compiled but not yet physically trialled controller.
+  The next recording must show controller version 5 before its behaviour can be
+  compared with the stale executable used for the 14:24 run.
+
+
+===============================================================================
+58. ARENA VIEW LIVE MOTOR AND NAVIGATION CONTROLS
+===============================================================================
+
+The live Arena View now has a compact control strip above the map containing:
+
+- RUN NAVIGATION: sends the existing `autonomous_navigation` command with
+  `enabled=true`.
+- STOP NAVIGATION: sends the same command with `enabled=false`, stopping only
+  the autonomous navigation routine.
+- RUN MOTORS: sends the existing global `run` command, taking the robot out of
+  stopped mode so drive commands are permitted.
+- STOP MOTORS: sends the existing global `stop` command, immediately entering
+  stopped mode and neutralising robot outputs.
+
+The controls emit through RobotDebugGUI.execute_command rather than talking to
+the serial layer directly. They therefore use the same command format, debug
+mode enforcement, transmit log and recording command history as the Dashboard
+and Commands tabs. Run buttons are green and stop buttons are red.
+
+Offline Run Replay and End View instances deliberately hide these controls so a
+recording cannot present buttons that look capable of controlling live hardware.
+No Teensy firmware change is required for this feature because all four commands
+already existed in the protocol.
+
+Verification:
+
+- All 45 desktop regression tests pass.
+- A new GUI test clicks all four buttons and verifies the exact command names
+  and arguments emitted in order.
+
+
+===============================================================================
+59. NEAR-CONTACT 8X8 WALL AND U-TRAP CORRECTION
+===============================================================================
+
+Recording `RobotRun_2026-09-22_14-57-55.rdbg` captured the robot continuously
+driving into the wall at the upper-right of the discovered arena. The failure
+was reproduced directly from the recorded actuator, range and controller data.
+
+Exact stuck condition near 75.7 seconds:
+
+- Navigation remained in `follow_wall` and commanded approximately -80/-76
+  percent forward output. Encoder 1 and Encoder 2 continued reporting about
+  -1018 and +1057 counts/second, respectively, while the wheels pushed against
+  the wall.
+- Ultrasound A measured 160 mm and Ultrasound B measured 248 mm. Both sides
+  therefore satisfied the requested U-enclosure threshold of 350 mm.
+- Both top point TOFs were timed out, leaving no point-sensor forward range.
+- The 8x8 frame at 64.19 seconds showed all 32 centre zones below 550 mm with a
+  median of 34 mm. Every subsequent frame contained a coherent surface only
+  12-21 mm away across almost the complete array.
+- The firmware's broad-wall calculation accepted values only from 30 mm upward.
+  Once the wall was closer than that, all 12-21 mm zones were discarded and
+  `navigation.front_mm` became zero, meaning unknown rather than close. Because
+  `frontBlocked` became false, U-trap recovery could not start despite both side
+  ranges being close.
+- This recording also lacks `system.navigation_controller_version`,
+  `system.max_loop_gap_ms`, `navigation.matrix_broad_wall` and the newer sweep
+  fields. Its motor output never reached the requested 100 percent. It was made
+  by the older intermediate firmware rather than controller version 5.
+
+Controller version 6 correction:
+
+- Broad 8x8 wall consensus now accepts centre-zone measurements from 10 through
+  3500 mm. Zero remains invalid. A coherent 10-29 mm image is treated as an
+  authoritative near-contact wall rather than disappearing from navigation.
+- Ordinary matrix ranging still rejects values below 200 mm for general gap and
+  distance estimation. Only the independent broad-wall consensus receives the
+  near-contact allowance, so isolated low pixels cannot trigger the behaviour.
+- The existing consensus still requires at least 20 usable centre zones and at
+  least two thirds of them below 550 mm. Re-evaluating every final matrix frame
+  from this run with the new rule produces 32 usable close zones and therefore
+  a broad wall. Combined with the recorded 160/248 mm side ranges, controller
+  version 6 enters `escape_reverse` instead of continuing forward.
+- Arena View now expects and reports controller version 6 so an old upload is
+  immediately visible.
+
+Verification:
+
+- All 45 desktop regression tests pass.
+- Teensy 4.0 release firmware builds successfully: 135,384 bytes of code and
+  316,544 bytes of RAM1 remain available for local variables.
+- Firmware image SHA-256:
+  `FD7C7B8D6546A9947E7868A7FF368475DF5145FAED39397F959499836B99DF31`.
+- No Teensy programming port was connected after the build. Only COM3 and COM4
+  computer Bluetooth ports were visible, so controller version 6 has not yet
+  been uploaded to the robot.

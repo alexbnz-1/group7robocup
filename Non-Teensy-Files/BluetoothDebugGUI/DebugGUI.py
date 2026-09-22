@@ -1030,6 +1030,7 @@ class RobotDebugGUI(QMainWindow):
 
     def _build_arena_tab(self):
         self.arena_view = ArenaView(self.settings)
+        self.arena_view.command_requested.connect(self.execute_command)
         self.tabs.addTab(self.arena_view, "Arena View")
 
 

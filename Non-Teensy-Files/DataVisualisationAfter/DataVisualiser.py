@@ -326,7 +326,10 @@ class DataVisualiser(QMainWindow):
         matrix_layout.addLayout(grid); matrix_layout.addStretch()
         self.replay_tabs.addTab(matrix_page, "8x8 TOF")
 
-        self.replay_arena = ArenaView(QSettings("RobotProject", "DataVisualiserReplay"))
+        self.replay_arena = ArenaView(
+            QSettings("RobotProject", "DataVisualiserReplay"),
+            show_controls=False,
+        )
         self.replay_tabs.addTab(self.replay_arena, "Arena View")
 
         plot_note = QLabel("The Plots tab is synchronized to this replay clock. "
@@ -347,7 +350,10 @@ class DataVisualiser(QMainWindow):
         self.replay_tabs.addTab(self.replay_logs, "Logs")
         self.replay_raw = QTextEdit(); self.replay_raw.setReadOnly(True)
         self.replay_tabs.addTab(self.replay_raw, "Raw Serial")
-        self.replay_end_arena = ArenaView(QSettings("RobotProject", "DataVisualiserEndView"))
+        self.replay_end_arena = ArenaView(
+            QSettings("RobotProject", "DataVisualiserEndView"),
+            show_controls=False,
+        )
         self.replay_tabs.addTab(self.replay_end_arena, "End View")
 
         self.tabs.addTab(page, "Run Replay")

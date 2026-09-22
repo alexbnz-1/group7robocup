@@ -64,6 +64,10 @@ class ArenaModel:
         self.theta = math.pi / 2  # forward is up in the initial local frame
         self._last_counts = None
         self._last_heading = None
+        self._last_imu_motion_event_count = None
+        self._imu_motion_latched = False
+        self.encoder_imu_disagreement = False
+        self.wheel_slip_detected = False
         self._frame_time = None
         self._frame = {}
         self.latest = {}
@@ -87,6 +91,11 @@ class ArenaModel:
         self.distance_travelled_mm = 0.0
         self.linear_speed_mm_s = 0.0
         self.range_filter_state = {}
+        # Stable arena geometry, separate from the noisy occupancy evidence.
+        # Each track is an axis-aligned wall repeatedly observed by the top
+        # ranging sensors. Tracks are retained for the whole run and extended
+        # as the robot sees more of the same wall.
+        self.wall_tracks = []
 
     def _filtered_distance(self, name, distance, confirm_initial=False):
         """Reject one-frame range jumps, then lightly median-filter accepted data."""
@@ -159,7 +168,10 @@ class ArenaModel:
                 filtered = self._filtered_distance(label, distance)
                 if filtered is not None:
                     valid_distances[label] = filtered
-                    self._add_observation(filtered, spec["angle"], label, spec["x"], spec["y"])
+                    self._add_observation(
+                        filtered, spec["angle"], label, spec["x"], spec["y"],
+                        wall_candidate=spec.get("layer") != "bottom"
+                    )
 
         # Ultrasound contributes ordinary free/obstacle centreline evidence.
         # Keep it out of the point-TOF top/bottom weight comparison because
@@ -182,6 +194,7 @@ class ArenaModel:
                         f"ultrasound.{telemetry_name}",
                         spec["x"],
                         spec["y"],
+                        wall_candidate=True,
                     )
 
         for bottom in self.sensor_specs:
@@ -226,27 +239,63 @@ class ArenaModel:
         if left is None or right is None:
             return
         counts = (left, right)
+
+        motion_event = _number(frame.get("imu.motion_event_count"))
+        motion_event = int(motion_event) if motion_event is not None else None
+        motion_fields_present = (
+            "imu.motion_active" in frame and
+            "imu.motion_event_count" in frame
+        )
+
         if self._last_counts is None:
             self._last_counts = counts
+            self._last_imu_motion_event_count = motion_event
+            self._imu_motion_latched = (
+                frame.get("imu.available") is True and
+                frame.get("imu.valid") is True and
+                frame.get("imu.motion_active") is True
+            )
+            self.encoder_imu_disagreement = False
             self.last_source = "Encoder baseline acquired"
             return
+
         dleft = left - self._last_counts[0]
         dright = right - self._last_counts[1]
+        # Always consume the encoder sample, including rejected wheel-only
+        # movement, so false motion is never back-filled into the map later.
         self._last_counts = counts
+
         # An encoder-zero command can cause a huge count discontinuity.
         if abs(dleft) > 100000 or abs(dright) > 100000:
+            self._imu_motion_latched = False
+            self.encoder_imu_disagreement = False
             self.last_source = "Encoder reset detected; pose held"
             return
         if self.invert_left:
             dleft = -dleft
         if self.invert_right:
             dright = -dright
+
         left_scale = self.encoder_1_mm_per_count or self.mm_per_count
         right_scale = self.encoder_2_mm_per_count or self.mm_per_count
         distance_scale_ready = left_scale > 0 and right_scale > 0
         dleft_mm = dleft * left_scale
         dright_mm = dright * right_scale
         ds = (dleft_mm + dright_mm) * 0.5
+        encoder_motion = abs(dleft) + abs(dright) >= 4
+
+        motor_a = _number(frame.get("dc_motor_203_second.channel_a_percent"))
+        motor_b = _number(frame.get("dc_motor_203_second.channel_b_percent"))
+        commanded_turn_in_place = (
+            motor_a is not None and motor_b is not None and
+            motor_a * motor_b < 0 and abs(motor_a) >= 50 and abs(motor_b) >= 50
+        )
+        front_mm = _number(frame.get("navigation.front_mm"))
+        pushing_into_wall = (
+            motor_a is not None and motor_b is not None and
+            motor_a <= -50 and motor_b <= -50 and
+            front_mm is not None and 0 < front_mm <= 300
+        )
 
         valid_imu = frame.get("imu.available") is True and frame.get("imu.valid") is True
         heading = _number(frame.get("imu.heading_deg")) if valid_imu else None
@@ -265,30 +314,94 @@ class ArenaModel:
             (self.last_imu_fusion_running is True or
              (not fusion_field_present and (cal is None or cal >= 1)))
         )
+
         previous_theta = self.theta
+        clockwise_delta = None
+        if heading_ready and self._last_heading is not None:
+            # Wrap through 0/360 without a spurious full revolution.
+            clockwise_delta = (heading - self._last_heading + 180) % 360 - 180
+
+        event_changed = (
+            motion_event is not None and
+            self._last_imu_motion_event_count is not None and
+            motion_event != self._last_imu_motion_event_count
+        )
+        if motion_event is not None:
+            self._last_imu_motion_event_count = motion_event
+
+        # A heading change is independent IMU evidence of real chassis motion
+        # during a turn. Straight translation is confirmed by the firmware's
+        # short-lived linear-acceleration event counter. Once a movement bout
+        # is confirmed, keep it latched through constant-speed travel because
+        # zero acceleration does not mean zero velocity. The latch resets when
+        # encoder motion stops, so the next bout must be confirmed again.
+        imu_heading_motion = (
+            clockwise_delta is not None and abs(clockwise_delta) >= 0.5
+        )
+        if motion_fields_present:
+            if not encoder_motion:
+                self._imu_motion_latched = False
+            elif valid_imu and (
+                    frame.get("imu.motion_active") is True or
+                    event_changed or imu_heading_motion):
+                self._imu_motion_latched = True
+            # Current firmware provides imu.motion_* specifically so encoder
+            # translation can be cross-checked. Do not advance the virtual
+            # chassis unless the IMU itself is currently valid and has
+            # confirmed this encoder-motion bout.
+            translation_confirmed = (
+                encoder_motion and valid_imu and self._imu_motion_latched
+            )
+            self.encoder_imu_disagreement = (
+                encoder_motion and not translation_confirmed
+            )
+        else:
+            # Backward compatibility for recordings and firmware made before
+            # imu.motion_* telemetry existed.
+            translation_confirmed = True
+            self.encoder_imu_disagreement = False
+
+        # Unequal wheel counts during a commanded point turn are rotation, not
+        # translation. Likewise, spinning both wheels forward against a wall
+        # cannot move the chassis through the wall even if vibration trips the
+        # IMU acceleration latch. Keep BNO055 yaw, but reject map translation.
+        self.wheel_slip_detected = bool(
+            encoder_motion and (commanded_turn_in_place or pushing_into_wall)
+        )
+        if self.wheel_slip_detected:
+            translation_confirmed = False
+            self.encoder_imu_disagreement = True
+
         if heading_ready:
-            if self._last_heading is not None:
-                # Wrap through 0/360 without a spurious full revolution.
-                clockwise_delta = (heading - self._last_heading + 180) % 360 - 180
+            if clockwise_delta is not None:
                 # The BNO055 magnetometer drifts around the powered chassis.
                 # If neither wheel moved, update its baseline but hold map yaw.
-                if abs(dleft) + abs(dright) >= 4:
+                if encoder_motion:
                     self.theta -= math.radians(clockwise_delta)
             self._last_heading = heading
-            self.last_source = (
-                "IMU heading + encoder distance" if abs(dleft) + abs(dright) >= 4
-                else "Stationary: encoder lock suppressing IMU yaw drift"
-            )
+            if self.encoder_imu_disagreement:
+                self.last_source = "Encoder movement held: IMU did not confirm chassis motion"
+            else:
+                self.last_source = (
+                    "IMU heading + encoder distance" if encoder_motion
+                    else "Stationary: encoder lock suppressing IMU yaw drift"
+                )
         elif self.track_width_mm > 0 and distance_scale_ready:
             self._last_heading = None
-            self.theta += (dright_mm - dleft_mm) / self.track_width_mm
-            self.last_source = "Encoder-only heading (IMU uncalibrated/unavailable)"
+            if translation_confirmed:
+                self.theta += (dright_mm - dleft_mm) / self.track_width_mm
+                self.last_source = "Encoder-only heading (IMU uncalibrated/unavailable)"
+            else:
+                self.last_source = "Encoder movement held: IMU did not confirm chassis motion"
         else:
             self._last_heading = None
-            self.last_source = "IMU fusion unavailable; turn mapping paused"
+            self.last_source = (
+                "Encoder movement held: IMU did not confirm chassis motion"
+                if self.encoder_imu_disagreement
+                else "IMU fusion unavailable; turn mapping paused"
+            )
 
         if distance_scale_ready:
-            self.distance_travelled_mm += abs(ds)
             left_rate = _number(frame.get("encoder.1.counts_per_s"))
             right_rate = _number(frame.get("encoder.2.counts_per_s"))
             if left_rate is not None and right_rate is not None:
@@ -296,9 +409,17 @@ class ArenaModel:
                     left_rate = -left_rate
                 if self.invert_right:
                     right_rate = -right_rate
-                self.linear_speed_mm_s = (
+                encoder_speed = (
                     left_rate * left_scale + right_rate * right_scale
                 ) * 0.5
+                self.linear_speed_mm_s = encoder_speed if translation_confirmed else 0.0
+            elif not translation_confirmed:
+                self.linear_speed_mm_s = 0.0
+
+            if not translation_confirmed:
+                return
+
+            self.distance_travelled_mm += abs(ds)
             # Integrate the exact constant-curvature arc between telemetry
             # frames. The old midpoint approximation badly displaced the map
             # during turns when Bluetooth delivered sparse pose samples.
@@ -310,7 +431,9 @@ class ArenaModel:
                 radius = ds / dtheta
                 self.x += radius * (math.sin(self.theta) - math.sin(previous_theta))
                 self.y -= radius * (math.cos(self.theta) - math.cos(previous_theta))
-            if not self.trail or math.hypot(self.x - self.trail[-1][0], self.y - self.trail[-1][1]) >= 15:
+            if (not self.trail or
+                    math.hypot(self.x - self.trail[-1][0],
+                               self.y - self.trail[-1][1]) >= 15):
                 self.trail.append((self.x, self.y))
 
     def _cell(self, x, y):
@@ -324,7 +447,57 @@ class ArenaModel:
                   origin_y + distance_mm * math.sin(angle))
         return target
 
-    def _add_observation(self, distance_mm, angle_deg, source, lateral_mm=0.0, forward_mm=0.0):
+    def _record_wall_observation(self, target, ray_angle_deg, source):
+        """Cluster repeat returns into persistent axis-aligned wall segments."""
+        world_angle = self.theta + math.radians(ray_angle_deg)
+        ray_x = math.cos(world_angle)
+        ray_y = math.sin(world_angle)
+        horizontal = abs(ray_y) >= abs(ray_x)
+        orientation = "horizontal" if horizontal else "vertical"
+        boundary = (
+            "north" if horizontal and ray_y >= 0 else
+            "south" if horizontal else
+            "east" if ray_x >= 0 else "west"
+        )
+        coordinate = target[1] if horizontal else target[0]
+        tangent = target[0] if horizontal else target[1]
+
+        # The arena is rectangular: there is only one boundary in each
+        # cardinal outward direction. This prevents pose drift from spawning
+        # a stack of parallel copies of a wall that was already discovered.
+        nearest = next(
+            (track for track in self.wall_tracks
+             if track["boundary"] == boundary), None
+        )
+
+        if nearest is None:
+            nearest = {
+                "boundary": boundary,
+                "orientation": orientation,
+                "coordinate": coordinate,
+                "coordinates": deque([coordinate], maxlen=31),
+                "minimum": tangent,
+                "maximum": tangent,
+                "observations": 0,
+                "sources": set(),
+            }
+            self.wall_tracks.append(nearest)
+        elif abs(nearest["coordinate"] - coordinate) > 180.0:
+            # Once this boundary exists, a return far from it is an internal
+            # object or accumulated pose error. It must not relocate the wall.
+            return
+
+        nearest["coordinates"].append(coordinate)
+        if nearest["observations"] < 3:
+            ordered = sorted(nearest["coordinates"])
+            nearest["coordinate"] = ordered[len(ordered) // 2]
+        nearest["minimum"] = min(nearest["minimum"], tangent)
+        nearest["maximum"] = max(nearest["maximum"], tangent)
+        nearest["observations"] += 1
+        nearest["sources"].add(source)
+
+    def _add_observation(self, distance_mm, angle_deg, source, lateral_mm=0.0,
+                         forward_mm=0.0, wall_candidate=False):
         if not self.min_range_mm <= distance_mm <= self.max_range_mm:
             return
         origin_x = self.x + forward_mm * math.cos(self.theta) + lateral_mm * math.sin(self.theta)
@@ -334,6 +507,8 @@ class ArenaModel:
         # Without a distance scale, previous readings cannot be registered.
         if self.mm_per_count > 0:
             self.points.append((*target, source))
+            if wall_candidate:
+                self._record_wall_observation(target, angle_deg, source)
             endpoint = self._cell(*target)
             traversed = set()
             count = max(1, math.ceil(distance_mm / (self.cell_size_mm / 3)))
@@ -346,6 +521,28 @@ class ArenaModel:
                 traversed.add(cell)
                 self.cells[cell] = max(-8, self.cells.get(cell, 0) - 1)
             self.cells[endpoint] = min(8, self.cells.get(endpoint, 0) + 3)
+
+    def wall_segment(self, wall):
+        """Return a visible segment, joining confirmed boundary intersections."""
+        if wall["orientation"] == "horizontal":
+            perpendicular = sorted(
+                item["coordinate"] for item in self.wall_tracks
+                if item["orientation"] == "vertical" and
+                item["observations"] >= 3
+            )
+        else:
+            perpendicular = sorted(
+                item["coordinate"] for item in self.wall_tracks
+                if item["orientation"] == "horizontal" and
+                item["observations"] >= 3
+            )
+        if len(perpendicular) >= 2:
+            return perpendicular[0], perpendicular[-1]
+        minimum, maximum = wall["minimum"], wall["maximum"]
+        if maximum - minimum < 300.0:
+            centre = (minimum + maximum) * 0.5
+            minimum, maximum = centre - 150.0, centre + 150.0
+        return minimum, maximum
 
     def _add_wedge_observation(self, distance_mm, centre_angle_deg, width_deg,
                                source, lateral_mm=0.0, forward_mm=0.0,
@@ -373,6 +570,7 @@ class ArenaModel:
 
         centre_target = plane_endpoint(centre_angle_deg)
         self.points.append((*centre_target, source))
+        self._record_wall_observation(centre_target, centre_angle_deg, source)
         free_cells = set()
         left_relative = math.radians(centre_angle_deg - half_width - reference_angle_deg)
         right_relative = math.radians(centre_angle_deg + half_width - reference_angle_deg)
@@ -498,6 +696,16 @@ class ArenaCanvas(QWidget):
         if self.model.cells:
             xs.extend(column * cell_size for column, _row in self.model.cells)
             ys.extend(row * cell_size for _column, row in self.model.cells)
+        for wall in self.model.wall_tracks:
+            if wall["observations"] < 3:
+                continue
+            minimum, maximum = self.model.wall_segment(wall)
+            if wall["orientation"] == "horizontal":
+                xs.extend((minimum, maximum))
+                ys.append(wall["coordinate"])
+            else:
+                xs.append(wall["coordinate"])
+                ys.extend((minimum, maximum))
         for x0, y0, x1, y1, _source in self.model.current_rays:
             xs.extend((x0, x1))
             ys.extend((y0, y1))
@@ -561,7 +769,24 @@ class ArenaCanvas(QWidget):
                 p.drawRect(QRectF(screen(x, y + cell_size), screen(x + cell_size, y)).normalized())
         p.setClipping(False)
         p.setPen(QColor("#667489"))
-        p.drawText(20, 23, "DISCOVERED MAP — red sensor returns form the arena boundary")
+        p.drawText(20, 23, "DISCOVERED MAP — solid red lines are remembered arena walls")
+
+        # Confirmed walls are drawn above the raw occupancy squares. Unlike
+        # individual ray endpoints these landmarks remain fixed and extend as
+        # later observations agree with the same physical wall.
+        p.setPen(QPen(QColor("#ef4444"), 5, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
+        for wall in self.model.wall_tracks:
+            if wall["observations"] < 3:
+                continue
+            minimum, maximum = self.model.wall_segment(wall)
+            if wall["orientation"] == "horizontal":
+                start = screen(minimum, wall["coordinate"])
+                end = screen(maximum, wall["coordinate"])
+            else:
+                start = screen(wall["coordinate"], minimum)
+                end = screen(wall["coordinate"], maximum)
+            p.drawLine(start, end)
 
         if len(self.model.trail) > 1:
             p.setPen(QPen(QColor("#60a5fa"), 2))
@@ -731,7 +956,9 @@ class SensorLayoutCanvas(QWidget):
 
 
 class ArenaView(QWidget):
-    def __init__(self, settings, parent=None):
+    command_requested = pyqtSignal(str, dict)
+
+    def __init__(self, settings, parent=None, show_controls=True):
         super().__init__(parent)
         self.settings = settings
         self.model = ArenaModel()
@@ -741,6 +968,45 @@ class ArenaView(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        if show_controls:
+            controls = QHBoxLayout()
+            controls.setSpacing(8)
+            controls.addWidget(QLabel("Arena controls:"))
+            self.run_navigation_button = QPushButton("RUN NAVIGATION")
+            self.stop_navigation_button = QPushButton("STOP NAVIGATION")
+            self.run_motors_button = QPushButton("RUN MOTORS")
+            self.stop_motors_button = QPushButton("STOP MOTORS")
+            for button in (self.run_navigation_button, self.run_motors_button):
+                button.setStyleSheet(
+                    "QPushButton { background: #15803d; color: white; "
+                    "font-weight: bold; padding: 7px 14px; }"
+                )
+            for button in (self.stop_navigation_button, self.stop_motors_button):
+                button.setStyleSheet(
+                    "QPushButton { background: #b91c1c; color: white; "
+                    "font-weight: bold; padding: 7px 14px; }"
+                )
+            self.run_navigation_button.clicked.connect(
+                lambda: self.command_requested.emit(
+                    "autonomous_navigation", {"enabled": True})
+            )
+            self.stop_navigation_button.clicked.connect(
+                lambda: self.command_requested.emit(
+                    "autonomous_navigation", {"enabled": False})
+            )
+            self.run_motors_button.clicked.connect(
+                lambda: self.command_requested.emit("run", {})
+            )
+            self.stop_motors_button.clicked.connect(
+                lambda: self.command_requested.emit("stop", {})
+            )
+            controls.addWidget(self.run_navigation_button)
+            controls.addWidget(self.stop_navigation_button)
+            controls.addSpacing(16)
+            controls.addWidget(self.run_motors_button)
+            controls.addWidget(self.stop_motors_button)
+            controls.addStretch()
+            left_layout.addLayout(controls)
         self.canvas = ArenaCanvas(self.model, self)
         left_layout.addWidget(self.canvas, 1)
         self._build_raw_tof_panel()
@@ -1306,6 +1572,11 @@ class ArenaView(QWidget):
             "Firmware mismatch: robot still sends old front/left TOF names and no IMU; "
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
+        controller_version = _number(m.latest.get("system.navigation_controller_version"))
+        if ("system.uptime_s" in m.latest and controller_version != 6):
+            firmware_warning += (
+                "Navigation controller v6 is not running; upload the current clean build. "
+            )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
         ultrasound_valid = sum(
@@ -1314,8 +1585,14 @@ class ArenaView(QWidget):
         )
         missing = (f" Wiring Guide ports not active in firmware: {', '.join(self.sensor_unmatched)}."
                    if self.sensor_unmatched else "")
+        motion_warning = (
+            "WHEEL SLIP / POINT TURN: map translation held. "
+            if m.wheel_slip_detected else
+            ("ENCODER/IMU DISAGREEMENT: map translation held. "
+             if m.encoder_imu_disagreement else "")
+        )
         self.status.setText(
-            f"{firmware_warning}{accuracy}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "
+            f"{firmware_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "
             f"Travel: {m.distance_travelled_mm:.0f} mm; speed: {m.linear_speed_mm_s:.0f} mm/s. "
             f"IMU fusion {'running' if m.last_imu_fusion_running is True else 'not ready'}; "
             f"system calibration {calibration}/3; status/error "
