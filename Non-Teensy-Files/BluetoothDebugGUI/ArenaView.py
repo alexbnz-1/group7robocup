@@ -1461,6 +1461,24 @@ class MissionLayout:
             "points": points,
         }
 
+    def map_payload(self):
+        # Rectangles are deliberately compact: the Teensy command receive
+        # buffer is 768 bytes. The opposite home is a forbidden area, while
+        # walls/ramps/tubes/dummy weights are physical ranging landmarks.
+        features = []
+        rectangles = [(self.no_go_home(), 0)]
+        rectangles.extend((self._obstacle_rect(item), 1)
+                          for item in self.obstacles)
+        rectangles.extend(((item["x"] - 120, item["y"] - 120,
+                            item["x"] + 120, item["y"] + 120), 1)
+                          for item in self.weights if item["dummy"])
+        for rect, kind in rectangles:
+            x0, y0, x1, y1 = rect
+            features.extend([max(0, int(round(x0))), max(0, int(round(y0))),
+                             min(4900, int(round(x1))), min(2400, int(round(y1))),
+                             kind])
+        return {"features": features}
+
     def to_dict(self):
         return {
             "my_home": self.my_home,
@@ -1508,6 +1526,9 @@ class MissionLayoutCanvas(QWidget):
         self._pan_at = None
         self.zoom = 1.0
         self.pan = QPointF(0.0, 0.0)
+        self.replay_path = []
+        self.replay_observed_ray = None
+        self.replay_expected_ray = None
 
     def reset_view(self):
         self.zoom = 1.0
@@ -1725,6 +1746,19 @@ class MissionLayoutCanvas(QWidget):
                 p.drawEllipse(centre, 9, 9)
                 p.drawText(QRectF(centre.x() - 12, centre.y() - 25, 24, 18),
                            Qt.AlignmentFlag.AlignCenter, str(visit_number))
+
+        if len(self.replay_path) >= 2:
+            p.setPen(QPen(QColor("#fb923c"), 3, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPolyline(QPolygonF([self._screen(x, y)
+                                       for x, y in self.replay_path]))
+        for ray, colour, style in (
+            (self.replay_expected_ray, "#67e8f9", Qt.PenStyle.DashLine),
+            (self.replay_observed_ray, "#f87171", Qt.PenStyle.SolidLine),
+        ):
+            if ray is not None:
+                p.setPen(QPen(QColor(colour), 3, style))
+                p.drawLine(self._screen(*ray[0]), self._screen(*ray[1]))
 
         for item in model.obstacles:
             selected = item["id"] == self.selected_id
@@ -2173,6 +2207,7 @@ class ArenaView(QWidget):
             controls.addWidget(QLabel("Arena controls:"))
             self.run_navigation_button = QPushButton("RUN NAVIGATION")
             self.stop_navigation_button = QPushButton("STOP NAVIGATION")
+            self.return_home_button = QPushButton("RETURN HOME")
             self.run_motors_button = QPushButton("RUN MOTORS")
             self.stop_motors_button = QPushButton("STOP MOTORS")
             for button in (self.run_navigation_button, self.run_motors_button):
@@ -2192,6 +2227,7 @@ class ArenaView(QWidget):
                 lambda: self.command_requested.emit(
                     "autonomous_navigation", {"enabled": False})
             )
+            self.return_home_button.clicked.connect(self._return_home)
             self.run_motors_button.clicked.connect(
                 lambda: self.command_requested.emit("run", {})
             )
@@ -2200,6 +2236,7 @@ class ArenaView(QWidget):
             )
             controls.addWidget(self.run_navigation_button)
             controls.addWidget(self.stop_navigation_button)
+            controls.addWidget(self.return_home_button)
             controls.addSpacing(16)
             controls.addWidget(self.run_motors_button)
             controls.addWidget(self.stop_motors_button)
@@ -2245,19 +2282,30 @@ class ArenaView(QWidget):
             if label is not None:
                 label.hide()
             control.hide()
-        # Powered straight-run calibration. The first two consistent trials
-        # covered 775 mm over 8522/8080 counts. A third trial was rejected as
-        # an approximately 12% distance outlier.
-        if not settings.value("arena/dual_encoder_calibration_20260920", False, type=bool):
-            settings.setValue("arena/encoder_1_mm_per_count", 775.0 / 8522.0)
-            settings.setValue("arena/encoder_2_mm_per_count", 775.0 / 8080.0)
+        # Powered straight-run encoder calibration updated 2026-09-23. Two
+        # measured runs covered 2180 mm and 2010 mm. Combined-distance /
+        # combined-count calibration gives 0.08437374 mm/count for encoder 1
+        # and 0.08461399 mm/count for encoder 2. Direction/inversion remains
+        # separate from distance scale. This migration deliberately overwrites
+        # the older saved calibration once on existing GUI installations.
+        encoder_1_calibration = 0.08437374
+        encoder_2_calibration = 0.08461399
+        if not settings.value(
+                "arena/dual_encoder_calibration_20260923", False, type=bool):
+            settings.setValue(
+                "arena/encoder_1_mm_per_count", encoder_1_calibration)
+            settings.setValue(
+                "arena/encoder_2_mm_per_count", encoder_2_calibration)
             settings.setValue("arena/invert_left", True)
             settings.setValue("arena/invert_right", False)
-            settings.setValue("arena/dual_encoder_calibration_20260920", True)
+            settings.setValue(
+                "arena/dual_encoder_calibration_20260923", True)
         self.encoder_1_scale = spin(
-            "encoder_1_mm_per_count", "Encoder 1 mm / count", 775.0 / 8522.0, 100, 5)
+            "encoder_1_mm_per_count", "Encoder 1 mm / count",
+            encoder_1_calibration, 100, 5)
         self.encoder_2_scale = spin(
-            "encoder_2_mm_per_count", "Encoder 2 mm / count", 775.0 / 8080.0, 100, 5)
+            "encoder_2_mm_per_count", "Encoder 2 mm / count",
+            encoder_2_calibration, 100, 5)
         self.track_width = spin("track_width", "Wheel track", 0, 2000)
         if not settings.value("arena/wheel_track_40mm_migrated", False, type=bool):
             if self.track_width.value() == 0:
@@ -2321,6 +2369,7 @@ class ArenaView(QWidget):
 
     def _build_mission_editor(self):
         self.mission_layout = MissionLayout()
+        self._return_home_route_active = False
         try:
             saved = self.settings.value("navigation/mission_layout", "")
             if saved:
@@ -2555,8 +2604,24 @@ class ArenaView(QWidget):
             self.mission_weight_visibility.setStyleSheet(
                 "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }")
         else:
+            valid = int(_number(latest.get("weight.valid_mask")) or 0)
+            gap = int(_number(latest.get("weight.gap_mask")) or 0)
+            target = int(_number(latest.get("weight.target_mask")) or 0)
+            wall = int(_number(latest.get("weight.map_wall_mask")) or 0)
+            if latest.get("weight.geometry_valid") is False:
+                reason = "Sensor positions not uploaded — restart mission from Arena View"
+            elif target & gap & valid & wall:
+                reason = "Candidate matches a mapped wall"
+            elif target & gap & valid:
+                reason = "Candidate awaiting 3 confirming polls"
+            elif target & valid:
+                reason = "Near planned weight, but top/bottom height gap is too small"
+            elif gap & valid:
+                reason = "Low return does not land near a planned weight"
+            else:
+                reason = "No valid paired low-object return"
             self.mission_weight_visibility.setText(
-                "NO WEIGHT CURRENTLY VISIBLE\n4-sector TOF confirmation is clear")
+                f"NO WEIGHT CURRENTLY VISIBLE\n{reason}")
             self.mission_weight_visibility.setStyleSheet(
                 "QLabel { background:#1e293b; color:#cbd5e1; padding:10px; font-weight:bold; }")
 
@@ -2568,6 +2633,7 @@ class ArenaView(QWidget):
 
     def _mission_layout_changed(self):
         self.mission_layout.route = []
+        self._return_home_route_active = False
         self._save_mission_layout()
         self.mission_status.setText("Layout changed — press PLAN ROUTE to recalculate around the new geometry.")
         self.mission_canvas.update()
@@ -2632,6 +2698,7 @@ class ArenaView(QWidget):
         grid.addWidget(self.navigation_strategy, 0, 1)
         definitions = [
             ("front_avoid_mm", "Front stop", 300, 100, 1000),
+            ("matrix_wall_mm", "8×8 wall consensus", 400, 200, 800),
             ("side_avoid_mm", "Side clearance", 200, 80, 800),
             ("wall_follow_mm", "Wall-follow distance", 200, 80, 1000),
             ("lane_spacing_mm", "Sweep spacing", 200, 80, 1000),
@@ -2665,18 +2732,119 @@ class ArenaView(QWidget):
         # normal autonomous_navigation command is sent.
         self._apply_navigation_tuning()
         if self.navigation_strategy.currentIndex() == 3:
-            if not self.mission_layout.route and not self._plan_mission_route():
+            if (self._return_home_route_active or not self.mission_layout.route) and \
+                    not self._plan_mission_route():
                 self.map_tabs.setCurrentWidget(self.mission_page)
                 return
+            self._return_home_route_active = False
             payload = self.mission_layout.command_payload()
+            map_payload = self._mission_map_payload()
             if len(payload["points"]) // 3 > MissionLayout.MAX_ROUTE_POINTS:
                 self.mission_status.setText("ROUTE ERROR: too many firmware waypoints.")
                 self.map_tabs.setCurrentWidget(self.mission_page)
                 return
+            if len(map_payload["features"]) // 5 > 24 or any(
+                    len(json.dumps({"type": "command", "command": name, **data},
+                                   separators=(",", ":")).encode("utf-8")) >= 760
+                    for name, data in (("mission_map_set", map_payload),
+                                       ("mission_plan_set", payload))):
+                self.mission_status.setText(
+                    "ROUTE ERROR: mission upload exceeds the Teensy's serial buffer; "
+                    "simplify the layout or route.")
+                self.map_tabs.setCurrentWidget(self.mission_page)
+                return
+            self.command_requested.emit("mission_map_set", map_payload)
             self.command_requested.emit("mission_plan_set", payload)
         self.command_requested.emit(
             "autonomous_navigation", {"enabled": True}
         )
+
+    def _mission_map_payload(self):
+        payload = self.mission_layout.map_payload()
+        bottom_names = ("bottom_left_left", "bottom_mid_left",
+                        "bottom_mid_right", "bottom_right_right")
+        specs = {item.get("name"): item for item in self.model.sensor_specs}
+        if all(name in specs for name in bottom_names):
+            payload["bottom_sensors"] = [
+                int(round(specs[name][field]))
+                for name in bottom_names for field in ("x", "y", "angle")]
+        ultrasound = {item.get("telemetry_name"): item
+                      for item in self.model.ultrasound_specs}
+        if all(name in ultrasound for name in ("a", "b")):
+            payload["ultrasound_offsets"] = [
+                int(round(ultrasound[name][field]))
+                for name in ("a", "b") for field in ("x", "y")]
+        return payload
+
+    def _return_home(self):
+        latest = self.model.latest
+        pose = [_number(latest.get(key)) for key in
+                ("mission.pose_x_mm", "mission.pose_y_mm", "mission.heading_deg")]
+        if any(value is None for value in pose) or not latest.get("imu.valid"):
+            self.mission_status.setText(
+                "RETURN HOME unavailable: wait for a valid mission pose and IMU.")
+            return
+        if latest.get("system.stopped") is True:
+            self.mission_status.setText(
+                "RETURN HOME unavailable: press RUN MOTORS first.")
+            return
+        x, y, heading = pose
+        layout = self.mission_layout
+        layout.ROBOT_RADIUS_MM = (
+            self.navigation_tuning_controls["robot_width_mm"].value() * 0.5)
+        layout.SAFETY_MARGIN_MM = max(
+            40.0, self.navigation_tuning_controls["gap_margin_mm"].value())
+        if layout.blocked(x, y):
+            self.mission_status.setText(
+                "RETURN HOME unavailable: current pose is inside mapped "
+                "obstacle clearance; reposition the robot first.")
+            return
+        home = layout.home_rect(layout.my_home)
+        destination = ((home[0] + home[2]) * 0.5,
+                       (home[1] + home[3]) * 0.5)
+        if math.hypot(x - destination[0], y - destination[1]) <= 120.0:
+            self.command_requested.emit("autonomous_navigation", {"enabled": False})
+            self.mission_status.setText("Robot is already at its home centre.")
+            return
+        path = layout._astar((x, y), destination)
+        if not path or len(path) < 2 or not layout._segment_clear((x, y), path[1]):
+            self.mission_status.setText(
+                "RETURN HOME unavailable: no mapped-clear route from the "
+                "current pose to our home.")
+            return
+        route = [{"x": float(px), "y": float(py),
+                  "target": index == len(path) - 1}
+                 for index, (px, py) in enumerate(path[1:], 1)]
+        points = [value for waypoint in route
+                  for value in (int(round(waypoint["x"])),
+                                int(round(waypoint["y"])),
+                                int(waypoint["target"]))]
+        plan = {"start_x_mm": int(round(x)), "start_y_mm": int(round(y)),
+                "start_heading_deg": int(round(heading)) % 360,
+                "fallback_strategy": 0, "return_home": True,
+                "points": points}
+        map_payload = self._mission_map_payload()
+        if len(route) > MissionLayout.MAX_ROUTE_POINTS or any(
+                len(json.dumps({"type": "command", "command": name, **data},
+                               separators=(",", ":")).encode("utf-8")) >= 760
+                for name, data in (("mission_map_set", map_payload),
+                                   ("mission_plan_set", plan))):
+            self.mission_status.setText(
+                "RETURN HOME unavailable: route exceeds the serial buffer.")
+            return
+        layout.route = route
+        self._return_home_route_active = True
+        self.mission_canvas.update()
+        self.navigation_strategy.setCurrentIndex(3)
+        self.settings.setValue("navigation/strategy", 3)
+        self.parameter_requested.emit("navigation.strategy", 3)
+        self.command_requested.emit("autonomous_navigation", {"enabled": False})
+        self.command_requested.emit("mission_map_set", map_payload)
+        self.command_requested.emit("mission_plan_set", plan)
+        self.command_requested.emit("autonomous_navigation", {"enabled": True})
+        self.mission_status.setText(
+            f"RETURN HOME running: {len(route)} mapped-clear waypoints; "
+            "motors will stop at home.")
 
     def _apply_navigation_tuning(self):
         strategy = self.navigation_strategy.currentIndex()
@@ -3181,11 +3349,15 @@ class ArenaView(QWidget):
             waypoint = int(_number(m.latest.get("mission.waypoint_index")) or 0)
             waypoint_count = int(_number(m.latest.get("mission.waypoint_count")) or 0)
             blocked = m.latest.get("mission.blocked") is True
+            avoid_phase = int(_number(m.latest.get("mission.avoid_phase")) or 0)
+            corrections = int(_number(m.latest.get("mission.landmark_corrections")) or 0)
+            movement = ("Taking a live obstacle detour. " if avoid_phase else
+                        "Live ranging is blocking the route; waiting for a clear bypass. "
+                        if blocked else "Following the uploaded route. ")
             self.mission_status.setText(
-                f"MISSION LIVE — weights {visited}/{total}; waypoint "
+                f"MISSION LIVE — weight locations reached {visited}/{total} (not sensor confirmations); waypoint "
                 f"{waypoint + 1 if waypoint < waypoint_count else waypoint_count}/{waypoint_count}. "
-                + ("Live ranging is blocking the route; robot is holding position."
-                   if blocked else "Robot is correcting toward the uploaded route.")
+                f"{movement}Matched-landmark pose corrections: {corrections}."
             )
         self.status.setText(
             f"{firmware_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "

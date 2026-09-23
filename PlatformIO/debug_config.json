@@ -92,6 +92,7 @@
     },
     {"name":"navigation.strategy","label":"Navigation strategy (0 balanced, 1 gap explorer, 2 conservative, 3 frontier A*, 4 reactive wander)","datatype":"int","value":0,"min":0,"max":4,"step":1},
     {"name":"navigation.front_avoid_mm","label":"Navigation front stop","datatype":"int","unit":"mm","value":300,"min":100,"max":1000,"step":25},
+    {"name":"navigation.matrix_wall_mm","label":"8x8 broad-wall consensus","datatype":"int","unit":"mm","value":400,"min":200,"max":800,"step":25},
     {"name":"navigation.side_avoid_mm","label":"Navigation side clearance","datatype":"int","unit":"mm","value":200,"min":80,"max":800,"step":25},
     {"name":"navigation.wall_follow_mm","label":"Wall-follow distance","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},
     {"name":"navigation.lane_spacing_mm","label":"Sweep lane spacing","datatype":"int","unit":"mm","value":200,"min":80,"max":1000,"step":25},

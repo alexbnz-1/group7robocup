@@ -573,6 +573,10 @@ class RobotDebugGUI(QMainWindow):
                 "matrix": self.arena_view.model.matrix_spec,
             }, separators=(",", ":")),
             "arena_settings_json": json.dumps(self._arena_recording_settings(), separators=(",", ":")),
+            "mission_layout_json": json.dumps({
+                **self.arena_view.mission_layout.to_dict(),
+                "route": self.arena_view.mission_layout.route,
+            }, separators=(",", ":")),
             **self.git_metadata(),
         }
 
@@ -710,6 +714,10 @@ class RobotDebugGUI(QMainWindow):
                 "matrix": self.arena_view.model.matrix_spec,
             },
             "arena_settings": self._arena_recording_settings(),
+            "mission_layout": {
+                **self.arena_view.mission_layout.to_dict(),
+                "route": self.arena_view.mission_layout.route,
+            },
         })
 
     def _arena_recording_settings(self):

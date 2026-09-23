@@ -5258,3 +5258,200 @@ Not verified here:
   compiled in this environment.
 - Physical weight visibility should be checked against the actual fitted outer
   and middle TOF angles before relying on the green planned-weight highlight.
+
+
+
+2026-09-23 encoder distance calibration update
+-----------------------------------------------
+- Recalibrated both drive encoders from two new powered straight-line runs.
+- Run 1: 2180 mm; encoder 1 changed by 25,450 counts and encoder 2 by 25,282 counts.
+- Run 2: 2010 mm; encoder 1 changed by 24,210 counts and encoder 2 by 24,237 counts.
+- Used combined measured distance divided by combined absolute counts rather than averaging the two per-run scale factors.
+- New encoder 1 calibration: 4190 / 49660 = 0.08437374 mm/count.
+- New encoder 2 calibration: 4190 / 49519 = 0.08461399 mm/count.
+- Encoder sign/inversion is unchanged; encoder 1 still uses its existing inverted direction and encoder 2 its existing normal direction.
+- BluetoothDebugWorkflow.cpp now uses the new constants for all encoder-distance navigation calculations.
+- ArenaView.py now uses the same values for desktop odometry and includes a one-time `arena/dual_encoder_calibration_20260923` settings migration so an existing installation does not silently retain the older saved calibration.
+- No wheel-track/yaw calibration was changed. The physical drive-wheel centre-to-centre track width still needs its own measurement.
+- ArenaView.py passes Python syntax compilation after the change.
+
+2026-09-23 known-arena live avoidance and landmark correction
+------------------------------------------------------------
+- The pre-laid mission now uploads a compact physical-feature map separately
+  from its A* waypoints. The map contains the opposite home as a forbidden
+  area and rectangles for configured walls, ramps, tubes and dummy weights.
+- Arena View checks both command sizes against the Teensy's 768-byte receive
+  buffer before sending; an oversized layout does not start navigation.
+- During a mission, a frontal obstacle on the current travel leg can trigger
+  a two-leg detour: move sideways into a verified clear ultrasound side, then
+  pass the obstacle. Both legs must remain within the arena and clear of
+  inflated known features. The robot then resumes the uploaded route. If no
+  verified bypass exists, it stops and reports that the leg is blocked.
+- Mission pose still integrates the BNO055 heading and calibrated drive
+  encoders. Fresh side-ultrasound echoes are now compared with predicted ranges
+  to the nearest uploaded physical feature or arena boundary. Three separate
+  matching echoes allow a small, bounded position correction; mismatched or
+  ambiguous echoes cannot make a large pose jump. This compensates gradual
+  position error, including displacement caused by heading drift, but does
+  not directly recalibrate the BNO055 yaw itself.
+- Mission telemetry now includes `mission.avoid_phase`,
+  `mission.landmark_corrections` and `mission.last_landmark_id`; Arena View
+  shows detour/blockage state and the number of landmark corrections.
+- New hardware-free `test_mission_navigation.py` covers feature uploads,
+  command ordering, and rejection of an oversized upload.
+- Verified: PlatformIO Teensy 4.0 firmware build succeeded; focused mission
+  GUI tests passed (3 tests). The broader arena GUI test file has 15 existing
+  failures/errors against mapping and sensor-count expectations and remains
+  out of sync with current implementation. Physical navigation/landmark tuning
+  has not yet been performed and the new firmware has not been uploaded.
+
+2026-09-23 arm-sorting command repair
+------------------------------------
+- Root cause: `debug_config.json` exposed ARM SORTING ON/OFF, but the firmware
+  had no handler for its `arm_sorting_toggle` action. The Teensy answered
+  `Command action has no firmware handler` and no sorting sequence ran.
+- Implemented ON/OFF handling and a nonblocking timing state machine using the
+  debounced `inductive_proximity.detected()` value from D21, not raw pin level.
+- Arming requires Debug Mode, Run state, a configured inductive input and a
+  valid Herkulex 4 angle response. It stores the current angle as software
+  zero, checks that both relative gate positions fit the absolute range, sets
+  HX12K bumpers C=130/D=0 (OFF) and moves the gate to -30 degrees.
+- A continuous detection for 500 ms sets bumpers C=0/D=130 (ON) and moves the
+  gate to +30 degrees. After detection clears, bumpers remain ON for 2 seconds
+  and the gate remains at +30 for 5 seconds. A renewed detection reasserts the
+  bumper ON state. With no confirmed target, bumpers pulse ON for one second
+  every 20 seconds. Turning sorting OFF restores bumpers OFF and gate -30.
+- Stop Robot and leaving Debug Mode disarm sorting before output shutdown.
+  Conflicting manual gate/HX12K commands are rejected while sorting is armed.
+- Telemetry now includes `sorting.armed`, `sorting.detected`,
+  `sorting.confirmed`, `sorting.bumpers_on`, `sorting.gate_angle_deg` and
+  `sorting.idle_pulse` for checking the live sequence and recordings.
+- Teensy firmware compiled successfully. Static app-to-firmware contract tests
+  were added in `test_sorting_contract.py`. Physical actuation has not been
+  tested or uploaded from this workstation in this change.
+
+2026-09-23 navigation responsiveness repair after Morerun.rdbg
+------------------------------------------------------------
+- The latest recorded known-arena run contained repeated ~1.5-second main-loop
+  gaps during synchronous SEN0628 8x8 data reads. The fixed 350 mm odometry
+  rejection limit then discarded genuine encoder travel of roughly 0.8 m per
+  delayed update, so the recorded mission pose stayed nearly stationary while
+  the chassis drove toward a wall. The motor/heading trace also showed
+  repeated high-power turns after the pose diverged.
+- The 8x8 I2C frame acquisition now sends the same command as the supplied
+  DFRobot library but polls for completion over successive loop iterations.
+  A read no longer waits in the navigation/motor-control loop for the full
+  sensor frame. Complete 64-zone frames retain the prior GUI wire format.
+- Navigation now accepts only a recent 8x8 frame from a compatible heading
+  and projects its ranges forward by measured encoder travel since that frame.
+  This lets an approaching wall become nearer between slow matrix frames
+  without changing the raw 8x8 values shown in the GUI and recordings.
+- Mission odometry validation is proportional to elapsed time and checks both
+  wheels; genuine travel through a long interval is integrated instead of
+  silently dropped. Rejected steps are counted in
+  `mission.odometry_rejected_steps` telemetry.
+- An 8x8 broad-wall consensus is now an early confidence check, not an
+  unconditional stop at its early-warning threshold. Actual front stopping
+  uses the configured `navigation.front_avoid_mm`; a separate
+  `navigation.matrix_wall_mm` GUI control/default of 400 mm sets the broad
+  consensus threshold. Forward-facing top point TOFs are preferred, with
+  outer top sensors used only when the forward pair is unavailable.
+- Verified: Teensy 4.0 firmware compiles, and focused navigation/sorting GUI
+  regression tests pass. These changes have not yet been uploaded or driven
+  on the physical robot; verify loop gap, matrix freshness, odometry rejection
+  count, and front-stop distance on a supervised run before relying on them.
+
+2026-09-23 21:47 run review, pre-laid replay and mission controls
+--------------------------------------------------------------
+- Reviewed `RobotRun_2026-09-23_21-47-22.rdbg` (about 45 seconds). Its mission
+  plan uploaded start (294,301), target visits (1876,544), (2471,1662), and
+  (4590,355), plus non-target route corners (3100,700) and (3200,600). The
+  local saved editor layout matches the three uploaded target positions and
+  has three physical wall objects. The recording itself did not contain the
+  original mission editor layout; the new visualiser reconstructs the older
+  run from the actual `mission_map_set` and `mission_plan_set` commands and
+  labels that approximation clearly.
+- The far-left bottom sensor reported roughly 120-165 mm throughout metres
+  of travel. It was angled outward toward the left wall, not proof of a weight.
+  The old detector compared it with a differently aimed top sensor and marked
+  the far-left sector continuously, including before navigation started.
+  Weight visibility is now gated to within a 300 mm radius of a planned real
+  weight, with a compatible bearing for that bottom sensor. The mission map
+  upload carries the editable bottom sensor offsets/angles; a return matching
+  a mapped physical wall or arena perimeter is excluded. `weight.map_wall_mask`
+  records sectors excluded by the map. No planned weight means no TOF weight
+  announcement, as requested. This affects TOF visibility, not the independent
+  inductive sorting input.
+- The first target was marked visited by odometry at about (1823,468), only
+  about 93 mm from its (1876,544) waypoint, but the inductive sorting sensor
+  never confirmed a pickup in the recording. The second was likewise marked
+  visited around (2467,1564). Thus firmware's target counter means waypoint
+  reached by estimated pose, not independently verified collection.
+- On the approach near the third route corner, forward range fell from about
+  485 mm to 209 mm, 160 mm and finally 87 mm while the old 150 mm front-stop
+  tuning allowed continued mission drive. Mission tracking now uses a 400 mm
+  minimum forward stop distance even when roaming is tuned closer. A blocked
+  route with no map-checked safe detour stops instead of driving into the wall.
+- The run's worst main-loop intervals were about 13-30 ms and no odometry
+  steps were rejected, so the prior blocking 8x8 read fault was not present.
+  However, 60 side-ultrasound landmark corrections occurred. The previous
+  expected-range calculation incorrectly cast from the robot centre although
+  both ultrasound transducers sit near the sides. The mission map upload now
+  includes their editable offsets and uses each physical transducer location.
+  Correction size is capped at 3 mm and at most once per side every 500 ms to
+  limit cumulative pose drift from an imperfect wall match.
+- New recordings embed the exact pre-laid editor layout and route in metadata
+  and UI snapshots. DataVisualiser's new `Planned Arena` replay tab shows the
+  planned cyan route, orange estimated actual trajectory, current blue pose,
+  planned obstacles and target weights. The older 21:47 run was loaded and
+  verified to display three target positions, three obstacles, five waypoints
+  and its estimated travelled path without modifying the original recording.
+- The Arena View has a `RETURN HOME` button. It plans a clearance-checked A*
+  route from the latest valid mission pose to the centre of the selected home,
+  uploads the map and route, and starts mission navigation. Firmware stops the
+  motors at home instead of switching into roaming. It refuses to start if the
+  pose/IMU is missing, robot is stopped, the pose lies inside mapped clearance,
+  no safe path exists, or the command exceeds the serial buffer.
+- The latest recording had 3-4 reported Bluetooth TX message drops and a few
+  malformed telemetry signal names. Its trajectory and sensor conclusions
+  above use intact named samples. No physical run of the new firmware has yet
+  verified weight gating, map-aided localisation, collision margin or return
+  home.
+- Planned Arena playback now projects the recorded forward range (red ray)
+  and the next expected physical wall on the pre-laid map (cyan ray) from the
+  recorded pose and matrix mounting location. In the 21:47 run near the wall
+  hit, it shows 87 mm observed versus approximately 638 mm expected. This is
+  strong evidence of an unmodelled obstacle or pose/map disagreement, but
+  the recording alone cannot distinguish which physical cause is correct.
+
+2026-09-23 late runs: bottom TOF weight-detection correction
+-----------------------------------------------------------
+- Reviewed `RobotRun_2026-09-23_22-23-13.rdbg` and
+  `RobotRun_2026-09-23_22-25-15.rdbg`. All four bottom TOFs stayed available
+  without timeout. However, three channels often produced 8191 (an unusable
+  range), while far-left repeatedly returned about 110-200 mm even away from
+  planned weights. The earlier run had only three brief weight confirmations;
+  the later run had none, despite two waypoint locations being marked visited.
+  The waypoint counter is based on estimated pose, not TOF or pickup proof.
+- The old detector required the robot centre to be within 300 mm of a planned
+  weight and the centre-to-weight bearing to match a bottom sensor angle within
+  28 degrees. This ignored the editable sensor mounts approximately 255-305 mm
+  ahead of the robot centre, rejecting plausible returns. It now transforms
+  each bottom TOF mounting point and its measured ray into mission coordinates
+  and requires the measured hit point to land within 300 mm of a planned real
+  weight. The paired top/bottom 150 mm height gap, three 100 ms confirmation
+  polls, and mapped physical-wall rejection remain in place. A mission still
+  needs uploaded bottom sensor geometry and a valid pose before announcing a
+  weight; no geometry or plan does not fall back to an unlocated detection.
+- New telemetry masks `weight.valid_mask`, `weight.gap_mask`, and
+  `weight.target_mask` expose which sectors pass each stage; existing
+  `weight.map_wall_mask` and `weight.sector_mask` show wall rejection and final
+  confirmation. `weight.geometry_valid` shows whether the upload succeeded.
+  Arena View displays a concise reason when no weight is currently visible
+  and labels the mission counter as locations reached, not sensor-confirmed
+  weights.
+- Teensy firmware builds successfully. The focused mission/weight GUI tests
+  pass (6 tests). The broader existing arena test file has 15 unrelated
+  failures/errors from outdated expectations about current mapping and extra
+  XSHUT6/7 sensors; those tests were not changed in this correction. The fix
+  has not yet been flashed or validated with a physical weight run.

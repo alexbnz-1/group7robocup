@@ -61,6 +61,16 @@ private:
     uint32_t lastServoReadMs_ = 0;
     uint32_t lastMoveStartMs_ = 0;
     uint16_t lastMoveDurationMs_ = 0;
+    bool armSortingEnabled_ = false;
+    bool sortingDetectionConfirmed_ = false;
+    bool sortingBumpersOn_ = false;
+    bool sortingGatePositive_ = false;
+    bool sortingIdlePulseActive_ = false;
+    uint8_t sortingInputIndex_ = 0;
+    uint32_t sortingDetectedSinceMs_ = 0;
+    uint32_t sortingClearedSinceMs_ = 0;
+    uint32_t sortingNextPulseMs_ = 0;
+    uint32_t sortingPulseEndMs_ = 0;
     bool continuousVelocityActive_ = false;
     int16_t commandedVelocity_ = 0;
     bool dcMotor203Active_ = false;
@@ -82,6 +92,9 @@ private:
     int16_t tofDistanceMm_[MAX_TOF_SENSORS] = {};
     uint32_t lastTof8x8FrameMs_ = 0;
     uint32_t lastTof8x8TransmitMs_ = 0;
+    float tof8x8FrameHeadingDeg_ = 0.0f;
+    int32_t tof8x8FrameEncoder1_ = 0;
+    int32_t tof8x8FrameEncoder2_ = 0;
     uint8_t digitalInputCount_ = 0;
     char digitalInputNames_[MAX_DIGITAL_INPUTS][25] = {};
     DigitalInputSensor digitalInputs_[MAX_DIGITAL_INPUTS];
@@ -180,6 +193,7 @@ private:
     uint8_t navigationClearanceTurnCount_ = 0;
     uint8_t navigationStrategy_ = 0;
     uint16_t navigationFrontAvoidMm_ = 300;
+    uint16_t navigationMatrixWallMm_ = 400;
     uint16_t navigationSideAvoidMm_ = 200;
     uint16_t navigationWallFollowMm_ = 200;
     uint16_t navigationLaneSpacingMm_ = 200;
@@ -221,13 +235,50 @@ private:
     float missionArenaHeadingDeg_ = 0.0f;
     int32_t missionLastEncoder1_ = 0;
     int32_t missionLastEncoder2_ = 0;
+    uint32_t missionLastPoseUpdateMs_ = 0;
+    uint16_t missionOdometryRejectedSteps_ = 0;
     uint32_t missionBlockedSinceMs_ = 0;
+    // Axis-aligned features uploaded with the route. Kind 0 is a no-go area;
+    // kind 1 is a physical surface that may be matched to a range reading.
+    static constexpr uint8_t MAX_MISSION_FEATURES = 24;
+    struct MissionFeature {
+        int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        uint8_t kind = 0;
+    };
+    MissionFeature missionFeatures_[MAX_MISSION_FEATURES] = {};
+    uint8_t missionFeatureCount_ = 0;
+    struct MissionBottomSensorPose {
+        int16_t lateralMm = 0, forwardMm = 0, angleDeg = 0;
+    };
+    MissionBottomSensorPose missionBottomSensors_[4] = {};
+    bool missionBottomSensorGeometryValid_ = false;
+    int16_t missionUltrasoundLateralMm_[2] = {};
+    int16_t missionUltrasoundForwardMm_[2] = {};
+    bool missionUltrasoundGeometryValid_ = false;
+    bool missionReturnHome_ = false;
+    uint8_t missionAvoidPhase_ = 0; // 0 route, 1 lateral, 2 past obstacle
+    int8_t missionAvoidSide_ = 0;
+    uint8_t missionAvoidAttempts_ = 0;
+    float missionAvoidXmm_ = 0.0f;
+    float missionAvoidYmm_ = 0.0f;
+    float missionAvoidForwardXmm_ = 0.0f;
+    float missionAvoidForwardYmm_ = 0.0f;
+    uint32_t missionLastLandmarkEcho_[2] = {};
+    uint32_t missionLastLandmarkCorrectionMs_[2] = {};
+    uint8_t missionLandmarkMatches_[2] = {};
+    int8_t missionLandmarkIds_[2] = {-1, -1};
+    uint16_t missionLandmarkCorrections_ = 0;
+    int8_t missionLastLandmarkId_ = -1;
 
     // Live low-object/weight visibility from matched bottom/top point-TOF pairs.
     // Four sectors run far-left, mid-left, mid-right, far-right. A sector is
     // confirmed only after three fresh 100 ms polls agree that the bottom TOF
     // sees an object at least 150 mm closer than its matched top TOF.
     uint8_t weightEvidence_[4] = {};
+    uint8_t weightValidMask_ = 0;
+    uint8_t weightGapMask_ = 0;
+    uint8_t weightTargetMask_ = 0;
+    uint8_t weightMapWallMask_ = 0;
     uint8_t weightSectorMask_ = 0;
     uint16_t weightNearestMm_ = 0;
     int8_t weightDirection_ = 0;
@@ -253,6 +304,10 @@ private:
     void updateTof8x8();
     void sendTof8x8Frame();
     void updateAutomaticServoRead();
+    void updateArmSorting(uint32_t now);
+    void setSortingBumpers(bool enabled);
+    void setSortingGate(bool positive);
+    void disarmArmSorting(bool restoreOutputs);
     void updateTrackingState(float absoluteAngle);
     JsonObject findParameter(const char* name);
     JsonObject findCommand(const char* name);
