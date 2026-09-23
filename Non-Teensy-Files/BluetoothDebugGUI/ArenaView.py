@@ -1529,6 +1529,58 @@ class MissionLayoutCanvas(QWidget):
         self.replay_path = []
         self.replay_observed_ray = None
         self.replay_expected_ray = None
+        # Keep every sensed location visible after the live detection clears.
+        self.detected_weight_hits = {}
+        self.detected_weight_local_hits = {}
+
+    def _remember_weight_hit(self, index, hit_x, hit_y, committed, latest):
+        index = int(index)
+        previous = self.detected_weight_hits.get(index)
+        if previous is not None and previous[2] and not committed:
+            return
+        if (previous is not None and index in self.detected_weight_local_hits and
+                previous[2] == committed and
+                abs(previous[0] - hit_x) < 0.01 and
+                abs(previous[1] - hit_y) < 0.01):
+            return
+        self.detected_weight_hits[index] = (hit_x, hit_y, committed)
+        robot_x = _number(latest.get("mission.pose_x_mm"))
+        robot_y = _number(latest.get("mission.pose_y_mm"))
+        heading = _number(latest.get("mission.heading_deg"))
+        if None in (robot_x, robot_y, heading):
+            return
+        dx, dy = hit_x - robot_x, hit_y - robot_y
+        distance = math.hypot(dx, dy)
+        relative = math.radians((math.degrees(math.atan2(dy, dx)) - heading + 180) % 360 - 180)
+        local_angle = self.live_model.theta - relative
+        self.detected_weight_local_hits[index] = (
+            self.live_model.x + distance * math.cos(local_angle),
+            self.live_model.y + distance * math.sin(local_angle), committed)
+
+    def observe_weight_estimate(self, latest):
+        vector_index = _number(latest.get("weight.vector_waypoint_index"))
+        hit_x = _number(latest.get("weight.vector_hit_x_mm"))
+        hit_y = _number(latest.get("weight.vector_hit_y_mm"))
+        if (vector_index is not None and int(vector_index) != 255 and
+                hit_x is not None and hit_y is not None and
+                0 <= hit_x <= self.layout_model.WIDTH_MM and
+                0 <= hit_y <= self.layout_model.HEIGHT_MM):
+            self._remember_weight_hit(vector_index, hit_x, hit_y, True, latest)
+        # An outer sensor's candidate is shown, but visually distinguished
+        # from a committed, centred approach vector.
+        if (latest.get("weight.detected") is True and
+                latest.get("weight.bearing_fresh") is True):
+            index = _number(latest.get("mission.waypoint_index"))
+            bearing_index = _number(latest.get("weight.bearing_waypoint_index"))
+            hit_x = _number(latest.get("weight.bearing_hit_x_mm"))
+            hit_y = _number(latest.get("weight.bearing_hit_y_mm"))
+            if (index is not None and bearing_index == index and
+                    hit_x is not None and hit_y is not None and
+                    0 <= hit_x <= self.layout_model.WIDTH_MM and
+                    0 <= hit_y <= self.layout_model.HEIGHT_MM and
+                    (int(index) not in self.detected_weight_hits or
+                     not self.detected_weight_hits[int(index)][2])):
+                self._remember_weight_hit(index, hit_x, hit_y, False, latest)
 
     def reset_view(self):
         self.zoom = 1.0
@@ -1797,6 +1849,23 @@ class MissionLayoutCanvas(QWidget):
                        Qt.AlignmentFlag.AlignCenter,
                        "D" if item["dummy"] else str(index))
 
+        for route_index, (hit_x, hit_y, committed) in self.detected_weight_hits.items():
+            centre = self._screen(hit_x, hit_y)
+            colour = QColor("#c084fc" if committed else "#fb923c")
+            p.setPen(QPen(colour, 3, Qt.PenStyle.SolidLine if committed
+                          else Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(centre, 13, 13)
+            p.drawLine(QPointF(centre.x() - 6, centre.y()),
+                       QPointF(centre.x() + 6, centre.y()))
+            p.drawLine(QPointF(centre.x(), centre.y() - 6),
+                       QPointF(centre.x(), centre.y() + 6))
+            p.setPen(colour)
+            p.drawText(QRectF(centre.x() + 16, centre.y() - 12, 150, 24),
+                       Qt.AlignmentFlag.AlignLeft,
+                       f"Sensed W{route_index + 1}" if committed else
+                       f"Possible W{route_index + 1}")
+
         start = self._screen(model.start["x"], model.start["y"])
         heading = math.radians(model.start["heading_deg"])
         nose = QPointF(start.x() + 24 * math.cos(heading),
@@ -1811,10 +1880,29 @@ class MissionLayoutCanvas(QWidget):
         robot_x = _number(self.live_model.latest.get("mission.pose_x_mm"))
         robot_y = _number(self.live_model.latest.get("mission.pose_y_mm"))
         robot_heading = _number(self.live_model.latest.get("mission.heading_deg"))
-        weight_detected = self.live_model.latest.get("weight.detected") is True
+        weight_detected = (self.live_model.latest.get("weight.detected") is True or
+                           self.live_model.latest.get("weight.target_commit_active") is True)
         weight_mask = int(_number(self.live_model.latest.get("weight.sector_mask")) or 0)
         if robot_x is not None and robot_y is not None:
             point = self._screen(robot_x, robot_y)
+            waypoint_x = _number(self.live_model.latest.get("mission.current_waypoint_x_mm"))
+            waypoint_y = _number(self.live_model.latest.get("mission.current_waypoint_y_mm"))
+            if (self.live_model.latest.get("mission.active") is True and
+                    waypoint_x is not None and waypoint_y is not None):
+                waypoint_point = self._screen(waypoint_x, waypoint_y)
+                p.setPen(QPen(QColor("#facc15"), 2, Qt.PenStyle.DashLine))
+                p.drawLine(point, waypoint_point)
+                p.setBrush(QColor("#facc15"))
+                p.drawEllipse(waypoint_point, 6, 6)
+            if self.live_model.latest.get("weight.bearing_active") is True:
+                hit_x = _number(self.live_model.latest.get("weight.bearing_hit_x_mm"))
+                hit_y = _number(self.live_model.latest.get("weight.bearing_hit_y_mm"))
+                if hit_x is not None and hit_y is not None:
+                    hit_point = self._screen(hit_x, hit_y)
+                    p.setPen(QPen(QColor("#c084fc"), 3))
+                    p.drawLine(point, hit_point)
+                    p.setBrush(QColor("#c084fc"))
+                    p.drawEllipse(hit_point, 7, 7)
             p.setPen(QPen(QColor("#ffffff"), 2))
             p.setBrush(QColor("#0ea5e9"))
             p.drawEllipse(point, 9, 9)
@@ -1842,7 +1930,16 @@ class MissionLayoutCanvas(QWidget):
         direction = int(_number(self.live_model.latest.get("weight.direction")) or 0)
         direction_text = {-2: "far left", -1: "left", 1: "right", 2: "far right"}.get(direction, "—")
         if weight_detected:
-            text = f"WEIGHT VISIBLE  ·  {nearest} mm  ·  {direction_text}"
+            if self.live_model.latest.get("weight.inner_locked") is True:
+                left = int(_number(self.live_model.latest.get("weight.inner_left_mm")) or 0)
+                right = int(_number(self.live_model.latest.get("weight.inner_right_mm")) or 0)
+                text = f"INNER PAIR CENTRED  ·  L {left} / R {right} mm  ·  SENDING"
+            elif self.live_model.latest.get("weight.target_commit_active") is True:
+                text = "APPROACHING KNOWN WEIGHT  ·  80% DRIVE"
+            elif self.live_model.latest.get("weight.bearing_active") is True:
+                text = f"WEIGHT BEARING VERIFIED  ·  {nearest} mm  ·  {direction_text}"
+            else:
+                text = f"POSSIBLE LOW OBJECT  ·  {nearest} mm  ·  {direction_text}"
         elif "weight.detected" in self.live_model.latest:
             text = "NO WEIGHT CURRENTLY VISIBLE"
         else:
@@ -1851,7 +1948,7 @@ class MissionLayoutCanvas(QWidget):
 
         p.setPen(QColor("#cbd5e1"))
         mode = (f"Click arena to add: {self.add_mode}" if self.add_mode else
-                "Left-drag items · middle/right-drag to pan · wheel to zoom")
+                "Left-drag items · pan/zoom · purple cross = committed weight · orange = possible")
         p.drawText(12, self.height() - 10, mode)
         p.end()
 
@@ -1904,6 +2001,11 @@ class ArenaCanvas(QWidget):
         if self.model.trail:
             xs.extend(point[0] for point in self.model.trail)
             ys.extend(point[1] for point in self.model.trail)
+        mission_canvas = getattr(self.owner, "mission_canvas", None)
+        if mission_canvas is not None:
+            for hit_x, hit_y, _committed in mission_canvas.detected_weight_local_hits.values():
+                xs.append(hit_x)
+                ys.append(hit_y)
         if self.model.cells:
             xs.extend(column * cell_size for column, _row in self.model.cells)
             ys.extend(row * cell_size for _column, row in self.model.cells)
@@ -2027,6 +2129,21 @@ class ArenaCanvas(QWidget):
         p.setPen(QPen(QColor("#6b7280"), 1))
         for x0, y0, x1, y1, _source in self.model.current_rays:
             p.drawLine(screen(x0, y0), screen(x1, y1))
+
+        if mission_canvas is not None:
+            for route_index, (hit_x, hit_y, committed) in (
+                    mission_canvas.detected_weight_local_hits.items()):
+                centre = screen(hit_x, hit_y)
+                colour = QColor("#c084fc" if committed else "#fb923c")
+                p.setPen(QPen(colour, 3))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(centre, 12, 12)
+                p.drawLine(QPointF(centre.x() - 6, centre.y()),
+                           QPointF(centre.x() + 6, centre.y()))
+                p.drawLine(QPointF(centre.x(), centre.y() - 6),
+                           QPointF(centre.x(), centre.y() + 6))
+                p.drawText(QRectF(centre.x() + 14, centre.y() - 10, 115, 22),
+                           Qt.AlignmentFlag.AlignLeft, f"W{route_index + 1} sensed")
 
         robot = screen(self.model.x, self.model.y)
         theta = self.model.theta
@@ -2475,6 +2592,14 @@ class ArenaView(QWidget):
         visibility_layout.addWidget(self.mission_weight_visibility)
         inspector_layout.addWidget(visibility_group)
 
+        self.mission_manual_home_pose = QCheckBox(
+            "Use marked START as actual return-home position")
+        self.mission_manual_home_pose.setToolTip(
+            "If wheel odometry has drifted, click Set start on this map and "
+            "place it at the robot's observed centre before pressing RETURN HOME. "
+            "The live IMU heading is still used.")
+        inspector_layout.addWidget(self.mission_manual_home_pose)
+
         self.mission_cursor_label = QLabel("Cursor: —")
         self.mission_cursor_label.setWordWrap(True)
         inspector_layout.addWidget(self.mission_cursor_label)
@@ -2585,24 +2710,51 @@ class ArenaView(QWidget):
         latest = self.model.latest
         if "weight.detected" not in latest:
             self.mission_weight_visibility.setText(
-                "WAITING FOR V10 WEIGHT TELEMETRY\nNo live confirmation yet")
+                "WAITING FOR WEIGHT TELEMETRY\nNo live confirmation yet")
             self.mission_weight_visibility.setStyleSheet(
                 "QLabel { background:#334155; color:white; padding:10px; font-weight:bold; }")
             return
         detected = latest.get("weight.detected") is True
+        commit = latest.get("weight.target_commit_active") is True
+        front_match = latest.get("weight.front_target_visible") is True
+        if latest.get("weight.inner_locked") is True:
+            left = int(_number(latest.get("weight.inner_left_mm")) or 0)
+            right = int(_number(latest.get("weight.inner_right_mm")) or 0)
+            self.mission_weight_visibility.setText(
+                "WEIGHT CENTRED BY INNER TOFS\n"
+                f"Left {left} mm · right {right} mm · sending straight through")
+            self.mission_weight_visibility.setStyleSheet(
+                "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }")
+            return
+        if commit:
+            front = int(_number(latest.get("navigation.front_mm")) or 0)
+            self.mission_weight_visibility.setText(
+                "APPROACHING KNOWN WEIGHT\n"
+                f"Forward return {front} mm · 80% drive · 100 mm wall limit\n"
+                + ("Front return matches target ahead" if front_match else
+                   "Forward return matches mapped wall behind target"))
+            self.mission_weight_visibility.setStyleSheet(
+                "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }")
+            return
         mask = int(_number(latest.get("weight.sector_mask")) or 0)
         nearest = int(_number(latest.get("weight.nearest_mm")) or 0)
         direction = int(_number(latest.get("weight.direction")) or 0)
         direction_text = {-2: "far left", -1: "left", 1: "right", 2: "far right"}.get(direction, "unknown")
         if detected:
+            bearing_active = latest.get("weight.bearing_active") is True
             active = [name for bit, name in enumerate(
                 ("far-left", "mid-left", "mid-right", "far-right"))
                 if mask & (1 << bit)]
             self.mission_weight_visibility.setText(
-                "WEIGHT VISIBLE\n"
-                f"{nearest} mm · {direction_text} · sectors: {', '.join(active) or '—'}")
+                ("WEIGHT BEARING VERIFIED\n" if bearing_active else
+                 "POSSIBLE LOW OBJECT\n") +
+                f"{nearest} mm · {direction_text} · sectors: {', '.join(active) or '—'}\n"
+                + ("Steering toward measured hit" if bearing_active
+                   else "Visible candidate; following planned route until bearing is verified"))
             self.mission_weight_visibility.setStyleSheet(
-                "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }")
+                "QLabel { background:#14532d; color:#dcfce7; padding:10px; font-weight:bold; }"
+                if bearing_active else
+                "QLabel { background:#78350f; color:#fef3c7; padding:10px; font-weight:bold; }")
         else:
             valid = int(_number(latest.get("weight.valid_mask")) or 0)
             gap = int(_number(latest.get("weight.gap_mask")) or 0)
@@ -2753,6 +2905,10 @@ class ArenaView(QWidget):
                     "simplify the layout or route.")
                 self.map_tabs.setCurrentWidget(self.mission_page)
                 return
+            self.mission_canvas.detected_weight_hits.clear()
+            self.mission_canvas.detected_weight_local_hits.clear()
+            self.mission_canvas.update()
+            self.canvas.update()
             self.command_requested.emit("mission_map_set", map_payload)
             self.command_requested.emit("mission_plan_set", payload)
         self.command_requested.emit(
@@ -2790,10 +2946,14 @@ class ArenaView(QWidget):
             return
         x, y, heading = pose
         layout = self.mission_layout
+        manual_pose = self.mission_manual_home_pose.isChecked()
+        if manual_pose:
+            x = float(layout.start["x"])
+            y = float(layout.start["y"])
         layout.ROBOT_RADIUS_MM = (
             self.navigation_tuning_controls["robot_width_mm"].value() * 0.5)
-        layout.SAFETY_MARGIN_MM = max(
-            40.0, self.navigation_tuning_controls["gap_margin_mm"].value())
+        layout.SAFETY_MARGIN_MM = (10.0 if manual_pose else max(
+            40.0, self.navigation_tuning_controls["gap_margin_mm"].value()))
         if layout.blocked(x, y):
             self.mission_status.setText(
                 "RETURN HOME unavailable: current pose is inside mapped "
@@ -2843,7 +3003,8 @@ class ArenaView(QWidget):
         self.command_requested.emit("mission_plan_set", plan)
         self.command_requested.emit("autonomous_navigation", {"enabled": True})
         self.mission_status.setText(
-            f"RETURN HOME running: {len(route)} mapped-clear waypoints; "
+            f"RETURN HOME running: {len(route)} mapped-clear waypoints; " +
+            ("using your marked actual position; " if manual_pose else "") +
             "motors will stop at home.")
 
     def _apply_navigation_tuning(self):
@@ -3271,6 +3432,8 @@ class ArenaView(QWidget):
 
     def reset_map(self):
         self.model.reset()
+        if hasattr(self, "mission_canvas"):
+            self.mission_canvas.detected_weight_local_hits.clear()
         self.canvas.update()
         self._refresh_status()
 
@@ -3294,6 +3457,8 @@ class ArenaView(QWidget):
         old_time = self.model._frame_time
         self.model.receive_telemetry(name, value, timestamp)
         if old_time is not None and old_time != timestamp:
+            if hasattr(self, "mission_canvas"):
+                self.mission_canvas.observe_weight_estimate(self.model.latest)
             self._refresh_status()
             self.canvas.update()
             if hasattr(self, "mission_canvas"):
@@ -3324,9 +3489,9 @@ class ArenaView(QWidget):
             "upload the current PlatformIO firmware. " if old_firmware else ""
         )
         controller_version = _number(m.latest.get("system.navigation_controller_version"))
-        if ("system.uptime_s" in m.latest and controller_version != 10):
+        if ("system.uptime_s" in m.latest and controller_version != 13):
             firmware_warning += (
-                "Navigation controller v10 is not running; upload the current clean build. "
+                "Navigation controller v13 is not running; upload the current clean build. "
             )
         online = sum(m.latest.get(f"tof.{spec['name']}.available") is True
                      for spec in m.sensor_specs)
@@ -3351,13 +3516,26 @@ class ArenaView(QWidget):
             blocked = m.latest.get("mission.blocked") is True
             avoid_phase = int(_number(m.latest.get("mission.avoid_phase")) or 0)
             corrections = int(_number(m.latest.get("mission.landmark_corrections")) or 0)
-            movement = ("Taking a live obstacle detour. " if avoid_phase else
+            recoveries = int(_number(m.latest.get("mission.landmark_recovery_count")) or 0)
+            reroutes = int(_number(m.latest.get("mission.reroute_count")) or 0)
+            skipped = int(_number(m.latest.get("mission.skipped_route_points")) or 0)
+            searching = m.latest.get("mission.search_active") is True
+            search_step = int(_number(m.latest.get("mission.search_step")) or 0)
+            checked = int(_number(m.latest.get("mission.search_sites_checked")) or 0)
+            incomplete = int(_number(m.latest.get("mission.search_sites_incomplete")) or 0)
+            movement = (f"Searching weight site, sweep {min(search_step + 1, 3)}/3. " if searching else
+                        "Taking a live obstacle detour. " if avoid_phase else
                         "Live ranging is blocking the route; waiting for a clear bypass. "
                         if blocked else "Following the uploaded route. ")
+            progress = ("RETURN HOME — destination pending; "
+                        if m.latest.get("mission.returning_home") is True else
+                        f"MISSION LIVE — weight sites searched {checked}/{total} "
+                        f"({incomplete} incomplete; pickup not confirmed); ")
             self.mission_status.setText(
-                f"MISSION LIVE — weight locations reached {visited}/{total} (not sensor confirmations); waypoint "
+                f"{progress}waypoint "
                 f"{waypoint + 1 if waypoint < waypoint_count else waypoint_count}/{waypoint_count}. "
-                f"{movement}Matched-landmark pose corrections: {corrections}."
+                f"{movement}Map reroutes: {reroutes}; skipped invalid corners: {skipped}. "
+                f"Landmark trim/recovery: {corrections}/{recoveries}."
             )
         self.status.setText(
             f"{firmware_warning}{accuracy}{motion_warning}Pose: {m.x:.0f}, {m.y:.0f} mm; heading {math.degrees(m.theta):.1f}°. "

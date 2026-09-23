@@ -5455,3 +5455,248 @@ Not verified here:
   failures/errors from outdated expectations about current mapping and extra
   XSHUT6/7 sensors; those tests were not changed in this correction. The fix
   has not yet been flashed or validated with a physical weight run.
+
+2026-09-23 22:48 Test.rdbg mission-stall and weight-bearing review
+----------------------------------------------------------------
+- The newest run `Non-Teensy-Files/DataVisualisationAfter/Data/Test.rdbg`
+  lasts about 76 seconds. Its mission map has three real weights and three
+  physical wall rectangles. At roughly 45-62 seconds the robot remained near
+  (2859,1151) mm with heading about 311 degrees, front range around 340 mm,
+  8x8 centre/near-side ranges around 275-400 mm, and both commanded motor
+  percentages zero. The event log says the mission leg was blocked, but the
+  old local detour tested only fixed 500 mm side steps, required a valid side
+  ultrasound return, and found neither side map-clear. The left ultrasound
+  was invalid/zero through most of the stall, so the old code never tried
+  the visible left-side opening as a turning route.
+- The uploaded non-target waypoints (3100,700) and (3200,600) lie inside
+  the firmware's inflated clearance around a mapped wall, even though the
+  next real weight at (4590,355) is reachable. A visibility-graph check from
+  the recorded stall pose finds a clear path via about (3066,572) before
+  continuing to the weight. Firmware now skips non-target routing corners
+  inside its actual clearance and, when a map segment is blocked, inserts
+  map-checked intermediate corners from the current pose. It preserves the
+  real target, and logs/counts both reroutes and skipped invalid corners.
+  The old live-obstacle side-step remains as a fallback for unmapped objects.
+  A needed point turn is allowed while the forward wall is close, but the
+  wall is checked again before the next forward move.
+- The run briefly reported far-left low-object sectors near the first two
+  planned weights. Those measured hit points were about 244 and 284 mm from
+  the corresponding target centres, consistent with the persistent far-left
+  background echo. The later mid-right return at about 70 seconds had a
+  bottom range near 99 mm, top range near 468 mm, and a measured hit about
+  149 mm from the last weight. Previously mission steering ignored all
+  `weight.direction` and continued aiming only at the planned coordinate.
+  It now uses a confirmed hit associated with the active weight waypoint if
+  its map-space error is <=170 mm, the observed hit and path are map-clear,
+  and the reading is fresh (<=2.5 seconds). The robot point-turns toward the
+  measured hit, then still obeys forward-wall avoidance. Broad 300 mm weight
+  visibility remains separate from the tighter steering gate.
+- New telemetry includes live current waypoint coordinates, mission reroute
+  and skipped-corner counts, and whether measured weight-bearing steering is
+  active, with the hit coordinates/error while fresh. Arena View and Planned
+  Arena replay show the active waypoint in yellow and an active measured
+  weight bearing in purple. The mission status explains reroutes/skips. The
+  GUI now calls a broad 300 mm sector return a possible low object and only
+  labels the tighter map-checked approach as a verified weight bearing.
+- The Teensy build succeeds and the 6 focused mission GUI tests pass,
+  including off-screen rendering of the new overlays. The replay tests pass
+  their 5 assertions but their PyQt process exits with a Windows access
+  violation during teardown; that issue remains separate. The new firmware
+  has not been uploaded or physically tested, so the reroute and weight
+  approach still require a supervised run with the current arena layout.
+
+2026-09-23 23:37 Test2.rdbg frontal-weight approach correction
+--------------------------------------------------------------
+- The newest ~120-second recording `Non-Teensy-Files/DataVisualisationAfter/Data/Test2.rdbg`
+  shows the first weight waypoint (2147,517) stalled near pose (1735,410),
+  heading 6.5 degrees, with a 332-335 mm frontal return and both drive motors
+  commanded zero. Its target is about 426 mm from the robot centre; the
+  bottom-pair target mask is zero. A similar ~20-second stall occurs near
+  (2283,1693), heading 72.5 degrees, on the second waypoint (2445,2042):
+  the front return is ~347-349 mm, both motors are zero, and a far-left low
+  return is visible but its estimated hit misses the narrower steering gate.
+  This is not simply a missing bottom TOF: the fixed 400 mm mission front
+  stop also prevents driving the last few hundred millimetres to a weight.
+- The final leg at ~119 seconds is a useful counterexample: the third target
+  is ~705 mm away while the forward return is 105 mm. This should stay
+  blocked, because that echo does not match the target's expected range.
+- Firmware now allows a close target leg only for a real, current weight
+  waypoint within 700 mm and a map-clear direct route. That final route uses
+  a 225 mm centre clearance (215 mm chassis half-width plus 10 mm), rather
+  than the general rerouting clearance of 305 mm. The first planned target
+  lies about 257 mm from a mapped wall, so the general clearance incorrectly
+  considered its endpoint obstructed even though the chassis fits.
+- It compares a forward return with the expected target range and checks
+  the mapped physical wall beyond it. A matching target or a mapped-wall
+  echo enables an 80% drive approach. The robot can drive through a short
+  weight return but must stop if the mapped front wall is under 100 mm away;
+  an early, unmatched forward echo keeps the usual 400 mm mission stop.
+  The target arrival radius is reduced from 100/130 mm to 70 mm. This is
+  commanded power, not a measured motor speed or proof of pickup.
+- New telemetry `weight.front_target_visible`, `weight.target_commit_active`,
+  `weight.front_target_range_error_mm`, and
+  `weight.front_target_mapped_wall_mm` exposes the new gate. Arena View labels
+  the approach distinctly from bottom-TOF confirmation. Teensy build and
+  six focused Arena View tests pass. No firmware upload or physical pickup
+  verification has occurred yet; monitor these four telemetry fields and
+  actual front-wall clearance during a supervised test.
+
+2026-09-24 RobotRun_2026-09-23_23-55-08.rdbg review and mission changes
+-----------------------------------------------------------------------
+- The latest ~283-second recording contains one weight mission and several
+  manually restarted return-home routes. The first and second weight sites
+  were marked visited at ~26 and ~38 seconds solely because the estimated
+  pose entered their arrival radii. There were zero confirmed bottom-TOF
+  `weight.detected` samples during either approach, so the old logs were
+  not pickup evidence. The third planned target at (4590,355) stalled at
+  pose roughly (4505,691), heading 287 degrees, with forward readings
+  ~331-345 mm and motors commanded zero. Its forward target-range error
+  was ~134-148 mm, just outside the prior 130 mm match gate; that gate is
+  now 170 mm while still requiring a map-clear route and a mapped wall
+  behind the possible target.
+- After a return-home restart, the robot's estimate settled at about
+  (863,663) mm, heading 205 degrees; the observed physical position supplied
+  by the operator is about (315,878) mm, a roughly 590 mm discrepancy.
+  Front range was ~350 mm, left ultrasound ~92 mm, right ultrasound
+  ~880 mm, and both drive commands were zero for over two minutes. The
+  uploaded physical wall rectangles did not explain a direct obstruction
+  on the estimated straight line to home. Existing side-landmark trimming
+  could not correct this: it excludes the 92 mm left reading, rejects side
+  residuals above 110 mm, and adjusts by at most 3 mm per match. The live
+  detour tried only a 500 mm lateral then 650 mm forward offset, which did
+  not fit inside the map clearance at this arena edge.
+- Firmware now performs a bounded search at each real weight site before
+  counting it as checked: a first rear-left/rear-right sweep and return
+  through the site, plus a shorter second sweep when a confirmed target
+  persists or coverage is insufficient. It dwells to gather readings at
+  each reachable sample position, stops after 20 seconds, and records both
+  checked and incomplete sites separately. It does not claim a pickup
+  without an actual pickup sensor. Telemetry includes search state, step,
+  samples and valid-range coverage. Return-home waypoints do not invoke
+  weight search.
+- For a blocked return-home leg, firmware holds still briefly and checks
+  whether a coherent front 8x8 wall return AND an independent valid side
+  ultrasound can both match known physical surfaces at a nearby candidate
+  pose. Three consistent candidate scans are required before correcting
+  the estimated pose. This provides a larger-drift recovery in addition
+  to the existing small side-landmark trims; it cannot guarantee absolute
+  location when the measurements or uploaded wall map are wrong. New
+  telemetry reports recovery count and match residual.
+- Live obstacle detours now try map-clear 250/350/500 mm lateral and
+  250/400/650 mm forward combinations instead of only 500/650 mm. Return
+  home permits up to six attempts. The firmware's map clearance for return
+  home uses half the configured robot width plus 10 mm, matching the close
+  physical corridor rather than an arbitrary 305 mm inflation; live range
+  blocking still applies. Arena View offers an explicit checkbox to use
+  a manually marked START position for RETURN HOME when the robot's actual
+  centre is known to differ from odometry. Its IMU heading remains live.
+  The checkbox is off by default; do not mark a position without observing
+  the robot there.
+- Controller version is now 11. The Teensy firmware builds successfully
+  and seven focused Arena View tests pass, including a manual return-home
+  start at the reported (315,878) mm location. These changes have not been
+  flashed or physically validated. In the next supervised run, check
+  `mission.search_*`, `mission.landmark_recovery_*`, actual pickup and
+  wall clearance; do not infer successful collection from the site counter.
+
+2026-09-24 00:23 and 00:26 run review; post-target pose and approach alignment
+--------------------------------------------------------------------------
+- Reviewed RobotRun_2026-09-24_00-23-08.rdbg and
+  RobotRun_2026-09-24_00-26-42.rdbg. The first recording explicitly uploads a
+  `return_home:true` mission plan at about 142 seconds. The second has no
+  return-home command. Both runs mark the last weight site checked without
+  independent pickup verification and then switch from strategy 3 (mission)
+  to fallback strategy 0 (roaming). That switch was not an automatic home trip.
+  The GUI's `return_home:true` plan is emitted by its RETURN HOME handler;
+  the recording cannot establish whether the button was clicked deliberately
+  or inadvertently.
+- At the switch, `mission.pose_x_mm`, `mission.pose_y_mm`, and
+  `mission.heading_deg` stopped changing while encoder counts continued to
+  change. For example, the second recording stayed at approximately
+  (4520,315) mm from 100 to 120 seconds while encoder 1 moved from roughly
+  -352308 to -398476 counts. The cause was that encoder/IMU pose integration
+  existed only inside the mission-navigation branch.
+- `updateMissionPose()` now runs after sensor sampling on every control loop,
+  including fallback roaming, navigation stopped, and manual driving. It
+  retains the calibrated encoder scales, IMU heading, and impossible-step
+  rejection. It only initialises from the uploaded start pose when a planned
+  mission actually begins. `mission.pose_live` reports whether the pose is
+  initialised and the IMU sample is valid. Existing landmark trimming still
+  applies only during the planned mission; post-mission coordinates remain an
+  odometry estimate, not guaranteed absolute localisation.
+- On a real weight approach within 700 mm, the controller now centres the
+  planned weight/bottom-TOF bearing to within 4 degrees, holds still for
+  250 ms to settle, then advances at the existing 80% collection speed. It
+  stops and re-aligns if heading error exceeds 7 degrees. Small turns use
+  motor pulses because below-75% output is unreliable. The state appears in
+  `mission.target_aligned`. The recordings did not provide a trustworthy
+  bottom-pair bearing or an independently verified pickup for the last site;
+  this alignment is to the mapped target unless a fresh sensor-derived
+  bearing is available. A supervised physical run is required to verify
+  centring and collection.
+- When a current weight-site hit is confirmed by the lower-vs-upper TOF
+  height gap, matches that site's 170 mm association tolerance, and has a
+  mapped-clear approach, firmware captures the measured hit as a fixed vector
+  from the current robot pose. It turns to that bearing and drives along it
+  through the hit, aiming 180 mm past it where the mapped chassis clearance
+  permits, otherwise trying 140 or 100 mm. If none of those extensions fit,
+  it may drive only to the hit. Front live ranging still blocks an unsafe
+  approach. It then resumes the site sweep; crossing the estimated hit does
+  not prove the weight was collected. Recording telemetry adds
+  `weight.vector_*` fields for the hit, end, heading, progress, and extension.
+- This environment cannot run the Teensy build (PlatformIO unavailable) or
+  the GUI regression suite (PyQt6 unavailable). Firmware has not been
+  uploaded from this change. Controller version is now 12. Compile/upload and inspect the live pose after
+  the final site before relying on the new behavior.
+
+2026-09-24 00:51 and 00:55 weight-approach review; inner-pair centring
+--------------------------------------------------------------------
+- Reviewed RobotRun_2026-09-24_00-51-55.rdbg (159 s) and
+  RobotRun_2026-09-24_00-55-06.rdbg (189 s), including logs, commands,
+  bottom TOFs, frontal range, pose, alignment flags, and motor commands.
+  These runs used the sensor-vector firmware above. Most confirmed weight
+  returns came from the far-left (mask 1) or far-right (mask 8) bottom TOF;
+  the two inner sensors rarely confirmed a low object simultaneously.
+- A far-left-only vector at about 19 s in the first run aimed at approximately
+  (2064,378) mm, although the planned weight was (2147,517) mm. The 162 mm
+  discrepancy passed the old 170 mm association gate but steered left of the
+  weight, matching the reported right-side miss. The last vector of that run
+  similarly placed its hit roughly 150 mm from the planned site. Outer-only
+  hits are therefore treated as candidates, not precise drive-through lines.
+- At about 89-91 s in the first run, the last weight vector remained active
+  but the motor commands were zero: forward range was about 345-362 mm and
+  the predicted mapped wall about 516-517 mm away. At about 139-140 s in the
+  second run, the last vector was only 165 mm through its planned travel and
+  the motors again sat at zero with a 364 mm front return. The old 400 mm
+  transit stop was winning when its strict target/wall range match failed.
+- Controller v13 now allows a confirmed low object near the current site to
+  proceed through a map-backed front corridor when the mapped wall is behind
+  the measured return, retaining the live 100 mm wall stop. An already
+  acquired vector tolerates up to 180 mm front-vs-map residual while staying
+  aligned. This is less likely to strand an approach 350-400 mm from a weight,
+  but still requires supervised verification of map accuracy and wall margin.
+- A close inner pair is now the collection centring cue. Within 350 mm of
+  the planned site (or 500 mm with fresh confirmed low-object evidence),
+  when both inner bottom TOFs read at most 200 mm, the
+  robot pulse-turns until their ranges agree within 30 mm. It then freezes
+  the current heading, estimates the weight's forward position using their
+  uploaded sensor offsets/angles, and sends straight through that location
+  at 80%, aiming up to 180 mm beyond it where the mapped footprint clears.
+  It no longer retargets from subsequent side-sensor readings during this
+  short send; the IMU still holds that frozen heading against drivetrain
+  drift. Centring is bounded to 2.5 s; non-convergence falls back to
+  the site search instead of spinning indefinitely. Search travel is reduced
+  from its prior 78-88% range to 76%, above the drivetrain's observed 75%
+  minimum usable command.
+- Arena View now retains a marker for each sensor-estimated weight location.
+  Orange means possible outer-sensor candidate; purple means committed
+  drive-through location. Markers remain on the planned-layout canvas after
+  live detection disappears and are also projected into the discovered-map
+  view at the time of detection. A new pre-laid RUN NAVIGATION clears prior
+  run markers; RETURN HOME does not. Recording telemetry includes inner left and
+  right ranges, the lock state, bearing sector/freshness, and the vector's
+  waypoint index; the GUI test verifies marker persistence.
+- Verified: PlatformIO Teensy 4.0 v13 build succeeds (177080 bytes code), and all eight focused
+  Arena View navigation tests pass. The physical robot has not been flashed
+  or driven with v13 yet; validate inner-pair signs, centred entry, front
+  wall clearance, and actual weight pickup in a supervised run.

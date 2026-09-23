@@ -337,7 +337,7 @@ class DataVisualiser(QMainWindow):
         planned_layout = QVBoxLayout(planned_page)
         self.replay_mission_note = QLabel(
             "Pre-laid arena · cyan planned route · orange recorded path · "
-            "blue recorded robot pose")
+            "blue recorded robot pose · yellow live waypoint · purple verified weight bearing")
         planned_layout.addWidget(self.replay_mission_note)
         self.replay_mission_comparison = QLabel(
             "Waiting for recorded pose and forward range")

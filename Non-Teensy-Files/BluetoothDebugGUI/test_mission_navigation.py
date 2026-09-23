@@ -16,6 +16,35 @@ class MissionUploadTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_sensed_weight_marker_persists_after_detection_clears(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            canvas = view.mission_canvas
+            canvas.observe_weight_estimate({
+                "weight.vector_waypoint_index": 2,
+                "weight.vector_hit_x_mm": 2120,
+                "weight.vector_hit_y_mm": 840,
+                "mission.pose_x_mm": 2000,
+                "mission.pose_y_mm": 800,
+                "mission.heading_deg": 0,
+            })
+            canvas.observe_weight_estimate({"weight.detected": False})
+            self.assertEqual(canvas.detected_weight_hits[2], (2120, 840, True))
+            self.assertIn(2, canvas.detected_weight_local_hits)
+            canvas.observe_weight_estimate({
+                "weight.detected": True,
+                "weight.bearing_fresh": True,
+                "weight.bearing_waypoint_index": 3,
+                "mission.waypoint_index": 3,
+                "weight.bearing_hit_x_mm": 2800,
+                "weight.bearing_hit_y_mm": 940,
+            })
+            self.assertEqual(canvas.detected_weight_hits[3], (2800, 940, False))
+            self.assertIn(2, canvas.detected_weight_hits)
+            view.close()
+
     def test_map_contains_forbidden_home_and_physical_landmarks(self):
         layout = MissionLayout()
         layout.add_obstacle("wall", 1800, 1000)
@@ -85,6 +114,31 @@ class MissionUploadTests(unittest.TestCase):
             self.assertEqual(len(sent[1][1]["ultrasound_offsets"]), 4)
             view.close()
 
+    def test_return_home_can_use_marked_actual_position_when_odometry_drifted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "mission.ini"),
+                                 QSettings.Format.IniFormat)
+            view = ArenaView(settings)
+            view.model.latest.update({
+                "mission.pose_x_mm": 863.0,
+                "mission.pose_y_mm": 663.0,
+                "mission.heading_deg": 205.0,
+                "imu.valid": True,
+                "system.stopped": False,
+            })
+            view.mission_layout.start["x"] = 315.0
+            view.mission_layout.start["y"] = 878.0
+            view.mission_manual_home_pose.setChecked(True)
+            sent = []
+            view.command_requested.connect(lambda name, data: sent.append((name, data)))
+            view._return_home()
+            plans = [data for name, data in sent if name == "mission_plan_set"]
+            self.assertEqual(len(plans), 1)
+            self.assertEqual((plans[0]["start_x_mm"], plans[0]["start_y_mm"]),
+                             (315, 878))
+            self.assertIn("marked actual position", view.mission_status.text())
+            view.close()
+
     def test_oversized_map_does_not_start_robot(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "mission.ini"),
@@ -122,6 +176,37 @@ class MissionUploadTests(unittest.TestCase):
             view.model.latest.update({"weight.gap_mask": 0, "weight.target_mask": 1})
             view._refresh_mission_weight_visibility()
             self.assertIn("height gap", view.mission_weight_visibility.text())
+            view.model.latest.update({
+                "weight.detected": True,
+                "weight.sector_mask": 4,
+                "weight.nearest_mm": 99,
+                "weight.direction": 1,
+                "weight.bearing_active": True,
+            })
+            view._refresh_mission_weight_visibility()
+            self.assertIn("Steering toward measured hit",
+                          view.mission_weight_visibility.text())
+            view.model.latest.update({
+                "weight.target_commit_active": True,
+                "weight.front_target_visible": True,
+                "navigation.front_mm": 330,
+            })
+            view._refresh_mission_weight_visibility()
+            self.assertIn("APPROACHING KNOWN WEIGHT",
+                          view.mission_weight_visibility.text())
+            self.assertIn("100 mm wall limit",
+                          view.mission_weight_visibility.text())
+            view.model.latest.update({
+                "mission.active": True,
+                "mission.pose_x_mm": 4135.0,
+                "mission.pose_y_mm": 345.0,
+                "mission.heading_deg": 347.0,
+                "mission.current_waypoint_x_mm": 4590.0,
+                "mission.current_waypoint_y_mm": 355.0,
+                "weight.bearing_hit_x_mm": 4472.0,
+                "weight.bearing_hit_y_mm": 446.0,
+            })
+            self.assertFalse(view.mission_canvas.grab().isNull())
             view.close()
 
 
