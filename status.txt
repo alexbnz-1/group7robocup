@@ -5700,3 +5700,40 @@ Not verified here:
   Arena View navigation tests pass. The physical robot has not been flashed
   or driven with v13 yet; validate inner-pair signs, centred entry, front
   wall clearance, and actual weight pickup in a supervised run.
+
+2026-09-24 evening: two first-site runs and turn oscillation
+- `RobotRun_2026-09-24_22-12-19.rdbg`: autonomous mission began at 9.5 s,
+  reached the first target vicinity, entered its 20 s site search at 18.5 s,
+  and marked that search incomplete at 38.5 s. During the search the requested
+  bearing sat near 204 degrees while the IMU hovered on the opposite side of
+  the circle (roughly 18-35 degrees). A target almost exactly 180 degrees away
+  has two equally short turn directions; small pose changes made the old
+  controller alternate full-power A/B turn commands. Estimated X also drifted
+  about 300 mm while turning, shifting the search target still further.
+- `RobotRun_2026-09-24_22-16-51.rdbg`: inner-bottom centring and a weight
+  drive-through occurred at 16.6 s; the same site search started at 18.8 s and
+  timed out at 38.8 s. After about 17 s the Bluetooth telemetry became
+  fragmented (only partial roughly 900-byte telemetry fragments are decoded),
+  so later motor/pose readings from this recording cannot independently prove
+  the precise oscillation. TX-drop counters were already rising by one frame
+  per second; this is a separate link/recording issue still to investigate.
+- Firmware now latches the chosen turn direction across the ambiguous
+  180-degree boundary, coasts before reversing it, and pulses smaller turns
+  rather than continuously commanding high torque. Encoder translation is
+  suppressed while the motor bank is commanded to point-turn, preventing
+  unequal encoder slip from inventing forward travel during the search.
+- After a completed sensed-weight drive-through, the robot now stops for one
+  second, makes a slow 30-degree-left/right/centre scan in place, and retries
+  the sensed location if it still sees a valid weight bearing. Retries are
+  bounded to two; if still seen but a retry is unsafe it falls back to the
+  existing site search. With no weight seen, it advances to the next site.
+- Normal Arena View mission uploads now include the chosen home centre.
+  After every planned weight site has been checked, firmware appends a
+  return-home leg using its live pose and existing map rerouting. On arrival
+  it turns toward the arena interior and starts the selected fallback
+  exploration strategy. The separate manual RETURN HOME command still stops
+  at home. Existing plans lacking home coordinates retain their old fallback.
+- The updated firmware compiles for Teensy 4.0 and all eight focused mission
+  GUI tests pass. These are not hardware validation: upload the new firmware
+  and run under supervision before relying on the collection check or
+  automatic return-home behaviour.

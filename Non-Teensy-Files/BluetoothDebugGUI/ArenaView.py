@@ -1453,10 +1453,13 @@ class MissionLayout:
         for point in self.route:
             points.extend([int(round(point["x"])), int(round(point["y"])),
                            1 if point.get("target") else 0])
+        home = self.home_rect(self.my_home)
         return {
             "start_x_mm": int(round(self.start["x"])),
             "start_y_mm": int(round(self.start["y"])),
             "start_heading_deg": int(round(self.start["heading_deg"])) % 360,
+            "home_x_mm": int(round((home[0] + home[2]) * 0.5)),
+            "home_y_mm": int(round((home[1] + home[3]) * 0.5)),
             "fallback_strategy": int(self.fallback_strategy),
             "points": points,
         }

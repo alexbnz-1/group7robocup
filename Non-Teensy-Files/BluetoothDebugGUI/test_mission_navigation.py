@@ -69,6 +69,8 @@ class MissionUploadTests(unittest.TestCase):
             self.assertEqual([name for name, _ in sent],
                              ["mission_map_set", "mission_plan_set",
                               "autonomous_navigation"])
+            self.assertEqual(sent[1][1]["home_x_mm"], 325)
+            self.assertEqual(sent[1][1]["home_y_mm"], 325)
             for name, data in sent[:2]:
                 encoded = json.dumps({"type": "command", "command": name, **data},
                                      separators=(",", ":")).encode("utf-8")

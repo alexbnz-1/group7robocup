@@ -237,6 +237,9 @@ private:
     int32_t missionLastEncoder2_ = 0;
     uint32_t missionLastPoseUpdateMs_ = 0;
     uint16_t missionOdometryRejectedSteps_ = 0;
+    int8_t missionTurnDirection_ = 0;
+    uint32_t missionTurnCoastUntilMs_ = 0;
+    uint32_t missionTurnPulseStartedMs_ = 0;
     uint32_t missionTargetAlignSinceMs_ = 0;
     bool missionTargetAligned_ = false;
     uint8_t missionTargetAlignWaypoint_ = 255;
@@ -270,6 +273,14 @@ private:
     uint8_t missionSearchSamples_ = 0;
     uint8_t missionSearchCoverageSamples_ = 0;
     float missionSearchApproachHeadingDeg_ = 0.0f;
+    uint8_t missionVerifyPhase_ = 0; // 0 idle, 1 pause, 2-4 slow scan
+    uint8_t missionVerifyWaypoint_ = 255;
+    uint8_t missionVerifyRetries_ = 0;
+    uint32_t missionVerifyStartedMs_ = 0;
+    float missionVerifyHeadingDeg_ = 0.0f;
+    bool missionVerifySawWeight_ = false;
+    float missionVerifyHitXmm_ = 0.0f;
+    float missionVerifyHitYmm_ = 0.0f;
     uint32_t missionLandmarkRecoveryLastMs_ = 0;
     uint8_t missionLandmarkRecoveryMatches_ = 0;
     float missionLandmarkRecoveryXmm_ = 0.0f;
@@ -294,6 +305,10 @@ private:
     int16_t missionUltrasoundForwardMm_[2] = {};
     bool missionUltrasoundGeometryValid_ = false;
     bool missionReturnHome_ = false;
+    bool missionAutoReturnHome_ = false;
+    bool missionHomeValid_ = false;
+    int16_t missionHomeXmm_ = 0;
+    int16_t missionHomeYmm_ = 0;
     uint8_t missionAvoidPhase_ = 0; // 0 route, 1 lateral, 2 past obstacle
     int8_t missionAvoidSide_ = 0;
     uint8_t missionAvoidAttempts_ = 0;
