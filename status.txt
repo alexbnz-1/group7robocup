@@ -5737,3 +5737,58 @@ Not verified here:
   GUI tests pass. These are not hardware validation: upload the new firmware
   and run under supervision before relying on the collection check or
   automatic return-home behaviour.
+
+2026-09-24 late run and sorting/collection tuning
+- `RobotRun_2026-09-24_22-58-23.rdbg` ran for 163 s with arm sorting on.
+  It made several blocked-leg detours between about 16 and 57 s, searched
+  the first weight site from 84 to 104 s and the second from 117 to 137 s.
+  Neither site produced a confirmed bottom-TOF weight sector/inner-pair lock
+  in recorded telemetry; both searches timed out. The inductive sensor did
+  confirm collection at 124 s during the second search, however. The plan
+  then initiated automatic return home at 137 s and inserted a map reroute
+  at 143 s; recording ended before arrival. The stop/go jitter aligns with
+  front-ranging near the 400 mm mission threshold and transitions between
+  point turns and forward driving. This run did not exercise a centred
+  drive-through, so its pickup geometry still needs a physical check.
+- Mission steering now has point-turn hysteresis (start above 24 degrees,
+  continue until within 12 degrees), and front blocking remains latched
+  until a range at least 80 mm clearer has remained stable for 300 ms.
+  This reduces flip-flopping on a noisy threshold without reducing the hard
+  100 mm wall limit. Both inner bottom TOFs may now differ by up to 50 mm
+  before collection locks, instead of 30 mm. Close target heading settling
+  is relaxed from 4/7 degrees to 10/14 degrees and 180 ms dwell.
+- Once the inner pair centres a weight, the frozen-heading approach uses
+  75% motor command. After reaching the vector end it continues at 75% for
+  up to two seconds to feed the item into the mechanism, but stops sooner
+  if mapped clearance ahead or a valid front return of at least 150 mm is
+  lost. A newly confirmed inductive detection completes the current weight
+  site immediately instead of continuing its search or post-pass scan.
+- Arm sorting assumes the physical gate is at reject when armed, reads
+  Herkulex 4 there as relative zero, commands reject at 0 degrees and
+  accept at +60 degrees, and verifies that +60 is inside servo range.
+  Explicit STOP NAVIGATION disarms sorting, turns bumpers off and commands
+  reject. STOP ROBOT stops propulsion/other servo torque first, parks the
+  gate at reject, then releases gate torque after its 500 ms motion. These
+  positions and stop sequencing need a supervised physical check. The
+  updated firmware builds successfully; it has not been uploaded here.
+
+2026-09-24 turn-smoothness follow-up
+- `RobotRun_2026-09-24_23-20-02.rdbg` completed the two planned site checks;
+  the first search timed out, but an inductive pickup at 97 s immediately
+  completed the second site. It returned toward home and then made a live
+  detour at about 126 s. The recording ended during that return. The turn
+  from about 126-141 s took a long sequence of brief motor-on/motor-off
+  steps while target heading remained near 250-270 degrees.
+- `RobotRun_2026-09-24_23-23-35.rdbg` repeated route planning several times
+  near 24-30 s. During its first site search the requested heading changed
+  sharply between search legs; a roughly 45-degree correction from about
+  44-54 s took 10 seconds of pulsed rotation. These are deliberate point
+  turns made visibly jerky by the old 75 ms on / 225 ms off pattern starting
+  as far as 55 degrees from target. Route detours and search-step changes
+  also create some genuinely large heading requests.
+- Firmware now uses continuous minimum-reliable turn power for most of a
+  heading change. It coasts for 350 ms on entering the final 35-degree
+  region, then uses short 65 ms finishing pulses only near the target.
+  A target-locked collection leg bypasses a stale generic point-turn state
+  and drives on its locked heading. The Teensy 4.0 build passes; turn quality
+  still requires an uploaded firmware and a supervised physical run.

@@ -65,6 +65,10 @@ private:
     bool sortingDetectionConfirmed_ = false;
     bool sortingBumpersOn_ = false;
     bool sortingGatePositive_ = false;
+    bool sortingGateReferenceValid_ = false;
+    uint32_t sortingGateTorqueOffAtMs_ = 0;
+    uint16_t sortingConfirmedSerial_ = 0;
+    uint16_t missionHandledSortingSerial_ = 0;
     bool sortingIdlePulseActive_ = false;
     uint8_t sortingInputIndex_ = 0;
     uint32_t sortingDetectedSinceMs_ = 0;
@@ -238,12 +242,18 @@ private:
     uint32_t missionLastPoseUpdateMs_ = 0;
     uint16_t missionOdometryRejectedSteps_ = 0;
     int8_t missionTurnDirection_ = 0;
+    bool missionPointTurnActive_ = false;
+    bool missionTurnFinishing_ = false;
+    uint32_t missionTurnBrakeUntilMs_ = 0;
+    bool missionFrontBlockedLatched_ = false;
+    uint32_t missionFrontClearSinceMs_ = 0;
     uint32_t missionTurnCoastUntilMs_ = 0;
     uint32_t missionTurnPulseStartedMs_ = 0;
     uint32_t missionTargetAlignSinceMs_ = 0;
     bool missionTargetAligned_ = false;
     uint8_t missionTargetAlignWaypoint_ = 255;
     bool missionWeightVectorActive_ = false;
+    uint32_t missionCollectionFollowThroughUntilMs_ = 0;
     uint8_t missionWeightVectorWaypoint_ = 255;
     uint8_t missionWeightVectorCompletedWaypoint_ = 255;
     float missionWeightVectorStartXmm_ = 0.0f;
@@ -373,7 +383,7 @@ private:
     void updateAutomaticServoRead();
     void updateArmSorting(uint32_t now);
     void setSortingBumpers(bool enabled);
-    void setSortingGate(bool positive);
+    void setSortingGate(bool positive, bool force = false);
     void disarmArmSorting(bool restoreOutputs);
     void updateTrackingState(float absoluteAngle);
     JsonObject findParameter(const char* name);

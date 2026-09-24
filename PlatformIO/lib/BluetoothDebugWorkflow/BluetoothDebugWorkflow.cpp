@@ -109,6 +109,12 @@ void BluetoothDebugWorkflow::update()
     for (uint8_t i = 0; i < digitalInputCount_; ++i)
         digitalInputs_[i].update(now);
     updateArmSorting(now);
+    if (sortingGateTorqueOffAtMs_ != 0 &&
+        static_cast<int32_t>(now - sortingGateTorqueOffAtMs_) >= 0)
+    {
+        servos_.torqueOff(4);
+        sortingGateTorqueOffAtMs_ = 0;
+    }
     if (dcMotor203SecondDeadman_ && dcMotor203SecondActive_ &&
         millis() - lastDcMotor203SecondCommandMs_ > KEYBOARD_DRIVE_TIMEOUT_MS)
     {
@@ -453,12 +459,18 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         missionHomeYmm_ = static_cast<int16_t>(missionHomeValid_ ? homeY : 0);
         missionAutoReturnHome_ = false;
         missionTurnDirection_ = 0;
+        missionPointTurnActive_ = false;
+        missionTurnFinishing_ = false;
+        missionFrontBlockedLatched_ = false;
+        missionFrontClearSinceMs_ = 0;
         missionPlanValid_ = count > 0 && targets > 0;
         missionPoseInitialised_ = false;
         missionTargetAlignSinceMs_ = 0;
         missionTargetAligned_ = false;
         missionTargetAlignWaypoint_ = 255;
         missionWeightVectorActive_ = false;
+        missionCollectionFollowThroughUntilMs_ = 0;
+        missionHandledSortingSerial_ = sortingConfirmedSerial_;
         missionWeightVectorWaypoint_ = 255;
         missionWeightVectorCompletedWaypoint_ = 255;
         missionWeightVectorOvershootMm_ = 0;
@@ -508,7 +520,6 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
     {
         disarmArmSorting(false);
         stopNavigation();
-        servos_.torqueOff(0xFE);
         continuousVelocityActive_ = false;
         commandedVelocity_ = 0;
         dcMotor203_.stop();
@@ -520,12 +531,22 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         hx12kB_.disable();
         hx12kC_.disable();
         hx12kD_.disable();
+        // Stop propulsion and release all servo torque first. If sorting was
+        // zeroed at reject, restore only gate 4 long enough to park it, then
+        // release its torque in update() after the 500 ms position command.
+        servos_.torqueOff(0xFE);
+        if (sortingGateReferenceValid_)
+        {
+            setSortingGate(false, true);
+            sortingGateTorqueOffAtMs_ = millis() + 550U;
+        }
         stopped_ = true;
         sendState();
         link_.log("WARNING", "STOP received; servo torque disabled");
     }
     else if (strcmp(action, "run") == 0)
     {
+        sortingGateTorqueOffAtMs_ = 0;
         stopped_ = false;
         trackingFault_ = false;
         consecutiveTrackingErrors_ = 0;
@@ -657,6 +678,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
 
         servoZeroOffsetsDeg_[id] = currentAngle;
         servoZeroed_[id] = true;
+        if (id == 4)
+            sortingGateReferenceValid_ = false;
         lastServoId_ = static_cast<uint8_t>(id);
         lastServoAngleDeg_ = 0.0f;
         measuredServoAngleDeg_ = 0.0f;
@@ -687,6 +710,8 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
 
         lastServoId_ = static_cast<uint8_t>(id);
         commandedVelocity_ = static_cast<int16_t>(speed);
+        if (id == 4 && speed != 0)
+            sortingGateReferenceValid_ = false;
         servos_.torqueOff(lastServoId_);
         delay(5);
         servos_.clearError(lastServoId_);
@@ -804,6 +829,12 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         if (!message["enabled"].as<bool>())
         {
             stopNavigation("Autonomous navigation stopped");
+            disarmArmSorting(false);
+            if (sortingGateReferenceValid_)
+            {
+                setSortingBumpers(false);
+                setSortingGate(false, true);
+            }
             return;
         }
         if (!debugMode_)
@@ -1023,16 +1054,28 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
             link_.error("Arm sorting needs the inductive_proximity input");
             return;
         }
+        if (sortingGateReferenceValid_)
+        {
+            // Reuse the previous reject reference to park before taking a
+            // fresh zero. The first arm after startup needs the gate placed
+            // at reject physically because no absolute reference exists yet.
+            setSortingGate(false, true);
+            delay(520);
+        }
         const float zero = servos_.readAngle(4, 30);
         if (isnan(zero) ||
-            zero - 30.0f < HerkulexConfig::MIN_ANGLE_DEG ||
-            zero + 30.0f > HerkulexConfig::MAX_ANGLE_DEG)
+            zero < HerkulexConfig::MIN_ANGLE_DEG ||
+            zero + 60.0f > HerkulexConfig::MAX_ANGLE_DEG)
         {
-            link_.error("Cannot arm sorting: Herkulex 4 did not respond or +/-30 exceeds its range");
+            link_.error("Cannot arm sorting: place gate at reject, then check Herkulex 4 and its +60 range");
             return;
         }
+        // The gate must physically be at reject when sorting is armed.
+        // Capture that position as relative zero for this run.
         servoZeroOffsetsDeg_[4] = zero;
         servoZeroed_[4] = true;
+        sortingGateReferenceValid_ = true;
+        sortingGateTorqueOffAtMs_ = 0;
         lastServoId_ = 4;
         lastServoAngleDeg_ = 0.0f;
         measuredServoAngleDeg_ = 0.0f;
@@ -1049,7 +1092,7 @@ void BluetoothDebugWorkflow::handleCommand(JsonDocument& message)
         setSortingBumpers(false);
         sortingGatePositive_ = true;
         setSortingGate(false);
-        link_.log("INFO", "Arm sorting ON: Herkulex 4 zeroed; bumpers OFF; gate -30");
+        link_.log("INFO", "Arm sorting ON: reject gate zeroed; bumpers OFF; gate 0");
         sendState();
     }
     else if (strcmp(action, "tof_read_all") == 0)
@@ -1166,10 +1209,10 @@ void BluetoothDebugWorkflow::setSortingBumpers(bool enabled)
     sortingBumpersOn_ = enabled;
 }
 
-void BluetoothDebugWorkflow::setSortingGate(bool positive)
+void BluetoothDebugWorkflow::setSortingGate(bool positive, bool force)
 {
-    if (sortingGatePositive_ == positive) return;
-    const float relativeAngle = positive ? 30.0f : -30.0f;
+    if (!sortingGateReferenceValid_ || (!force && sortingGatePositive_ == positive)) return;
+    const float relativeAngle = positive ? 60.0f : 0.0f;
     const float absoluteAngle = servoZeroOffsetsDeg_[4] + relativeAngle;
     constexpr uint16_t MOVE_MS = 500;
     // Match the proven Herkulex position-mode sequence used by the manual
@@ -1226,10 +1269,11 @@ void BluetoothDebugWorkflow::updateArmSorting(uint32_t now)
             now - sortingDetectedSinceMs_ >= 500U)
         {
             sortingDetectionConfirmed_ = true;
+            ++sortingConfirmedSerial_;
             sortingIdlePulseActive_ = false;
             setSortingBumpers(true);
             setSortingGate(true);
-            link_.log("INFO", "Inductive detection confirmed: bumpers ON, gate +30");
+            link_.log("INFO", "Inductive detection confirmed: bumpers ON, gate +60");
         }
         return;
     }
@@ -1246,7 +1290,7 @@ void BluetoothDebugWorkflow::updateArmSorting(uint32_t now)
             sortingDetectionConfirmed_ = false;
             sortingClearedSinceMs_ = 0;
             sortingNextPulseMs_ = now + 20000U;
-            link_.log("INFO", "Inductive target cleared: gate -30; idle pulse timer restarted");
+            link_.log("INFO", "Inductive target cleared: gate 0; idle pulse timer restarted");
         }
         return;
     }
@@ -1370,7 +1414,7 @@ void BluetoothDebugWorkflow::sendTelemetry()
         digitalInputs_[sortingInputIndex_].detected();
     data["sorting.confirmed"] = sortingDetectionConfirmed_;
     data["sorting.bumpers_on"] = armSortingEnabled_ && sortingBumpersOn_;
-    data["sorting.gate_angle_deg"] = sortingGatePositive_ ? 30 : -30;
+    data["sorting.gate_angle_deg"] = sortingGatePositive_ ? 60 : 0;
     data["sorting.idle_pulse"] = sortingIdlePulseActive_;
     data["dc_motor_203.active"] = dcMotor203Active_;
     data["dc_motor_203.channel_a_percent"] = dcMotor203_.channelAPercent();
@@ -2166,9 +2210,14 @@ void BluetoothDebugWorkflow::stopNavigation(const char* reason)
 {
     navigationActive_ = false;
     missionWeightVectorActive_ = false;
+    missionCollectionFollowThroughUntilMs_ = 0;
     missionVerifyPhase_ = 0;
     missionInnerWeightLocked_ = false;
     missionTargetAligned_ = false;
+    missionPointTurnActive_ = false;
+    missionTurnFinishing_ = false;
+    missionFrontBlockedLatched_ = false;
+    missionFrontClearSinceMs_ = 0;
     navigationState_ = NAV_IDLE;
     missionAvoidPhase_ = 0;
     missionBlockedSinceMs_ = 0;
@@ -3559,6 +3608,34 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionBlockedSinceMs_ = 0;
             missionAvoidAttempts_ = 0;
         };
+        if (missionHandledSortingSerial_ != sortingConfirmedSerial_)
+        {
+            missionHandledSortingSerial_ = sortingConfirmedSerial_;
+            if (!missionReturnHome_ && (waypoint.flags & 0x01) != 0 &&
+                (searchActive || missionWeightVectorActive_ ||
+                 routeRangeMm <= 500.0f))
+            {
+                // The inductor is direct evidence that a weight entered the
+                // mechanism. Do not keep searching the already-collected site.
+                setDrive(0, 0);
+                missionWeightVectorActive_ = false;
+                missionCollectionFollowThroughUntilMs_ = 0;
+                missionInnerWeightLocked_ = false;
+                missionVerifyPhase_ = 0;
+                missionSearchWaypoint_ = 255;
+                missionSearchStep_ = 0;
+                missionVerifyRetries_ = 0;
+                weightBearingWaypoint_ = 255;
+                if (missionTargetsVisited_ < missionTargetCount_)
+                    ++missionTargetsVisited_;
+                if (missionSearchSitesChecked_ < 255U)
+                    ++missionSearchSitesChecked_;
+                ++missionWaypointIndex_;
+                missionBlockedSinceMs_ = 0;
+                link_.log("INFO", "Inductive pickup confirmed; moving to next weight site");
+                return;
+            }
+        }
         if (missionVerifyPhase_ != 0 &&
             missionVerifyWaypoint_ == missionWaypointIndex_)
         {
@@ -3705,7 +3782,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionWeightVectorCompletedWaypoint_ != missionWaypointIndex_ &&
             front != 0xFFFF && front >= 100U)
         {
-            if (abs(innerDeltaMm) > 30)
+            if (abs(innerDeltaMm) > 50)
             {
                 if (missionInnerAlignStartedMs_ == 0)
                     missionInnerAlignStartedMs_ = now;
@@ -3760,6 +3837,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                     }
                 }
                 missionWeightVectorActive_ = true;
+                missionCollectionFollowThroughUntilMs_ = 0;
                 missionInnerWeightLocked_ = true;
                 missionWeightVectorWaypoint_ = missionWaypointIndex_;
                 missionWeightVectorStartXmm_ = missionPoseXmm_;
@@ -3794,6 +3872,7 @@ void BluetoothDebugWorkflow::updateNavigation()
              missionAvoidPhase_ != 0))
         {
             missionWeightVectorActive_ = false;
+            missionCollectionFollowThroughUntilMs_ = 0;
             missionInnerWeightLocked_ = false;
         }
         if (!missionWeightVectorActive_ && followWeightBearing &&
@@ -3822,6 +3901,7 @@ void BluetoothDebugWorkflow::updateNavigation()
                     }
                 }
                 missionWeightVectorActive_ = true;
+                missionCollectionFollowThroughUntilMs_ = 0;
                 if (searchActive)
                     missionSearchStartedMs_ = now;
                 missionWeightVectorWaypoint_ = missionWaypointIndex_;
@@ -3868,8 +3948,31 @@ void BluetoothDebugWorkflow::updateNavigation()
         if (missionWeightVectorActive_ &&
             vectorProgressMm >= missionWeightVectorTravelMm_)
         {
+            if (missionInnerWeightLocked_)
+            {
+                if (missionCollectionFollowThroughUntilMs_ == 0)
+                {
+                    missionCollectionFollowThroughUntilMs_ = now + 2000U;
+                    link_.log("INFO", "Centred pickup reached; slow collection follow-through");
+                }
+                const float headingRad = missionWeightVectorHeadingDeg_ * DEG_TO_RAD;
+                const float aheadX = missionPoseXmm_ + 100.0f * cosf(headingRad);
+                const float aheadY = missionPoseYmm_ + 100.0f * sinf(headingRad);
+                if (static_cast<int32_t>(now - missionCollectionFollowThroughUntilMs_) < 0 &&
+                    front != 0xFFFF && front >= 150U &&
+                    segmentFreeAt(missionPoseXmm_, missionPoseYmm_, aheadX, aheadY,
+                                  targetClearanceMm))
+                {
+                    const float frozenBnoHeading = normaliseHeading(
+                        missionStartImuHeadingDeg_ + headingDelta(
+                            missionStartArenaHeadingDeg_, missionWeightVectorHeadingDeg_));
+                    driveOnHeading(frozenBnoHeading, 75);
+                    return;
+                }
+            }
             setDrive(0, 0);
             missionWeightVectorActive_ = false;
+            missionCollectionFollowThroughUntilMs_ = 0;
             missionInnerWeightLocked_ = false;
             missionWeightVectorCompletedWaypoint_ = missionWaypointIndex_;
             missionSearchWaypoint_ = 255;
@@ -4026,12 +4129,35 @@ void BluetoothDebugWorkflow::updateNavigation()
             missionFrontTargetVisible_ || mappedWallEcho || sensedWeightCorridor;
         const uint16_t missionStopMm = max(FRONT_AVOID_MM,
                                            static_cast<uint16_t>(400U));
+        // A noisy frontal range near 400 mm made the last run alternate
+        // STOP/GO and repeatedly restart bypasses. Release only after a
+        // stable, clearly larger reading; keep the 100 mm hard wall limit.
+        if (missionTargetCommitActive_)
+        {
+            missionFrontBlockedLatched_ = false;
+            missionFrontClearSinceMs_ = 0;
+        }
+        else if (front != 0xFFFF && front < missionStopMm)
+        {
+            missionFrontBlockedLatched_ = true;
+            missionFrontClearSinceMs_ = 0;
+        }
+        else if (missionFrontBlockedLatched_ && front != 0xFFFF &&
+                 front >= missionStopMm + 80U)
+        {
+            if (missionFrontClearSinceMs_ == 0)
+                missionFrontClearSinceMs_ = now;
+            if (now - missionFrontClearSinceMs_ >= 300U)
+                missionFrontBlockedLatched_ = false;
+        }
+        else
+            missionFrontClearSinceMs_ = 0;
         const bool closeWallBlocked = missionTargetCommitActive_ &&
             (mappedWallMm < 100.0f ||
              (front < 100U && !missionFrontTargetVisible_));
-        const bool blockedOnLeg = front != 0xFFFF &&
+        const bool blockedOnLeg = (front != 0xFFFF || missionFrontBlockedLatched_) &&
             (missionTargetCommitActive_ ? closeWallBlocked :
-             front < missionStopMm) &&
+             missionFrontBlockedLatched_) &&
             (missionTargetCommitActive_ || !navigationGapPassable_) &&
             // A sizeable new bearing needs a point turn, not a forward drive.
             // Allow that turn, then recheck the wall before moving ahead.
@@ -4159,7 +4285,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             // The close inner pair has already centred the object. Hold the
             // captured heading against drivetrain drift, but do not chase
             // subsequent range/weight measurements or change the vector.
-            driveOnHeading(targetBnoHeadingDeg, 80);
+            driveOnHeading(targetBnoHeadingDeg, 75);
             return;
         }
         if (targetLeg)
@@ -4167,7 +4293,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             // Before committing to a mapped weight location, point the robot
             // down the actual robot-to-target bearing and allow yaw to settle.
             // Do not use the wide 18-degree transit tolerance for collection.
-            const float alignmentToleranceDeg = missionTargetAligned_ ? 7.0f : 4.0f;
+            const float alignmentToleranceDeg = missionTargetAligned_ ? 14.0f : 10.0f;
             if (fabsf(headingError) > alignmentToleranceDeg)
             {
                 missionTargetAligned_ = false;
@@ -4175,8 +4301,8 @@ void BluetoothDebugWorkflow::updateNavigation()
                 const bool turnRight = headingError > 0.0f;
                 // The motor driver needs >=75% to move. Pulse close turns so
                 // inertia does not carry the weight past the bumper centre.
-                if (fabsf(headingError) > 35.0f || now % 320U < 75U)
-                    setDrive(turnRight ? -80 : 80, turnRight ? 80 : -80);
+                if (fabsf(headingError) > 28.0f || now % 450U < 65U)
+                    setDrive(turnRight ? -75 : 75, turnRight ? 75 : -75);
                 else
                     setDrive(0, 0);
                 return;
@@ -4186,12 +4312,26 @@ void BluetoothDebugWorkflow::updateNavigation()
                 setDrive(0, 0);
                 if (missionTargetAlignSinceMs_ == 0)
                     missionTargetAlignSinceMs_ = now;
-                if (now - missionTargetAlignSinceMs_ < 250U)
+                if (now - missionTargetAlignSinceMs_ < 180U)
                     return;
                 missionTargetAligned_ = true;
             }
+            // A locked collection bearing should continue forward, not fall
+            // into the generic point-turn state retained from a route leg.
+            missionPointTurnActive_ = false;
+            missionTurnDirection_ = 0;
+            missionTurnFinishing_ = false;
+            driveOnHeading(targetBnoHeadingDeg,
+                           missionWeightVectorActive_ ? 75 : 80);
+            return;
         }
-        if (fabsf(headingError) > 18.0f)
+        // Hysteresis avoids alternating between a stationary point turn and
+        // forward drive at the same 18-degree boundary each sensor update.
+        if (!missionPointTurnActive_ && fabsf(headingError) > 24.0f)
+            missionPointTurnActive_ = true;
+        else if (missionPointTurnActive_ && fabsf(headingError) <= 12.0f)
+            missionPointTurnActive_ = false;
+        if (missionPointTurnActive_)
         {
             // Point-turn until the requested path is reasonably aligned, then
             // proportional straight-line heading correction takes over. A
@@ -4203,6 +4343,7 @@ void BluetoothDebugWorkflow::updateNavigation()
             if (direction != missionTurnDirection_)
             {
                 missionTurnDirection_ = direction;
+                missionTurnFinishing_ = false;
                 missionTurnCoastUntilMs_ = now + 180U;
                 missionTurnPulseStartedMs_ = missionTurnCoastUntilMs_;
             }
@@ -4211,17 +4352,40 @@ void BluetoothDebugWorkflow::updateNavigation()
                 setDrive(0, 0);
                 return;
             }
-            const int16_t turnPower = fabsf(headingError) > 55.0f ? 90 : 80;
-            if (fabsf(headingError) > 55.0f ||
-                (now - missionTurnPulseStartedMs_) % 300U < 75U)
+            const float absoluteError = fabsf(headingError);
+            // Keep the body rotating continuously until it is genuinely
+            // near the target. The previous 75 ms / 300 ms duty cycle began
+            // at 55 degrees and made a modest turn take many visible kicks.
+            if (missionTurnFinishing_ && absoluteError > 50.0f)
+                missionTurnFinishing_ = false;
+            if (!missionTurnFinishing_ && absoluteError > 35.0f)
+            {
+                const int16_t turnPower = absoluteError > 90.0f ? 80 : 75;
                 setDrive(direction > 0 ? -turnPower : turnPower,
                          direction > 0 ? turnPower : -turnPower);
+                return;
+            }
+            if (!missionTurnFinishing_)
+            {
+                missionTurnFinishing_ = true;
+                missionTurnBrakeUntilMs_ = now + 350U;
+                missionTurnPulseStartedMs_ = missionTurnBrakeUntilMs_;
+            }
+            if (now < missionTurnBrakeUntilMs_)
+            {
+                setDrive(0, 0);
+                return;
+            }
+            if ((now - missionTurnPulseStartedMs_) % 450U < 65U)
+                setDrive(direction > 0 ? -75 : 75,
+                         direction > 0 ? 75 : -75);
             else
                 setDrive(0, 0);
         }
         else
         {
             missionTurnDirection_ = 0;
+            missionTurnFinishing_ = false;
             const int16_t basePower = targetLeg ? 80 :
                 (searchActive ? 76 : (distanceToWaypoint < 350.0f ? 78 : 88));
             driveOnHeading(targetBnoHeadingDeg, basePower);
