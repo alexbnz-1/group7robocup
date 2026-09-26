@@ -69,6 +69,10 @@ private:
     uint32_t sortingGateTorqueOffAtMs_ = 0;
     uint16_t sortingConfirmedSerial_ = 0;
     uint16_t missionHandledSortingSerial_ = 0;
+    uint8_t missionPendingPickupWaypoint_ = 255;
+    uint32_t missionPendingPickupSinceMs_ = 0;
+    uint32_t missionPostPickupStraightUntilMs_ = 0;
+    float missionPostPickupHeadingDeg_ = 0.0f;
     bool sortingIdlePulseActive_ = false;
     uint8_t sortingInputIndex_ = 0;
     uint32_t sortingDetectedSinceMs_ = 0;
@@ -220,7 +224,7 @@ private:
     struct MissionWaypoint {
         int16_t xMm = 0;
         int16_t yMm = 0;
-        uint8_t flags = 0;  // bit 0 = real-weight visit point
+        uint8_t flags = 0;  // bit 0 = target, bit 2 = reverse-dock finish
     };
     MissionWaypoint missionWaypoints_[MAX_MISSION_WAYPOINTS] = {};
     uint8_t missionWaypointCount_ = 0;
@@ -248,7 +252,11 @@ private:
     bool missionFrontBlockedLatched_ = false;
     uint32_t missionFrontClearSinceMs_ = 0;
     uint32_t missionTurnCoastUntilMs_ = 0;
-    uint32_t missionTurnPulseStartedMs_ = 0;
+    uint32_t missionTurnPulseUntilMs_ = 0;
+    uint32_t missionLastPointTurnMs_ = 0;
+    uint32_t missionTurnLastSampleMs_ = 0;
+    float missionTurnLastHeadingDeg_ = 0.0f;
+    float missionTurnYawRateDegPerSec_ = 0.0f;
     uint32_t missionTargetAlignSinceMs_ = 0;
     bool missionTargetAligned_ = false;
     uint8_t missionTargetAlignWaypoint_ = 255;
@@ -283,7 +291,7 @@ private:
     uint8_t missionSearchSamples_ = 0;
     uint8_t missionSearchCoverageSamples_ = 0;
     float missionSearchApproachHeadingDeg_ = 0.0f;
-    uint8_t missionVerifyPhase_ = 0; // 0 idle, 1 pause, 2-4 slow scan
+    uint8_t missionVerifyPhase_ = 0; // 0 idle, 1 pause, 2-4 scan, 5 reverse for retry
     uint8_t missionVerifyWaypoint_ = 255;
     uint8_t missionVerifyRetries_ = 0;
     uint32_t missionVerifyStartedMs_ = 0;
@@ -291,6 +299,10 @@ private:
     bool missionVerifySawWeight_ = false;
     float missionVerifyHitXmm_ = 0.0f;
     float missionVerifyHitYmm_ = 0.0f;
+    int32_t missionRetryReverseEncoder1_ = 0;
+    int32_t missionRetryReverseEncoder2_ = 0;
+    float missionRetryReverseDistanceMm_ = 0.0f;
+    uint32_t missionRetryReverseStartedMs_ = 0;
     uint32_t missionLandmarkRecoveryLastMs_ = 0;
     uint8_t missionLandmarkRecoveryMatches_ = 0;
     float missionLandmarkRecoveryXmm_ = 0.0f;
@@ -306,6 +318,7 @@ private:
     };
     MissionFeature missionFeatures_[MAX_MISSION_FEATURES] = {};
     uint8_t missionFeatureCount_ = 0;
+    uint16_t missionDummyExtraMm_ = 150;
     struct MissionBottomSensorPose {
         int16_t lateralMm = 0, forwardMm = 0, angleDeg = 0;
     };
@@ -316,12 +329,26 @@ private:
     bool missionUltrasoundGeometryValid_ = false;
     bool missionReturnHome_ = false;
     bool missionAutoReturnHome_ = false;
+    uint32_t missionDockTurnStartedMs_ = 0;
+    bool missionDockAligned_ = false;
     bool missionHomeValid_ = false;
     int16_t missionHomeXmm_ = 0;
     int16_t missionHomeYmm_ = 0;
     uint8_t missionAvoidPhase_ = 0; // 0 route, 1 lateral, 2 past obstacle
     int8_t missionAvoidSide_ = 0;
     uint8_t missionAvoidAttempts_ = 0;
+    bool missionWallReverseActive_ = false;
+    bool missionWallReverseFailed_ = false;
+    bool missionWallReverseNoProgress_ = false;
+    uint32_t missionWallReverseStartedMs_ = 0;
+    int32_t missionWallReverseEncoder1_ = 0;
+    int32_t missionWallReverseEncoder2_ = 0;
+    uint32_t missionForwardProgressStartedMs_ = 0;
+    int32_t missionForwardProgressEncoder1_ = 0;
+    int32_t missionForwardProgressEncoder2_ = 0;
+    bool missionForwardStalled_ = false;
+    uint32_t missionTurnProgressStartedMs_ = 0;
+    float missionTurnProgressHeadingDeg_ = 0.0f;
     float missionAvoidXmm_ = 0.0f;
     float missionAvoidYmm_ = 0.0f;
     float missionAvoidForwardXmm_ = 0.0f;

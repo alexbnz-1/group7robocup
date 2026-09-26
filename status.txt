@@ -5792,3 +5792,83 @@ Not verified here:
   A target-locked collection leg bypasses a stale generic point-turn state
   and drives on its locked heading. The Teensy 4.0 build passes; turn quality
   still requires an uploaded firmware and a supervised physical run.
+
+2026-09-26 weight approach, missed-pickup recovery, and live mission state
+- The two latest examined recordings are `RobotRun_2026-09-26_15-27-13.rdbg`
+  and `RobotRun_2026-09-26_15-30-15.rdbg`. Neither recorded an inductive
+  pickup during the examined collection pass. In the first run, a single
+  bottom-TOF bearing caused a vector drive at about 86 s; the inner-pair lock
+  stayed false while the robot's stored path diverged from the sensed hit by
+  over 100 mm. The second run repeated this at about 42 s: the vector hit was
+  near (1664,1966) mm; by 46-47 s the pose ran about 70-80 mm sideways of
+  that frozen line, despite `mission.target_aligned` remaining true. The old
+  14-degree heading tolerance and weak steering at 75% allowed that miss.
+- A pair of similarly short inner TOF ranges is no longer automatically
+  treated as one centred weight. Both height/target-qualified inner sectors
+  must identify projected hit points within 160 mm of each other before
+  fused centring can lock; the two inner sensor rays point outward and may
+  be seeing different objects at equal distances. Sensor vectors now apply
+  lateral cross-track correction and a 4/5-degree heading tolerance rather
+  than continuing a long collection pass while 8-14 degrees off heading.
+- After a drive-through with no inductive confirmation, the robot waits one
+  second for sorting, then (if the uploaded map shows a clear rear corridor)
+  backs up to 120-240 mm before the sensed hit and re-approaches. Reverse
+  distance is encoder-bounded and time-limited to 4.5 seconds; retries are
+  limited to two. If there is no clear reverse corridor it falls back to the
+  existing scan/search. STOP NAVIGATION still stops propulsion immediately.
+- The latest run had repeated right-ultrasound readings of 30-59 mm and
+  top far-right TOF readings around 150-200 mm near 160-164 s, while stored
+  mission pose was approximately (2065,1860) mm and the photographed robot
+  was against the corresponding side wall. The old landmark trim discarded
+  side-ultrasound readings below 180 mm and never recovered that drift.
+  Valid side-ultrasound ranges now remain usable at close distance. When a
+  repeated close return geometrically matches an uploaded perimeter wall,
+  the pose can be corrected in bounded steps; a nearby top TOF shortens the
+  confirmation but is not required. This changes map association, not the
+  reliability assigned to the measured ultrasound distance.
+- Firmware telemetry now includes `mission.phase` (following path, searching,
+  centring, collecting, checking pickup, reversing for retry, avoiding,
+  returning home, etc.) and reports navigation-controller version 14. Arena
+  View shows this as a prominent state banner on both live-map and mission
+  planner views. The Teensy 4.0 build succeeds and the focused navigation/
+  replay tests report 16 passing tests. The new firmware has not yet been
+  uploaded or checked with a physical collection run.
+
+2026-09-26 — Mission pickup attribution, home docking and run controls
+- Analysed RobotRun_2026-09-26_15-54-44.rdbg and
+  RobotRun_2026-09-26_15-58-54.rdbg. The first had no inductive pickup. In
+  the second, the first site search timed out at about 64.3 s after repeatedly
+  being blocked, while the successful inductive pickup arrived at 81.3 s.
+  Firmware had attributed that delayed pickup to the *next* site because its
+  route point was within 500 mm, incremented the visited count, and returned
+  home without searching that second site. The inductive sensor is direct
+  evidence of successful collection, not a false detection.
+- Firmware now remembers a recently incomplete site. A later inductive
+  confirmation is credited to that site unless an active collection/verify
+  pass establishes the new one. It no longer advances past the next planned
+  site merely because that site's waypoint is within 500 mm. After pickup it
+  attempts a 1.2 s straight 75% roll-on, only if the forward sensor and
+  uploaded corridor are clear. A blocked weight-site search now tries another
+  sweep after 1.2 s instead of waiting motionless for the entire timeout;
+  the search window has been extended to 28 s.
+- Mission travel paths now round A* corners into short, map-checked curved
+  polylines. Weight collection's final straight approach is not rounded.
+- GUI manual return-home and firmware automatic return-home now look for a
+  map-clear staging point with turning clearance and a straight corridor to
+  home. At that point the robot turns to face outward, then reverses into
+  home at 75% while checking IMU heading and mapped corridor. If staging,
+  heading, IMU or the corridor is invalid, navigation stops. The robot has no
+  rear range sensor, so reverse docking remains dependent on map accuracy;
+  verify at low risk before trusting it near movable obstacles.
+- Mission Planner has START RUN / STOP RUN and a visible elapsed timer. START
+  RUN uploads the planned mission, enables robot run mode, arms sorting,
+  commands both first-bank motor channels to +100%, then starts navigation.
+  STOP RUN sends STOP (which disarms sorting and neutralises both banks).
+  The timer also starts from RUN NAVIGATION and freezes on STOP NAVIGATION or
+  STOP MOTORS. Hardware command acknowledgement is asynchronous: watch the
+  robot status/log for an arm-sort failure before leaving a run unattended.
+- Validation: Teensy 4.0 PlatformIO firmware build succeeded; all 12 focused
+  test_mission_navigation.py tests pass, including new run-button and docking
+  route checks. test_arena_view.py has older unrelated expectations (for
+  example six sensors versus eight configured) and is not currently green.
+  This firmware was not uploaded or physically exercised in this turn.

@@ -27,6 +27,7 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +108,9 @@ class DataVisualiser(QMainWindow):
         self.replay_time = 0.0
         self.replay_duration = 0.0
         self.replay_latest = {}
+        self._replay_wall_clock = None
+        self._replay_advancing = False
+        self._replay_dashboard_at = -1.0
 
         self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(width=1))
         self.cursor_line.setZValue(1000)
@@ -762,6 +766,7 @@ class DataVisualiser(QMainWindow):
     def _reset_replay(self):
         self.replay_index = 0
         self.replay_time = 0.0
+        self._replay_dashboard_at = -1.0
         self.replay_latest = {}
         self.replay_mission_telemetry.latest.clear()
         self.replay_mission_canvas.replay_path.clear()
@@ -790,18 +795,29 @@ class DataVisualiser(QMainWindow):
     def toggle_replay(self):
         if self.replay_timer.isActive():
             self.replay_timer.stop(); self.replay_play.setText("Play")
+            self._replay_wall_clock = None
         else:
             if self.replay_time >= self.replay_duration:
                 self.replay_slider.setValue(0)
+            self._replay_wall_clock = time.monotonic()
             self.replay_timer.start(50); self.replay_play.setText("Pause")
 
     def advance_replay(self):
         speed = float(self.replay_speed.currentData() or 1.0)
-        value = self.replay_slider.value() + max(1, int(50 * speed))
+        now = time.monotonic()
+        elapsed = 0.05 if self._replay_wall_clock is None else max(
+            0.0, now - self._replay_wall_clock)
+        self._replay_wall_clock = now
+        value = self.replay_slider.value() + max(1, int(elapsed * 1000 * speed))
         if value >= self.replay_slider.maximum():
             value = self.replay_slider.maximum()
             self.replay_timer.stop(); self.replay_play.setText("Play")
-        self.replay_slider.setValue(value)
+            self._replay_wall_clock = None
+        self._replay_advancing = True
+        try:
+            self.replay_slider.setValue(value)
+        finally:
+            self._replay_advancing = False
 
     def seek_replay(self, milliseconds: int):
         target = milliseconds / 1000.0
@@ -814,7 +830,10 @@ class DataVisualiser(QMainWindow):
             self.replay_index += 1
         self.replay_time = target
         self.replay_clock.setText(f"{target:.2f} / {self.replay_duration:.2f} s")
-        self._refresh_replay_dashboard()
+        if (not self._replay_advancing or target - self._replay_dashboard_at >= 0.2
+                or target >= self.replay_duration):
+            self._refresh_replay_dashboard()
+            self._replay_dashboard_at = target
         self._update_planned_comparison()
         self.replay_mission_canvas.update()
         self.cursor_line.setPos(target); self.cursor_line.show(); self.update_cursor_values()

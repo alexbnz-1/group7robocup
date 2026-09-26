@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -22,6 +23,18 @@ class RecordingReplayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_replay_clock_catches_up_after_delayed_paint(self):
+        visualiser = DataVisualiser()
+        try:
+            visualiser.replay_duration = 10.0
+            visualiser.replay_slider.setRange(0, 10000)
+            visualiser._replay_wall_clock = 100.0
+            with patch("DataVisualiser.time.monotonic", return_value=101.5):
+                visualiser.advance_replay()
+            self.assertEqual(visualiser.replay_slider.value(), 1500)
+        finally:
+            visualiser.close()
 
     def test_schema_records_matrix_and_gui_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
